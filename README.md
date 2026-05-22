@@ -1,245 +1,291 @@
-# Hermes Trading Agent
+# HerMES-Trading - Complete Self-Improving Trading Agent
 
-A self-improving autonomous trading agent built with Python, CCXT, and AI/ML capabilities.
+## 🚀 Overview
 
-## Features
+A **self-improving autonomous trading agent** that leverages market data, macroeconomic indicators, news sentiment, and on-chain analytics to execute intelligent trading strategies with continuous reflection and learning.
 
-- **Autonomous Trading Loop**: Self-improving agent that learns from market data and execution results
-- **Multi-Source Data Adaptation**: Intelligently ingests macroeconomic, news, on-chain, and price data
-- **Reflection & Learning**: Built-in reflection mechanism for continuous self-improvement
-- **Scoring System**: Performance evaluation and optimization tracking
+---
 
-## Tech Stack
+## ✨ Key Features
 
-- **Core**: Python 3.10+, pandas, numpy
-- **Trading**: CCXT (crypto exchanges)
-- **Data**: yfinance, web scraping capabilities
-- **AI/ML**: Self-learning architecture with reflection patterns
+- **Autonomous Trading Loop**: Self-optimizing agent that learns from execution results
+- **Multi-Source Data Integration**: 
+  - 📊 Market data via CCXT (crypto exchanges)
+  - 🌐 Macroeconomic indicators
+  - 📰 News sentiment analysis
+  - 🔗 On-chain blockchain analytics
+- **Reflection & Self-Improvement**: Built-in reflection mechanism for continuous optimization
+- **Performance Scoring**: Real-time evaluation and adaptive strategy adjustment
+- **Docker Native**: Easy deployment with `docker-compose`
 
-## Project Structure
+---
+
+## 🏗️ Tech Stack
+
+| Category | Technology |
+|----------|-----------|
+| Core | Python 3.10+ |
+| Trading API | CCXT (crypto exchanges) |
+| Data Analysis | pandas, numpy |
+| HTTP/Async | httpx, aiofiles |
+| Documentation | rich console renderer |
+| Deployment | Docker, uv package manager |
+
+---
+
+## 📁 Project Structure
 
 ```
 hermes-trading/
-├── hermes_trading/           # Main package
+├── hermes_trading/           # Core Python package
 │   ├── __init__.py
-│   ├── run.py                 # Entry point
-│   ├── loop.py                # Trading loop logic
-│   ├── score.py               # Scoring system
-│   └── reflect.py             # Reflection/self-improvement
+│   ├── run.py                 # Entry point / main orchestrator
+│   ├── loop.py                # Trading loop logic & decision engine
+│   ├── score.py               # Performance metrics & scoring system
+│   └── reflect.py             # Reflection/self-improvement mechanisms
+│
 ├── hermes_trading/adapters/  # Data source adapters
 │   ├── __init__.py
-│   ├── macro.py              # Macroeconomic data
-│   ├── news.py               # News feeds
-│   ├── onchain.py            # On-chain blockchain data
-│   └── price.py              # Price/market data
-├── .env                       # Environment variables (gitignored)
-├── pyproject.toml             # Project config & dependencies
+│   ├── macro.py              # Macroeconomic data ingestion
+│   ├── news.py               # News feeds & sentiment analysis
+│   ├── onchain.py            # On-chain blockchain analytics
+│   └── price.py              # Price/market data (CCXT)
+│
+├── pyproject.toml             # Modern Python packaging config
+├── requirements.txt           # Simple pip dependency list
 ├── Dockerfile                 # Container definition
+├── docker-compose.yml         # Orchestration setup
+├── .env                       # Environment variables template
+├── .gitignore                 # Git exclusion rules
+│
 └── state/                     # Runtime state (gitignored)
 ```
 
-## Setup & Installation
+---
 
-### Option 1: Direct Clone on VPS
+## 🚀 Quick Start
+
+### Option 1: VPS Deployment (Recommended)
 
 ```bash
-# Clone the repository
-git clone https://github.com/nghil/HerMES-Trading.git /path/to/your/hermes-trading
-cd hermes-trading
+# Clone from GitHub
+git clone https://github.com/nghilinh-alt/hermes-trading.git /opt/trading
+cd /opt/trading/hermes-trading
 
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
+source venv/bin/activate
 
 # Install dependencies
-pip install -e ".[dev]"
-# or for production:
-pip install ccxt yfinance pyyaml httpx aiofiles numpy pandas rich
-```
+pip install -e .
 
-### Option 2: Using Docker
-
-```bash
-# Build the image
-docker build -t hermes-trading .
-
-# Run the container
-docker run -d --name hermes-trading \
-  -v $(pwd)/.env:/app/.env \
-  -v $(pwd)/state:/app/state \
-  hermes-trading
-```
-
-### Option 3: Using uv (Recommended for Python projects)
-
-```bash
-# Install uv if not present
-pip install uv
-
-# Install the project
-uv sync
+# Configure API keys (optional for paper trading)
+cp .env.example .env  # Edit with your secrets or leave blank
 
 # Run the agent
+python -m hermes_trading.run
+```
+
+### Option 2: Docker Deployment
+
+```bash
+git clone https://github.com/nghilinh-alt/hermes-trading.git /opt/trading
+cd /opt/trading/hermes-trading
+
+# Build and run with docker-compose
+docker-compose up -d --build
+
+# View logs
+docker-compose logs -f trading-agent
+```
+
+### Option 3: Using uv (Fast & Modern)
+
+```bash
+pip install uv
+cd /opt/trading/hermes-trading
+uv sync
 uv run python -m hermes_trading.run
 ```
 
-## Configuration
+---
 
-Create a `.env` file with your configuration:
+## 🔧 Configuration
+
+Create/edit your `.env` file:
 
 ```env
-# Trading API Keys
-CCXT_API_KEY=your_api_key_here
-CCXT_API_SECRET=your_api_secret_here
+# Trading Mode
+HERMES_TRADING_MODE=paper        # or 'live'
 
-# Exchange settings
-EXCHANGE=binance  # or bybit, kucoin, etc.
-TRADING_MODE=spot  # or futures
+# Risk Settings
+HERMES_TRADING_I_ACCEPT_RISK=false
 
-# AI/ML Configuration
-MODEL_PATH=/path/to/model
-REFLECTION_INTERVAL=3600  # seconds between reflection cycles
+# Exchange API (optional - leave blank for free tier)
+EXCHANGE_API_KEY=your_api_key_here
+EXCHANGE_API_SECRET=your_secret_here
+EXCHANGE=binance  # Options: binance, bybit, kucoin, etc.
+TRADING_MODE=spot  # or 'futures'
 
-# Logging
+# Third-party APIs (optional)
+GLASSNODE_API_KEY=  # On-chain analytics
+NEWS_API_KEY=       # News sentiment
+
+# Runtime
 LOG_LEVEL=INFO
-LOG_FILE=logs/trading.log
+REFLECTION_INTERVAL=3600  # Seconds between reflection cycles
 ```
 
-## Usage
+---
 
-### Running the Agent
-
-```bash
-# Basic run
-python -m hermes_trading.run
-
-# With custom configuration
-python -m hermes_trading.run --config=config.yaml
-
-# Debug mode
-python -m hermes_trading.run --debug
-```
-
-### Docker Compose Setup
-
-Create `docker-compose.yml`:
-
-```yaml
-version: '3.8'
-services:
-  hermes-trading:
-    build: .
-    volumes:
-      - ./state:/app/state
-      - ./logs:/app/logs
-    environment:
-      - CCXT_API_KEY=${CCXT_API_KEY}
-      - CCXT_API_SECRET=${CCXT_API_SECRET}
-    restart: unless-stopped
-```
-
-```bash
-docker-compose up -d
-```
-
-## Architecture Overview
-
-### Data Flow
+## 📊 Architecture Overview
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Macro Data │───▶│   Adapter   │───▶│  Agent Core  │
+│ Macro Data │───▶│   Adapter    │───▶│ Agent Core   │
 └─────────────┘     └─────────────┘     └──────┬──────┘
                                                 │
 ┌─────────────┐     ┌─────────────┐           │
-│   News Data │───▶│   Adapter   │────────────┘
+│ News Data   │───▶│   Adapter    │────────────┘
 └─────────────┘     └─────────────┘
     ▲                    │
     │              ┌─────▼─────┐
 ┌─────────────┐  │  Score &   │◀─────── Execution Results
-│ On-chain D. │───▶ Reflect   │       (for learning)
+│On-chain D.  │───▶ Reflect   │       (for learning)
 └─────────────┘  └─────────────┘
 ```
 
-### Key Components
+### Core Components
 
-1. **Adapters**: Handle data ingestion from various sources
-2. **Loop**: Core trading logic and decision making
-3. **Score**: Performance metrics and evaluation
-4. **Reflect**: Self-improvement and learning mechanisms
+1. **Adapters**: Handle data ingestion from various sources (CCXT, macro APIs, news feeds, on-chain analytics)
+2. **Loop**: Core trading logic - makes decisions based on synthesized market intelligence
+3. **Score**: Performance metrics, PnL tracking, risk assessment
+4. **Reflect**: Self-improvement mechanism - learns from past trades and optimizes strategies
 
-## Dependencies
+---
 
-See `pyproject.toml` for complete list:
+## 🔐 Security Best Practices
 
-```toml
-ccxt>=4.0.0          # Crypto exchange library
-yfinance>=0.2.0      # Stock/crypto data
-pyyaml>=6.0          # YAML config
-httpx>=0.27.0        # HTTP client
-aiofiles>=23.0.0     # Async file I/O
-numpy>=1.26.0        # Numerical computing
-pandas>=2.0.0        # Data analysis
-rich>=13.0.0         # Console rendering
+### Never commit secrets!
+
+- API keys go in `.env` (gitignored)
+- Use GitHub Secrets for production deployments
+- Consider using a secrets manager (HashiCorp Vault, AWS Secrets Manager)
+
+### Environment Variables by Sensitivity
+
+| Variable | Default | When to set |
+|----------|---------|-------------|
+| `HERMES_TRADING_MODE` | `paper` | Always - use `paper` for testing |
+| `EXCHANGE_API_KEY` | (blank) | Only for live trading |
+| `GLASSNODE_API_KEY` | (blank) | For on-chain analytics |
+
+---
+
+## 📈 Monitoring & Logs
+
+### Log Output
+
+The agent outputs rich console logs including:
+- Market data ingestion events
+- Reflection cycles and learnings
+- Trading decisions and executions
+- Performance metrics
+
+### Production Setup
+
+Add logging configuration to `logging.conf`:
+
+```ini
+[loggers]
+keys=root,hermes_trading
+
+[handlers]
+keys=console,file
+
+[formatters]
+key=simple,detailed
+
+[logger_root]
+level=INFO
+handlers=console,file
+
+[logger_hermes_trading]
+level=DEBUG
+handlers=console,file
 ```
 
-## Environment Variables
+---
 
-| Variable | Description | Required | Default |
-|----------|-------------|----------|---------|
-| `CCXT_API_KEY` | API key for exchange | Yes | - |
-| `CCXT_API_SECRET` | API secret for exchange | Yes | - |
-| `EXCHANGE` | Exchange name | Yes | binance |
-| `TRADING_MODE` | Spot or futures | Yes | spot |
-| `REFLECTION_INTERVAL` | Seconds between reflection cycles | No | 3600 |
-| `LOG_LEVEL` | Logging level | No | INFO |
+## 🔍 Troubleshooting
 
-## Deployment Checklist
+### "Module not found" errors
 
-- [ ] API keys configured securely (use `.env`, not git)
-- [ ] Docker image tested in staging environment
-- [ ] Trading strategy validated with backtesting
-- [ ] Monitoring/logging configured
-- [ ] Resource limits set (memory, CPU)
-- [ ] Backup/recovery procedures documented
-- [ ] Error handling and alerts configured
-
-## Troubleshooting
-
-### Common Issues
-
-**"No module named 'hermes_trading'"**
 ```bash
-pip install -e .
-# or
-uv sync
+pip install -e .  # Or: uv sync
 ```
 
-**"API key error"**
-- Check `.env` file is loaded
-- Verify keys in exchange dashboard
-- Ensure permissions (read/trade) are enabled
+### Port already in use
 
-**"Port already in use"**
+The agent may bind to ports for webhooks. Change in config or kill existing processes:
+
 ```bash
-# Find and kill the process
 lsof -i :5175 | grep LISTEN
 kill -9 <PID>
 ```
 
-## Contributing
+### API rate limit errors
+
+Reduce `REFLECTION_INTERVAL` or use premium exchange tiers.
+
+---
+
+## 📚 Development Guidelines
+
+### Adding New Data Sources
+
+1. Create adapter in `hermes_trading/adapters/`
+2. Follow existing patterns (e.g., `price.py`)
+3. Update adapters' `__init__.py`
+
+### Writing Unit Tests
+
+```bash
+# Install dev dependencies
+pip install pytest pytest-asyncio
+
+# Run tests
+pytest tests/
+```
+
+---
+
+## 🤝 Contributing
 
 1. Fork the repository
-2. Create a feature branch
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
 3. Make your changes
 4. Run tests
 5. Submit a pull request
 
-## License
+---
 
-MIT License - see LICENSE file for details
+## 📄 License
 
-## Support
+MIT License - See `LICENSE` file for details.
 
-For issues or questions, open an issue on GitHub.
+---
+
+## 🔗 Resources
+
+- **GitHub Repository**: https://github.com/nghilinh-alt/hermes-trading
+- **Documentation**: `README.md` + `DEPLOY-GUIDE.md`
+- **Issues & Bug Reports**: [GitHub Issues](https://github.com/nghilinh-alt/hermes-trading/issues)
+
+---
+
+## ⚠️ Risk Disclaimer
+
+Trading involves substantial risk of loss and is not suitable for every investor. The `HERMES_TRADING_I_ACCEPT_RISK=false` setting in the `.env` file indicates that this is a research/training project, not production financial advice.
+
+Always test with paper trading (mock mode) before deploying live capital.
