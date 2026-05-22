@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  trading-agent:
+    build: .
+    container_name: hermes-trading-agent
+    volumes:
+      - ./state:/app/state
+      - ./logs:/app/logs
+    environment:
+      - CCXT_API_KEY=${CCXT_API_KEY}
+      - CCXT_API_SECRET=${CCXT_API_SECRET}
+      - EXCHANGE=binance  # Change as needed
+      - TRADING_MODE=spot  # or 'futures'
+    command: python -m hermes_trading.run
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
