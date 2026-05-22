@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment files (sensitive)
+.env
+.venv/
+
+# State and runtime data (should not be tracked)
+state/
+logs/
+*.log
+*.json  # Except package.json
+
+# IDE editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# Lock files (optional - you can include if you want reproducible builds)
+# uv.lock
+# poetry.lock
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+temp/
+tmp/
