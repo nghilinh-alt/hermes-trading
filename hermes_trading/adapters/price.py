@@ -40,8 +40,10 @@ async def fetch(asset: str = "BTC/USDT") -> dict:
     highs  = [c[2] for c in ohlcv]
     lows   = [c[3] for c in ohlcv]
 
-    # RSI-14
-    rsi = _rsi(closes, period=14)
+    # RSI-14, EMA-9, Bollinger Bands-20
+    rsi   = _rsi(closes, period=14)
+    ema_9 = _ema(closes, period=9)
+    bb_upper, bb_mid, bb_lower = _bollinger(closes, period=20, num_std=2)
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -51,11 +53,36 @@ async def fetch(asset: str = "BTC/USDT") -> dict:
         "ask": ticker.get("ask"),
         "volume_24h": ticker.get("quoteVolume"),
         "rsi_14": rsi,
+        "ema_9": ema_9,
+        "bb_upper": bb_upper,
+        "bb_mid": bb_mid,
+        "bb_lower": bb_lower,
         "ohlcv_1m": ohlcv[-10:],   # last 10 candles for loop decisions
         "high_24h": ticker.get("high"),
         "low_24h":  ticker.get("low"),
     }
     return result
+
+
+def _bollinger(closes: list, period: int = 20, num_std: float = 2) -> tuple[float, float, float]:
+    if len(closes) < period:
+        mid = closes[-1] if closes else 0.0
+        return round(mid, 4), round(mid, 4), round(mid, 4)
+    window = closes[-period:]
+    mid = sum(window) / period
+    variance = sum((p - mid) ** 2 for p in window) / period
+    std = variance ** 0.5
+    return round(mid + num_std * std, 4), round(mid, 4), round(mid - num_std * std, 4)
+
+
+def _ema(closes: list, period: int = 9) -> float:
+    if len(closes) < period:
+        return closes[-1] if closes else 0.0
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period   # seed with SMA
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 4)
 
 
 def _rsi(closes: list, period: int = 14) -> float:

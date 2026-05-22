@@ -87,15 +87,41 @@ def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_dat
     indicator = entry.get("indicator", "rsi")
     threshold = float(entry.get("threshold", 30))
     direction = entry.get("direction", "long")
+    ema_period = entry.get("ema_period")  # optional EMA trend filter
 
+    rsi_signal = False
     if indicator == "rsi":
         rsi = price_data.get("rsi_14", 50.0)
         if direction == "long" and rsi < threshold:
-            return True
-        if direction == "short" and rsi > threshold:
-            return True
+            rsi_signal = True
+        elif direction == "short" and rsi > threshold:
+            rsi_signal = True
 
-    return False
+    if not rsi_signal:
+        return False
+
+    price = price_data.get("price", 0)
+
+    # EMA trend filter: only enter if price is on the right side of the EMA
+    if ema_period == 9:
+        ema = price_data.get("ema_9")
+        if ema is not None:
+            if direction == "long" and price < ema:
+                return False   # price below EMA-9 — no uptrend confirmation
+            if direction == "short" and price > ema:
+                return False
+
+    # Bollinger Band filter: long only when price touches or breaks below lower band
+    if entry.get("bb_filter"):
+        bb_lower = price_data.get("bb_lower")
+        bb_upper = price_data.get("bb_upper")
+        if bb_lower is not None:
+            if direction == "long" and price > bb_lower:
+                return False   # not at the lower band — wait for the squeeze
+            if direction == "short" and price < bb_upper:
+                return False
+
+    return True
 
 
 def _simulate_paper_trade(strategy: dict, price_data: dict) -> dict:
@@ -122,6 +148,9 @@ def _simulate_paper_trade(strategy: dict, price_data: dict) -> dict:
         "pnl_pct": round(pnl_pct, 6),
         "strategy_version": strategy.get("version", "01"),
         "rsi_at_entry": price_data.get("rsi_14"),
+        "ema_9_at_entry": price_data.get("ema_9"),
+        "bb_lower_at_entry": price_data.get("bb_lower"),
+        "bb_upper_at_entry": price_data.get("bb_upper"),
     }
 
 

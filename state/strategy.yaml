@@ -1,7 +1,9 @@
-version: "01"
+version: "02"
 entry:
   indicator: rsi
   threshold: 30
   direction: long
+  ema_period: 9      # only enter when price > EMA-9
+  bb_filter: true    # only enter when price touches lower Bollinger Band
 stop_loss_pct: 2.0
 position_size_r: 0.5
