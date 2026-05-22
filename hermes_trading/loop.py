@@ -142,8 +142,12 @@ def _maybe_trigger_reflection(goal: dict, trade_count: int):
             console.print(f"[red]Reflection failed: {e}[/red]")
 
 
-async def run(asset: str):
-    """Main async loop — runs forever."""
+async def run(asset: str, goal: dict | None = None):
+    """Main async loop — runs forever.
+
+    *goal* is the pre-resolved dict from run.py (_resolve_goal).
+    If not provided the loop falls back to reading GOAL_FILE each tick.
+    """
     console.print(f"[bold green]Booting hermes-trading worker · asset={asset} · mode={os.getenv('HERMES_TRADING_MODE','paper')}[/bold green]")
 
     consecutive_failures = 0
@@ -151,7 +155,8 @@ async def run(asset: str):
     while True:
         tick_start = time.monotonic()
         try:
-            goal = _load_yaml(GOAL_FILE)
+            # Reload goal each tick only if not pre-resolved (supports live edits)
+            resolved_goal = goal if goal is not None else _load_yaml(GOAL_FILE)
             strategy = _load_yaml(STRATEGY_FILE)
 
             # Fetch all adapters concurrently
@@ -173,7 +178,7 @@ async def run(asset: str):
                 _log_trade(trade)
                 closed_count = _count_closed_trades()
                 console.print(f"[green]Trade #{closed_count}: {trade['direction']} @ {trade['entry_price']} → pnl {trade['pnl_pct']:+.4%}[/green]")
-                _maybe_trigger_reflection(goal, closed_count)
+                _maybe_trigger_reflection(resolved_goal, closed_count)
             else:
                 rsi_val = price_data.get("rsi_14", "?")
                 console.print(f"[dim]No entry · RSI={rsi_val} · price={price_data.get('price')}[/dim]")

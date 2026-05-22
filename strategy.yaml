@@ -1,0 +1,129 @@
+# HerMES-Trading Agent - Trading Strategy Configuration
+# Defines autonomous agent behavior and decision-making parameters
+
+agent:
+  name: "HerMES BTC/USDT Autonomous Trader"
+  version: "1.0.0"
+  description: "Self-improving AI trading agent for crypto markets"
+
+asset_pair: BTC/USDT
+trading_mode: paper  # Options: 'paper' (mock) or 'live'
+
+# Trading Parameters
+strategy:
+  name: "momentum_breakout"   # Strategy type: momentum, mean_reversion, breakout
+  entry_conditions:
+    - indicator: "rsi"        # Relative Strength Index
+      threshold: 30           # Enter when RSI < 30 (oversold) OR > 70 (overbought)
+    - indicator: "macd"       # Moving Average Convergence Divergence
+      condition: "crossover"   # Buy on bullish crossover, sell on bearish
+    - indicator: "volume_sma" # Volume above 20-day moving average
+      multiplier: 1.5         # Enter when volume > 1.5x average
+
+  exit_conditions:
+    stop_loss: 5.0           # Exit at -5% from entry (hard stop)
+    take_profit: 10.0        # Exit at +10% from entry (take profit)
+    trailing_stop: true       # Enable trailing stops after target reached
+    trailing_distance: 3.0   # Trailing stop distance in percentage
+
+  position_sizing:
+    method: "fixed"          # Options: 'fixed', 'fbb' (Fixed Fractional), 'kelly'
+    base_usd: 100            # Base position size in USD for fixed sizing
+    fbb_risk_pct: 2.0        # Risk % per trade for FBB method
+    kelly_fraction: 0.25     # Kelly criterion fraction (use cautiously!)
+
+# Risk Management
+risk_management:
+  max_daily_loss_pct: 10.0   # Maximum daily drawdown before stop trading
+  max_weekly_trades: 5       # Maximum trades per week to prevent overtrading
+  position_limit_usd: 100    # Hard cap on any single trade size (USD)
+
+# Reflection & Self-Improvement
+reflection:
+  enabled: true
+  interval_seconds: 3600     # Analyze every hour for strategy improvements
+  
+  optimization_targets:
+    - "win_rate"             # Maximize winning trades %
+    - "sharpe_ratio"         # Improve risk-adjusted returns
+    - "max_drawdown"        # Reduce worst losses
+    
+  learning_parameters:
+    exploration_rate: 0.1    # Random moves for discovering new strategies (0-1)
+    exploitation_weight: 0.9 # Stick to best performing strategy
+    
+  memory_window_days: 7      # Remember last week's trades for reflection
+
+# Scoring System
+performance_score:
+  enabled: true
+  
+  components:
+    - metric: "pnl"              # Net profit/loss ($)
+      weight: 0.4               # Importance (total = 1.0)
+    - metric: "sharpe_ratio"     # Risk-adjusted returns
+      weight: 0.3
+    - metric: "win_rate"         # % of winning trades
+      weight: 0.2
+    - metric: "profit_factor"    # Gross profit / gross loss
+      weight: 0.1
+
+  baseline_comparison: true   # Score vs initial performance benchmark
+
+# Data Collection Preferences
+data_sources:
+  exchanges:
+    - name: "binance"
+      api_key_env: "EXCHANGE_API_KEY"     # Or set in state/.env
+      api_secret_env: "EXCHANGE_API_SECRET"
+      rate_limit_handling: true         # Handle API throttling gracefully
+
+  macro_economic:
+    sources:
+      - "federalreserve.gov"
+      - "tradingeconomics.com"
+    update_frequency_minutes: 60        # Refresh every hour
+
+  news_sentiment:
+    enabled: true                      # Enable news-driven trading signals
+    api_key_env: "NEWS_API_KEY"
+    languages: ["en"]                  # Primary language for analysis
+    
+  on_chain_analytics:
+    enabled: false                     # Disable for demo (requires Glassnode key)
+    api_key_env: "GLASSNODE_API_KEY"
+
+# Goal Tracking
+goals:
+  current_goal_file: "state/goal.yaml"  # Path to goal configuration
+  
+  objectives:
+    primary: pnl                      # Primary goal: PnL maximization
+    
+    targets:
+      - name: "short_term"
+        timeframe: "1d"               # Daily objective
+        target_pnl_usd: 2.0           # $2 daily profit target
+        
+      - name: "medium_term"
+        timeframe: "7d"               # Weekly objective  
+        target_sharpe: 1.5            # Sharpe ratio of 1.5 in one week
+      
+      - name: "long_term"
+        timeframe: "30d"              # Monthly objective
+        target_compounded_returns_pct: 15.0  # 15% monthly growth
+
+# System Configuration
+system:
+  log_level: INFO                  # Options: DEBUG, INFO, WARNING, ERROR
+  output_format: rich              # Rich console for colorful terminal output
+  
+  heartbeat_interval_seconds: 30   # How often to write state/heartbeat.json
+  
+  failure_threshold: 5             # Failures before stopping execution
+
+# Debug & Development
+debug:
+  verbose_logging: false            # Enable detailed logging if true
+  dry_run_mode: true               # True = paper trading, false = live trades
+  debug_indicators: false          # Show calculation details for each indicator
