@@ -12,9 +12,10 @@ risk:
   trailing_stop_pct: 3.0            # Trailing stop activation threshold
 
 # Reflection & Learning
+reflection_every: 5                  # Reflect every N closed trades (overrides interval_seconds)
 reflection:
   enabled: true
-  interval_seconds: 3600             # Check every hour (or set to null for continuous)
+  interval_seconds: 3600             # Fallback time-based cadence (ignored when reflection_every is set)
   consider_past_trades: true         # Use historical trades for strategy improvement
   target_improvement_pct: 1.5        # Aim for 1.5% better than baseline each cycle
 
