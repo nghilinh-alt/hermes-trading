@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 from rich.console import Console
 
 console = Console()
@@ -119,6 +120,8 @@ def _resolve_goal(raw: dict) -> dict:
 
 
 def main() -> None:
+    load_dotenv()
+
     # Safety check — refuse to run in live mode unless the risk flag is set
     mode        = os.getenv("HERMES_TRADING_MODE", "paper")
     accept_risk = os.getenv("HERMES_TRADING_I_ACCEPT_RISK", "false").lower()
