@@ -35,7 +35,7 @@ def _ssh(cmd: str) -> str:
     """Run a command on the VPS via SSH. Returns stdout or empty string on error."""
     result = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", VPS, cmd],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -61,12 +61,19 @@ def _parse_jsonl_last(text: str) -> dict:
 
 
 def _parse_strategy(text: str) -> dict:
-    """Very light YAML parser — only reads top-level key: value pairs."""
+    """Light YAML parser — reads top-level key: value pairs, strips comments and quotes."""
     result = {}
     for line in text.splitlines():
-        if ":" in line and not line.strip().startswith("#"):
-            k, _, v = line.partition(":")
-            result[k.strip()] = v.strip()
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        v = v.split("#")[0].strip()          # strip inline comments
+        v = v.strip('"').strip("'")          # strip surrounding quotes
+        if k.strip() and v:
+            result[k.strip()] = v
     return result
 
 

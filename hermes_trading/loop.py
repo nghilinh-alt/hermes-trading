@@ -200,15 +200,16 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
             if price_data is None:
                 raise RuntimeError("price adapter returned None — cannot evaluate strategy")
 
+            ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
             if _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}):
                 trade = _simulate_paper_trade(strategy, price_data)
                 _log_trade(state_dir, trade)
                 closed_count = _count_closed_trades(state_dir)
-                console.print(f"[green]{tag} Trade #{closed_count}: {trade['direction']} @ {trade['entry_price']} → pnl {trade['pnl_pct']:+.4%}[/green]")
+                console.print(f"[green]{ts} {tag} Trade #{closed_count}: {trade['direction']} @ {trade['entry_price']} → pnl {trade['pnl_pct']:+.4%}[/green]")
                 _maybe_trigger_reflection(resolved_goal, closed_count, state_dir)
             else:
                 rsi_val = price_data.get("rsi_14", "?")
-                console.print(f"[dim]{tag} No entry · RSI={rsi_val} · price={price_data.get('price')}[/dim]")
+                console.print(f"[dim]{ts} {tag} No entry · RSI={rsi_val} · price={price_data.get('price')}[/dim]")
 
             consecutive_failures = 0
             _write_heartbeat(state_dir, "ok", 0)
