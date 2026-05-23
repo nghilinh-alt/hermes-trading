@@ -78,45 +78,119 @@ def _log_trade(state_dir: Path, trade: dict) -> None:
         f.write(json.dumps(trade) + "\n")
 
 
-def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_data: dict) -> bool:
-    """Returns True if entry conditions are met."""
-    entry = strategy.get("entry", {})
-    indicator = entry.get("indicator", "rsi")
-    threshold = float(entry.get("threshold", 30))
-    direction = entry.get("direction", "long")
-    ema_period = entry.get("ema_period")  # optional EMA trend filter
-
-    rsi_signal = False
-    if indicator == "rsi":
-        rsi = price_data.get("rsi_14", 50.0)
-        if direction == "long" and rsi < threshold:
-            rsi_signal = True
-        elif direction == "short" and rsi > threshold:
-            rsi_signal = True
-
-    if not rsi_signal:
-        return False
-
+def _check_indicator(name: str, params: dict, direction: str, price_data: dict) -> bool | None:
+    """
+    Evaluate a single named indicator against price_data.
+    Returns True (signal fires), False (signal does not fire), or None (data unavailable).
+    """
     price = price_data.get("price", 0)
 
-    # EMA trend filter: only enter if price is on the right side of the EMA
-    if ema_period == 9:
-        ema = price_data.get("ema_9")
-        if ema is not None:
-            if direction == "long" and price < ema:
-                return False   # price below EMA-9 — no uptrend confirmation
-            if direction == "short" and price > ema:
-                return False
+    if name == "rsi":
+        rsi = price_data.get("rsi_14")
+        if rsi is None:
+            return None
+        threshold = float(params.get("threshold", 30))
+        if direction == "long":
+            return rsi < threshold
+        return rsi > threshold
 
-    # Bollinger Band filter: long only when price touches or breaks below lower band
-    if entry.get("bb_filter"):
+    if name == "ema_trend":
+        period = int(params.get("period", 50))
+        ema = price_data.get(f"ema_{period}")
+        if ema is None:
+            return None
+        if direction == "long":
+            return price > ema
+        return price < ema
+
+    if name == "macd":
+        macd_line   = price_data.get("macd_line")
+        macd_signal = price_data.get("macd_signal")
+        if macd_line is None or macd_signal is None:
+            return None
+        if direction == "long":
+            return macd_line > macd_signal   # bullish crossover territory
+        return macd_line < macd_signal
+
+    if name == "vwap":
+        vwap = price_data.get("vwap")
+        if vwap is None:
+            return None
+        if direction == "long":
+            return price < vwap   # price below VWAP — mean-reversion long
+        return price > vwap
+
+    if name == "volume_spike":
+        ratio     = price_data.get("volume_ratio")
+        if ratio is None:
+            return None
+        min_ratio = float(params.get("min_ratio", 1.5))
+        return ratio >= min_ratio
+
+    if name == "bb_squeeze":
         bb_lower = price_data.get("bb_lower")
         bb_upper = price_data.get("bb_upper")
-        if bb_lower is not None:
-            if direction == "long" and price > bb_lower:
-                return False   # not at the lower band — wait for the squeeze
-            if direction == "short" and price < bb_upper:
-                return False
+        if bb_lower is None or bb_upper is None:
+            return None
+        if direction == "long":
+            return price <= bb_lower
+        return price >= bb_upper
+
+    return None  # unknown indicator — treat as unavailable
+
+
+def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_data: dict) -> bool:
+    """
+    Modular weighted indicator registry.
+
+    Each indicator in strategy['indicators'] has:
+      required (bool)  — if True, failure blocks the trade outright
+      weight   (float) — contribution toward optional confidence score
+      params   (dict)  — indicator-specific config
+
+    A trade fires when:
+      1. All required indicators return True
+      2. The sum of weights from passing optional indicators >= entry.min_confidence
+    """
+    indicators = strategy.get("indicators", [])
+    direction  = strategy.get("entry", {}).get("direction", "long")
+    min_conf   = float(strategy.get("entry", {}).get("min_confidence", 0.0))
+
+    # Fallback: if no indicator registry defined, replicate original RSI behaviour
+    if not indicators:
+        entry     = strategy.get("entry", {})
+        rsi       = price_data.get("rsi_14", 50.0)
+        threshold = float(entry.get("threshold", 30))
+        if direction == "long":
+            return rsi < threshold
+        return rsi > threshold
+
+    optional_total  = sum(float(i.get("weight", 1.0)) for i in indicators if not i.get("required", False))
+    optional_passed = 0.0
+
+    for ind in indicators:
+        name     = ind.get("name", "")
+        params   = ind.get("params", {})
+        required = ind.get("required", False)
+        weight   = float(ind.get("weight", 1.0))
+
+        result = _check_indicator(name, params, direction, price_data)
+
+        if result is None:
+            # Data unavailable — skip required indicators gracefully, skip optional
+            continue
+
+        if required and not result:
+            return False   # hard gate failed
+
+        if not required and result:
+            optional_passed += weight
+
+    # Check optional confidence threshold (only meaningful if there are optional indicators)
+    if optional_total > 0 and min_conf > 0:
+        confidence = optional_passed / optional_total
+        if confidence < min_conf:
+            return False
 
     return True
 

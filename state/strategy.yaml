@@ -1,9 +1,45 @@
 version: "02"
+
 entry:
-  indicator: rsi
-  threshold: 30
   direction: long
-  ema_period: 9      # only enter when price > EMA-9
-  bb_filter: true    # only enter when price touches lower Bollinger Band
+  min_confidence: 0.4   # optional indicators must contribute >= 40% of their total weight
+
+# Indicator registry — Hermes can tune weight, params, and add/remove optional entries.
+# required: true  → must fire or trade is blocked
+# required: false → contributes to confidence score; trade proceeds if enough pass
+indicators:
+  - name: rsi
+    required: true
+    weight: 1.0
+    params:
+      threshold: 30       # long: RSI < threshold  |  short: RSI > threshold
+
+  - name: ema_trend
+    required: false
+    weight: 0.6
+    params:
+      period: 50          # price must be above EMA-50 for longs
+
+  - name: macd
+    required: false
+    weight: 0.5
+    params: {}            # long: macd_line > signal_line (bullish territory)
+
+  - name: vwap
+    required: false
+    weight: 0.4
+    params: {}            # long: price below VWAP (mean-reversion entry)
+
+  - name: volume_spike
+    required: false
+    weight: 0.3
+    params:
+      min_ratio: 1.5      # current volume >= 1.5x 20-period average
+
+  - name: bb_squeeze
+    required: false
+    weight: 0.3
+    params: {}            # long: price at or below lower Bollinger Band
+
 stop_loss_pct: 2.0
 position_size_r: 0.5

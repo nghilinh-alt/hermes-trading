@@ -143,15 +143,36 @@ def run_fallback():
             f"Loosening entry threshold {old_val} → {new_val} to increase trade frequency."
         )
     else:
-        # Performing well — nudge position size up slightly
-        old_val = float(strategy.get("position_size_r", 0.5))
-        new_val = round(min(1.0, old_val + 0.05), 2)
-        strategy["position_size_r"] = new_val
-        changed_var = "position_size_r"
-        reasoning = (
-            f"Realised return {realised:.2%} on track. "
-            f"Nudging position_size_r {old_val} → {new_val} to compound gains."
-        )
+        # Performing well — nudge position size up slightly, or boost MACD weight
+        # Alternate between the two so fallback doesn't only ever touch position size
+        old_pos = float(strategy.get("position_size_r", 0.5))
+        if old_pos < 1.0:
+            new_val = round(min(1.0, old_pos + 0.05), 2)
+            strategy["position_size_r"] = new_val
+            old_val = old_pos
+            changed_var = "position_size_r"
+            reasoning = (
+                f"Realised return {realised:.2%} on track. "
+                f"Nudging position_size_r {old_val} → {new_val} to compound gains."
+            )
+        else:
+            # Position size maxed — boost MACD confirmation weight instead
+            indicators = strategy.get("indicators", [])
+            macd_ind = next((i for i in indicators if i.get("name") == "macd"), None)
+            if macd_ind is not None:
+                old_val = float(macd_ind.get("weight", 0.5))
+                new_val = round(min(1.0, old_val + 0.1), 2)
+                macd_ind["weight"] = new_val
+                changed_var = "indicators[macd].weight"
+                reasoning = (
+                    f"Realised return {realised:.2%} on track, position_size_r maxed. "
+                    f"Increasing MACD weight {old_val} → {new_val} for stronger confirmation."
+                )
+            else:
+                old_val = old_pos
+                new_val = old_pos
+                changed_var = "position_size_r"
+                reasoning = "No actionable change — strategy performing within targets."
 
     strategy["version"] = new_version
     _save_yaml(STRATEGY_FILE, strategy)
@@ -190,8 +211,16 @@ def run_hermes():
         "instruction": (
             "You are the reflection engine for a self-improving trading agent. "
             "Review the recent trades and current strategy. "
-            "Generate 1-3 hypotheses. Each must name exactly ONE variable in strategy.yaml "
-            "and predict the score direction. Choose the highest-confidence hypothesis. "
+            "Generate 1-3 hypotheses. Each must change exactly ONE variable and predict "
+            "the score direction. Choose the highest-confidence hypothesis. "
+            "Tunable variables include: stop_loss_pct, position_size_r, entry.min_confidence, "
+            "and any indicator field using dot notation such as "
+            "'indicators[rsi].params.threshold', 'indicators[ema_trend].weight', "
+            "'indicators[macd].weight', 'indicators[vwap].weight', "
+            "'indicators[volume_spike].params.min_ratio', 'indicators[volume_spike].weight'. "
+            "You may also set an indicator's weight to 0.0 to effectively disable it, "
+            "or increase a weight to give it more influence. "
+            "Do NOT change the 'required' field on rsi — it must stay true. "
             "Output JSON: {changed_variable, old_value, new_value, reasoning, confidence}. "
             "Only output JSON, nothing else."
         ),
