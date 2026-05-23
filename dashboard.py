@@ -16,6 +16,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+AEST = ZoneInfo("Australia/Sydney")
 
 VPS        = "root@187.127.108.173"
 VPS_BASE   = "/opt/trading/hermes_trading"
@@ -87,7 +90,7 @@ def _parse_heartbeat(text: str) -> dict:
 def _fetch_data() -> dict:
     """Pull all state from VPS (or local fallback) and return a structured dict."""
     data = {
-        "updated": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "updated": datetime.now(AEST).strftime("%H:%M:%S AEST"),
         "assets": {},
         "log_tail": [],
         "goal": {},
@@ -312,7 +315,11 @@ def _render_html(d: dict) -> str:
     recent_trades = sorted(all_trades_flat, key=lambda t: t.get("ts", ""), reverse=True)[:50]
 
     def _trade_row_html(t: dict) -> str:
-        ts    = t.get("ts", "")[:16].replace("T", " ")
+        ts_raw = t.get("ts", "")
+        try:
+            ts = datetime.fromisoformat(ts_raw).astimezone(AEST).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ts = ts_raw[:16].replace("T", " ")
         asset = t.get("asset", "—")
         dirn  = t.get("direction", "—")
         dirn_col = "#1D9E75" if dirn == "long" else "#E24B4A"
@@ -340,7 +347,7 @@ def _render_html(d: dict) -> str:
   <table style="width:100%;border-collapse:collapse">
     <thead>
       <tr style="background:var(--surface)">
-        <th style="padding:8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">time (UTC)</th>
+        <th style="padding:8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">time (AEST)</th>
         <th style="padding:8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">asset</th>
         <th style="padding:8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">side</th>
         <th style="padding:8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">entry</th>
@@ -366,7 +373,10 @@ def _render_html(d: dict) -> str:
     def _reflection_card(h: dict) -> str:
         asset   = h.get("_asset", "")
         ts_raw  = h.get("ts", "")
-        ts_disp = ts_raw[:16].replace("T", " ") if ts_raw else "—"
+        try:
+            ts_disp = datetime.fromisoformat(ts_raw).astimezone(AEST).strftime("%Y-%m-%d %H:%M") if ts_raw else "—"
+        except Exception:
+            ts_disp = ts_raw[:16].replace("T", " ") if ts_raw else "—"
         v_from  = h.get("version_from", "?")
         v_to    = h.get("version_to", "?")
         var     = h.get("changed_variable", "—")
@@ -430,8 +440,7 @@ def _render_html(d: dict) -> str:
 </div>
 <script>
   (function tick(){{
-    var n=new Date();
-    var s=n.toUTCString().slice(17,25)+' UTC';
+    var s=new Date().toLocaleTimeString('en-AU',{{timeZone:'Australia/Sydney',hour12:false}})+' AEST';
     var el=document.getElementById('clk');
     if(el) el.textContent=s;
     setTimeout(tick,1000);
