@@ -136,6 +136,43 @@ def _check_indicator(name: str, params: dict, direction: str, price_data: dict) 
             return price <= bb_lower
         return price >= bb_upper
 
+    if name == "fvg":
+        # Price retracing into a Fair Value Gap (1h candles)
+        if direction == "long":
+            low  = price_data.get("fvg_bull_low")
+            high = price_data.get("fvg_bull_high")
+        else:
+            low  = price_data.get("fvg_bear_low")
+            high = price_data.get("fvg_bear_high")
+        if low is None or high is None:
+            return None
+        return low <= price <= high
+
+    if name == "order_block":
+        # Price touching a bullish/bearish Order Block zone (1h candles)
+        tolerance = float(params.get("tolerance_pct", 0.5)) / 100
+        if direction == "long":
+            low  = price_data.get("ob_bull_low")
+            high = price_data.get("ob_bull_high")
+        else:
+            low  = price_data.get("ob_bear_low")
+            high = price_data.get("ob_bear_high")
+        if low is None or high is None:
+            return None
+        # Allow a small tolerance above/below the zone
+        return low * (1 - tolerance) <= price <= high * (1 + tolerance)
+
+    if name == "sr_zone":
+        # Price near a support (long) or resistance (short) level from 1h/4h swing points
+        tolerance = float(params.get("tolerance_pct", 1.0)) / 100
+        if direction == "long":
+            level = price_data.get("support_1h4h")
+        else:
+            level = price_data.get("resistance_1h4h")
+        if level is None:
+            return None
+        return abs(price - level) / level <= tolerance
+
     return None  # unknown indicator — treat as unavailable
 
 
