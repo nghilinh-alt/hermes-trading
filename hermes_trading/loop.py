@@ -121,6 +121,14 @@ def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_dat
     return True
 
 
+def _execute_trade(strategy: dict, price_data: dict) -> dict:
+    """Dispatch to live execution or paper simulator based on HERMES_TRADING_MODE."""
+    if os.getenv("HERMES_TRADING_MODE", "paper") == "live":
+        from hermes_trading.adapters import execution as execution_adapter
+        return execution_adapter.place_live_trade(strategy, price_data)
+    return _simulate_paper_trade(strategy, price_data)
+
+
 def _simulate_paper_trade(strategy: dict, price_data: dict) -> dict:
     """Generate a paper trade record (no real money moves)."""
     entry_price = price_data.get("price", 0)
@@ -202,10 +210,22 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
 
             ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
             if _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}):
-                trade = _simulate_paper_trade(strategy, price_data)
+                # Live mode: skip if already in a position for this asset
+                if os.getenv("HERMES_TRADING_MODE", "paper") == "live":
+                    from hermes_trading.adapters import execution as execution_adapter
+                    if execution_adapter.has_open_position(asset):
+                        console.print(f"[dim]{ts} {tag} Entry signal — position already open, skipping[/dim]")
+                        _write_heartbeat(state_dir, "ok", 0)
+                        consecutive_failures = 0
+                        elapsed = time.monotonic() - tick_start
+                        await asyncio.sleep(max(0, 300 - elapsed))
+                        continue
+
+                trade = _execute_trade(strategy, price_data)
                 _log_trade(state_dir, trade)
                 closed_count = _count_closed_trades(state_dir)
-                console.print(f"[green]{ts} {tag} Trade #{closed_count}: {trade['direction']} @ {trade['entry_price']} → pnl {trade['pnl_pct']:+.4%}[/green]")
+                pnl_display = f"{trade['pnl_pct']:+.4%}" if trade.get("pnl_pct") is not None else "pending"
+                console.print(f"[green]{ts} {tag} Trade #{closed_count}: {trade['direction']} @ {trade['entry_price']} → pnl {pnl_display}[/green]")
                 _maybe_trigger_reflection(resolved_goal, closed_count, state_dir)
             else:
                 rsi_val = price_data.get("rsi_14", "?")
