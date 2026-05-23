@@ -34,20 +34,39 @@ PORT        = 8888
 POLL_SECS   = 60
 
 
-def _ssh(cmd: str) -> str:
-    """Run a command on the VPS via SSH. Returns stdout or empty string on error."""
+def _ssh_batch(files: list[str]) -> dict[str, str]:
+    """Fetch multiple remote files in a single SSH connection. Returns {path: content}."""
+    # Build a shell script that prints each file with a unique delimiter
+    SEP = "---HERMES_SEP---"
+    parts = []
+    for path in files:
+        parts.append(f"echo '{SEP}{path}'; cat {path} 2>/dev/null; echo '{SEP}END'")
+    script = "; ".join(parts)
     result = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", VPS, cmd],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", VPS, script],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
     )
-    return result.stdout.strip() if result.returncode == 0 else ""
+    output = result.stdout if result.returncode == 0 else ""
+    # Parse output back into {path: content}
+    parsed: dict[str, str] = {}
+    current_path = None
+    current_lines: list[str] = []
+    for line in output.splitlines():
+        if line.startswith(SEP) and not line.endswith("END"):
+            current_path = line[len(SEP):]
+            current_lines = []
+        elif line == f"{SEP}END" and current_path:
+            parsed[current_path] = "\n".join(current_lines).strip()
+            current_path = None
+        elif current_path is not None:
+            current_lines.append(line)
+    return parsed
 
 
-def _read_file(remote_path: str, local_fallback: Path | None = None) -> str:
-    """Try SSH first, fall back to local file."""
-    content = _ssh(f"cat {remote_path} 2>/dev/null")
-    if content:
-        return content
+def _read_file(remote_path: str, local_fallback: Path | None = None, _cache: dict | None = None) -> str:
+    """Return content from cache (populated by _ssh_batch) or local fallback."""
+    if _cache is not None and remote_path in _cache:
+        return _cache[remote_path]
     if local_fallback and local_fallback.exists():
         return local_fallback.read_text()
     return ""
@@ -88,7 +107,7 @@ def _parse_heartbeat(text: str) -> dict:
 
 
 def _fetch_data() -> dict:
-    """Pull all state from VPS (or local fallback) and return a structured dict."""
+    """Pull all state from VPS in one SSH call and return a structured dict."""
     data = {
         "updated": datetime.now(AEST).strftime("%H:%M:%S AEST"),
         "assets": {},
@@ -97,8 +116,20 @@ def _fetch_data() -> dict:
         "source": "vps",
     }
 
+    # Build full file list for one-shot SSH fetch
+    all_files = [f"{VPS_BASE}/state/goal.yaml", f"{VPS_BASE}/logs/hermes.log"]
+    for slug in ASSETS:
+        state_dir = f"{VPS_BASE}/state/{slug}"
+        all_files += [
+            f"{state_dir}/trades.jsonl",
+            f"{state_dir}/strategy.yaml",
+            f"{state_dir}/heartbeat.json",
+            f"{state_dir}/hypotheses.jsonl",
+        ]
+    cache = _ssh_batch(all_files)
+
     # Goal config
-    goal_text = _read_file(f"{VPS_BASE}/state/goal.yaml", LOCAL_STATE / "goal.yaml")
+    goal_text = _read_file(f"{VPS_BASE}/state/goal.yaml", LOCAL_STATE / "goal.yaml", cache)
     goal = _parse_strategy(goal_text)
     data["goal"] = {
         "target": goal.get("target_value", "25") + "%",
@@ -114,10 +145,10 @@ def _fetch_data() -> dict:
         state_dir = f"{VPS_BASE}/state/{slug}"
         local_dir = LOCAL_STATE / slug
 
-        trades_text    = _read_file(f"{state_dir}/trades.jsonl")
-        strategy_text  = _read_file(f"{state_dir}/strategy.yaml", (local_dir / "strategy.yaml") if local_dir.exists() else None)
-        hb_text        = _read_file(f"{state_dir}/heartbeat.json")
-        hyp_text       = _read_file(f"{state_dir}/hypotheses.jsonl")
+        trades_text    = _read_file(f"{state_dir}/trades.jsonl", None, cache)
+        strategy_text  = _read_file(f"{state_dir}/strategy.yaml", (local_dir / "strategy.yaml") if local_dir.exists() else None, cache)
+        hb_text        = _read_file(f"{state_dir}/heartbeat.json", None, cache)
+        hyp_text       = _read_file(f"{state_dir}/hypotheses.jsonl", None, cache)
 
         all_trades: list[dict] = []
         for line in trades_text.splitlines():
@@ -154,9 +185,7 @@ def _fetch_data() -> dict:
         }
 
     # Log tail (last 15 lines)
-    log_text = _read_file(f"{VPS_BASE}/state/worker.log")
-    if not log_text:
-        log_text = _ssh(f"tail -15 {VPS_BASE}/state/worker.log")
+    log_text = cache.get(f"{VPS_BASE}/logs/hermes.log", "")
     lines = [l for l in log_text.splitlines() if l.strip()]
     data["log_tail"] = lines[-15:]
 
@@ -275,7 +304,7 @@ def _render_html(d: dict) -> str:
         return (now_utc - timedelta(days=days)).isoformat()
 
     def _period_pnl(trades: list[dict], since_iso: str) -> float:
-        return sum(float(t.get("pnl_pct", 0)) for t in trades if t.get("ts", "") >= since_iso) * 100
+        return sum(float(t.get("pnl_pct") or 0) for t in trades if t.get("ts", "") >= since_iso) * 100
 
     def _pnl_chip(val: float) -> str:
         col = "#1D9E75" if val >= 0 else "#E24B4A"
@@ -324,7 +353,7 @@ def _render_html(d: dict) -> str:
         dirn  = t.get("direction", "—")
         dirn_col = "#1D9E75" if dirn == "long" else "#E24B4A"
         entry = t.get("entry_price", 0)
-        pnl   = float(t.get("pnl_pct", 0)) * 100
+        pnl   = float(t.get("pnl_pct") or 0) * 100
         pnl_col = "#1D9E75" if pnl >= 0 else "#E24B4A"
         sign  = "+" if pnl >= 0 else ""
         ver   = t.get("strategy_version", "—")
