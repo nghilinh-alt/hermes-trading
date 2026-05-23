@@ -204,28 +204,31 @@ def place_live_trade(strategy: dict, price_data: dict) -> dict:
 # ── Closed PnL polling ────────────────────────────────────────────────────────
 
 
-def fetch_recent_closed_pnl(asset: str, limit: int = 10) -> list[dict]:
+def fetch_last_closed_pnl(asset: str) -> dict | None:
     """
-    Fetch recently closed positions from Bybit for reconciliation.
-    Returns a list of dicts with keys: ts, asset, exit_price, order_id.
+    Fetch the most recently closed position P&L from Bybit's closed-pnl endpoint.
+    Returns {exit_price, pnl_pct, closed_pnl_usdt} or None if unavailable.
     """
     exchange = _get_exchange()
-    symbol = _to_perp_symbol(asset)
+    symbol_clean = _to_perp_symbol(asset).replace("/", "").replace(":USDT", "")
     try:
-        raw = exchange.fetch_closed_orders(symbol, limit=limit)
-        results = []
-        for o in raw:
-            if o.get("status") == "closed":
-                results.append(
-                    {
-                        "ts": datetime.fromtimestamp(
-                            o["timestamp"] / 1000, tz=timezone.utc
-                        ).isoformat(),
-                        "asset": asset,
-                        "exit_price": o.get("average"),
-                        "order_id": o.get("id"),
-                    }
-                )
-        return results
+        result = exchange.private_get_v5_position_closed_pnl({
+            "category": "linear",
+            "symbol": symbol_clean,
+            "limit": 1,
+        })
+        items = result.get("result", {}).get("list", [])
+        if not items:
+            return None
+        item = items[0]
+        exit_price  = float(item.get("avgExitPrice", 0) or 0)
+        entry_price = float(item.get("avgEntryPrice", 0) or 0)
+        closed_pnl  = float(item.get("closedPnl", 0) or 0)
+        pnl_pct = round((exit_price - entry_price) / entry_price, 6) if entry_price else 0.0
+        return {
+            "exit_price":       round(exit_price, 4),
+            "pnl_pct":          pnl_pct,
+            "closed_pnl_usdt":  round(closed_pnl, 4),
+        }
     except Exception:
-        return []
+        return None

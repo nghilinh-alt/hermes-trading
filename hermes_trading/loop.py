@@ -233,6 +233,47 @@ def _simulate_paper_trade(strategy: dict, price_data: dict) -> dict:
     }
 
 
+def _reconcile_open_trades(asset: str, state_dir: Path) -> None:
+    """
+    In live mode: if a trade is recorded as open (pnl_pct=None) but Bybit
+    shows no open position, fetch the closed PnL and update trades.jsonl.
+    """
+    if os.getenv("HERMES_TRADING_MODE", "paper") != "live":
+        return
+    trades_file = state_dir / "trades.jsonl"
+    if not trades_file.exists():
+        return
+    lines = [l.strip() for l in trades_file.read_text().splitlines() if l.strip()]
+    trades = []
+    for l in lines:
+        try:
+            trades.append(json.loads(l))
+        except Exception:
+            pass
+    open_indices = [i for i, t in enumerate(trades) if t.get("pnl_pct") is None]
+    if not open_indices:
+        return
+    try:
+        from hermes_trading.adapters import execution as execution_adapter
+        if execution_adapter.has_open_position(asset):
+            return  # position still live — nothing to reconcile
+        closed = execution_adapter.fetch_last_closed_pnl(asset)
+        if not closed:
+            return
+        # Update the most recent open trade with real exit data
+        idx = open_indices[-1]
+        trades[idx]["exit_price"]      = closed["exit_price"]
+        trades[idx]["pnl_pct"]         = closed["pnl_pct"]
+        trades[idx]["closed_pnl_usdt"] = closed["closed_pnl_usdt"]
+        trades_file.write_text("\n".join(json.dumps(t) for t in trades) + "\n")
+        console.print(
+            f"[cyan][{asset}] Reconciled: exit={closed['exit_price']} "
+            f"pnl={closed['pnl_pct']:+.4%}[/cyan]"
+        )
+    except Exception as e:
+        console.print(f"[yellow][{asset}] Reconcile error: {e}[/yellow]")
+
+
 def _maybe_trigger_reflection(goal: dict, trade_count: int, state_dir: Path) -> None:
     """Run reflect when the cadence threshold is crossed."""
     cadence = int(goal.get("reflection_every", 5))
@@ -305,6 +346,7 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
                 rsi_val = price_data.get("rsi_14", "?")
                 console.print(f"[dim]{ts} {tag} No entry · RSI={rsi_val} · price={price_data.get('price')}[/dim]")
 
+            _reconcile_open_trades(asset, state_dir)
             consecutive_failures = 0
             _write_heartbeat(state_dir, "ok", 0)
 
