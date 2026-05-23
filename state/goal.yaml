@@ -7,7 +7,7 @@ assets:           # All assets to monitor in parallel
   - ETH/USDT
   - SOL/USDT
   - TAO/USDT
-mode: paper       # Options: 'paper' (mock) or 'live'
+mode: live        # Options: 'paper' (mock) or 'live'
 timeframe: 5m     # Candle timeframe for all indicators
 
 # Risk Management Settings
