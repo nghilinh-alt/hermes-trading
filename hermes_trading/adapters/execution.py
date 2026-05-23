@@ -6,11 +6,13 @@ Only active when HERMES_TRADING_MODE=live AND HERMES_TRADING_I_ACCEPT_RISK=true.
 
 Safety constraints:
   - One position per asset at a time (checked via fetch_positions)
-  - Position size capped by MAX_POSITION_USD env var (default $100)
+  - Position size = MAX_POSITION_PCT * USDT wallet balance (default 20%)
+  - Leverage scaled 3–15x based on RSI signal strength
   - SL/TP always attached to every order
 """
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import ccxt
 
@@ -23,15 +25,22 @@ def _get_exchange() -> ccxt.Exchange:
     global _exchange
     if _exchange is None:
         api_key = os.getenv("BYBIT_API_KEY", "")
-        api_secret = os.getenv("BYBIT_API_SECRET", "")
-        if not api_key or not api_secret:
+        if not api_key:
+            raise ValueError("BYBIT_API_KEY must be set for live trading")
+
+        # RSA private key auth (Bybit now requires RSA for new keys)
+        key_path = os.getenv("BYBIT_RSA_PRIVATE_KEY_PATH", "")
+        if not key_path or not Path(key_path).exists():
             raise ValueError(
-                "BYBIT_API_KEY and BYBIT_API_SECRET must be set for live trading"
+                f"BYBIT_RSA_PRIVATE_KEY_PATH must point to your private key PEM file "
+                f"(got: {key_path!r})"
             )
+        private_key = Path(key_path).read_text()
+
         _exchange = ccxt.bybit(
             {
                 "apiKey": api_key,
-                "secret": api_secret,
+                "secret": private_key,
                 "enableRateLimit": True,
                 "options": {"defaultType": "linear"},  # USDT perpetual
             }
@@ -48,6 +57,53 @@ def _to_perp_symbol(asset: str) -> str:
         return asset
     base, quote = asset.split("/")
     return f"{base}/{quote}:{quote}"
+
+
+# ── Position sizing ───────────────────────────────────────────────────────────
+
+
+def _fetch_usdt_balance(exchange: ccxt.Exchange) -> float:
+    """Return available USDT balance in the unified/contract wallet."""
+    balance = exchange.fetch_balance({"type": "contract"})
+    usdt = balance.get("USDT", {})
+    return float(usdt.get("free", usdt.get("total", 0)) or 0)
+
+
+def _calc_position_usd(exchange: ccxt.Exchange) -> float:
+    """Return position size in USD: MAX_POSITION_PCT × USDT balance."""
+    pct = float(os.getenv("MAX_POSITION_PCT", "0.20"))
+    balance = _fetch_usdt_balance(exchange)
+    if balance <= 0:
+        raise RuntimeError("USDT balance is zero — cannot size position")
+    return balance * pct
+
+
+# ── Leverage scaling ──────────────────────────────────────────────────────────
+
+
+def _calc_leverage(rsi: float | None, threshold: float, direction: str) -> int:
+    """
+    Scale leverage linearly between MIN_LEVERAGE and MAX_LEVERAGE based on
+    how far RSI is from the entry threshold.
+
+    For longs: RSI at threshold=3x, RSI at 0=15x (max conviction at extreme lows).
+    For shorts: RSI at threshold=3x, RSI at 100=15x.
+    """
+    min_lev = int(os.getenv("MIN_LEVERAGE", "3"))
+    max_lev = int(os.getenv("MAX_LEVERAGE", "15"))
+
+    if rsi is None:
+        return min_lev
+
+    if direction == "long":
+        # distance: 0 at threshold, 1 at RSI=0
+        distance = max(0.0, (threshold - rsi) / threshold)
+    else:
+        # distance: 0 at threshold, 1 at RSI=100
+        distance = max(0.0, (rsi - threshold) / (100 - threshold))
+
+    leverage = min_lev + (max_lev - min_lev) * distance
+    return max(min_lev, min(max_lev, round(leverage)))
 
 
 # ── Position guard ────────────────────────────────────────────────────────────
@@ -75,7 +131,9 @@ def place_live_trade(strategy: dict, price_data: dict) -> dict:
     """
     Place a real market order on Bybit USDT perpetual.
 
-    Attaches stop-loss and take-profit at order creation.
+    - Position size = 20% of USDT balance (configurable via MAX_POSITION_PCT)
+    - Leverage = 3–15x scaled by RSI signal strength (MIN_LEVERAGE / MAX_LEVERAGE)
+    - SL/TP attached at order creation
     Returns a trade record dict matching the schema used by loop.py.
     """
     exchange = _get_exchange()
@@ -87,10 +145,16 @@ def place_live_trade(strategy: dict, price_data: dict) -> dict:
 
     entry_price = float(price_data.get("price", 0))
     stop_loss_pct = float(strategy.get("stop_loss_pct", 2.0)) / 100
-    max_pos_usd = float(os.getenv("MAX_POSITION_USD", "100"))
 
-    # Quantity in base currency (e.g. BTC), rounded to exchange precision
-    qty = exchange.amount_to_precision(symbol, max_pos_usd / entry_price)
+    # Dynamic leverage based on RSI signal strength
+    rsi = price_data.get("rsi_14")
+    threshold = float(strategy.get("entry", {}).get("threshold", 30))
+    leverage = _calc_leverage(rsi, threshold, direction)
+    exchange.set_leverage(leverage, symbol)
+
+    # Position size = 20% of balance, notional value
+    pos_usd = _calc_position_usd(exchange)
+    qty = exchange.amount_to_precision(symbol, pos_usd / entry_price)
 
     # SL/TP prices — 2:1 reward-to-risk
     if direction == "long":
@@ -124,10 +188,11 @@ def place_live_trade(strategy: dict, price_data: dict) -> dict:
         "pnl_pct": None,          # filled when position closes
         "order_id": order.get("id"),
         "qty": qty,
+        "leverage": leverage,
         "sl_price": sl_price,
         "tp_price": tp_price,
         "strategy_version": strategy.get("version", "01"),
-        "rsi_at_entry": price_data.get("rsi_14"),
+        "rsi_at_entry": rsi,
         "ema_9_at_entry": price_data.get("ema_9"),
         "bb_lower_at_entry": price_data.get("bb_lower"),
         "bb_upper_at_entry": price_data.get("bb_upper"),
@@ -140,7 +205,7 @@ def place_live_trade(strategy: dict, price_data: dict) -> dict:
 def fetch_recent_closed_pnl(asset: str, limit: int = 10) -> list[dict]:
     """
     Fetch recently closed positions from Bybit for reconciliation.
-    Returns a list of dicts with keys: ts, asset, pnl_pct, exit_price.
+    Returns a list of dicts with keys: ts, asset, exit_price, order_id.
     """
     exchange = _get_exchange()
     symbol = _to_perp_symbol(asset)
