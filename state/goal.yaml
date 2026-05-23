@@ -44,7 +44,7 @@ data:
 # Goal Definition for Self-Improvement
 objective:
   type: pnl                          # Options: 'pnl' (maximize profit), 'sharpe' (risk-adjusted)
-  target_value: 50.0                 # Target return % over timeline_days (50.0 = +50%)
+  target_value: 25.0                 # Target return % over timeline_days (25.0 = +25%)
   timeline_days: 30                  # Expected timeframe to reach goal
 
 # Environment Configuration
