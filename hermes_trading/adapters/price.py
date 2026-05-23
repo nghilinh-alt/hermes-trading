@@ -28,7 +28,8 @@ async def fetch(asset: str = "BTC/USDT") -> dict:
     exchange = exchange_cls(config)
 
     try:
-        ohlcv = await exchange.fetch_ohlcv(asset, timeframe="1m", limit=100)
+        timeframe = os.getenv("HERMES_TIMEFRAME", "5m")
+        ohlcv = await exchange.fetch_ohlcv(asset, timeframe=timeframe, limit=100)
         ticker = await exchange.fetch_ticker(asset)
     finally:
         await exchange.close()

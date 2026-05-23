@@ -1,8 +1,14 @@
 # HerMES-Trading Agent - Goal Configuration
 # This file defines the trading strategy and objectives for the autonomous agent
 
-asset: BTC/USDT  # Trading pair
+asset: BTC/USDT   # Primary asset (used if assets list is absent)
+assets:           # All assets to monitor in parallel
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - TAO/USDT
 mode: paper       # Options: 'paper' (mock) or 'live'
+timeframe: 5m     # Candle timeframe for all indicators
 
 # Risk Management Settings
 risk:

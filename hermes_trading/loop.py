@@ -28,11 +28,7 @@ from hermes_trading.adapters import macro as macro_adapter
 
 console = Console()
 
-STATE_DIR   = Path(os.getenv("STATE_DIR", "state"))
-TRADES_FILE = STATE_DIR / "trades.jsonl"
-HB_FILE     = STATE_DIR / "heartbeat.json"
-STRATEGY_FILE = STATE_DIR / "strategy.yaml"
-GOAL_FILE   = STATE_DIR / "goal.yaml"
+_BASE_STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
 
 MAX_CONSECUTIVE_FAILURES = 5
 RETRY_ATTEMPTS = 3
@@ -62,22 +58,23 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def _count_closed_trades() -> int:
-    if not TRADES_FILE.exists():
+def _count_closed_trades(state_dir: Path) -> int:
+    trades_file = state_dir / "trades.jsonl"
+    if not trades_file.exists():
         return 0
-    return sum(1 for line in TRADES_FILE.read_text().splitlines() if line.strip())
+    return sum(1 for line in trades_file.read_text().splitlines() if line.strip())
 
 
-def _write_heartbeat(status: str, consecutive_failures: int):
-    HB_FILE.write_text(json.dumps({
+def _write_heartbeat(state_dir: Path, status: str, consecutive_failures: int) -> None:
+    (state_dir / "heartbeat.json").write_text(json.dumps({
         "status": status,
         "last_tick": datetime.now(timezone.utc).isoformat(),
         "consecutive_failures": consecutive_failures,
     }))
 
 
-def _log_trade(trade: dict):
-    with open(TRADES_FILE, "a") as f:
+def _log_trade(state_dir: Path, trade: dict) -> None:
+    with open(state_dir / "trades.jsonl", "a") as f:
         f.write(json.dumps(trade) + "\n")
 
 
@@ -154,16 +151,16 @@ def _simulate_paper_trade(strategy: dict, price_data: dict) -> dict:
     }
 
 
-def _maybe_trigger_reflection(goal: dict, trade_count: int):
+def _maybe_trigger_reflection(goal: dict, trade_count: int, state_dir: Path) -> None:
     """Run reflect when the cadence threshold is crossed."""
     cadence = int(goal.get("reflection_every", 5))
     if trade_count > 0 and trade_count % cadence == 0:
         mode = os.getenv("HERMES_TRADING_MODE", "paper")
         reflect_mode = "--hermes" if mode == "live" else "--fallback"
-        console.print(f"[bold cyan]Reflection trigger at {trade_count} trades → running reflect {reflect_mode}[/bold cyan]")
+        console.print(f"[bold cyan]{state_dir.name}: reflection at {trade_count} trades → {reflect_mode}[/bold cyan]")
         try:
             subprocess.run(
-                ["python", "-m", "hermes_trading.reflect", reflect_mode],
+                ["python", "-m", "hermes_trading.reflect", reflect_mode, "--state-dir", str(state_dir)],
                 check=True,
                 timeout=120,
             )
@@ -171,24 +168,26 @@ def _maybe_trigger_reflection(goal: dict, trade_count: int):
             console.print(f"[red]Reflection failed: {e}[/red]")
 
 
-async def run(asset: str, goal: dict | None = None):
+async def run(asset: str, goal: dict | None = None, state_dir: Path | None = None) -> None:
     """Main async loop — runs forever.
 
-    *goal* is the pre-resolved dict from run.py (_resolve_goal).
-    If not provided the loop falls back to reading GOAL_FILE each tick.
+    *goal*      pre-resolved dict from run.py. Falls back to reading goal.yaml if None.
+    *state_dir* per-asset state directory (e.g. state/btc_usdt/). Falls back to state/.
     """
-    console.print(f"[bold green]Booting hermes-trading worker · asset={asset} · mode={os.getenv('HERMES_TRADING_MODE','paper')}[/bold green]")
+    state_dir = state_dir or _BASE_STATE_DIR
+    strategy_file = state_dir / "strategy.yaml"
+    tag = f"[{asset}]"
+
+    console.print(f"[bold green]Booting hermes-trading worker · {asset} · {state_dir} · mode={os.getenv('HERMES_TRADING_MODE','paper')}[/bold green]")
 
     consecutive_failures = 0
 
     while True:
         tick_start = time.monotonic()
         try:
-            # Reload goal each tick only if not pre-resolved (supports live edits)
-            resolved_goal = goal if goal is not None else _load_yaml(GOAL_FILE)
-            strategy = _load_yaml(STRATEGY_FILE)
+            resolved_goal = goal if goal is not None else _load_yaml(_BASE_STATE_DIR / "goal.yaml")
+            strategy = _load_yaml(strategy_file)
 
-            # Fetch all adapters concurrently
             results = await asyncio.gather(
                 _fetch_with_retry(price_adapter, asset, "price"),
                 _fetch_with_retry(onchain_adapter, asset, "onchain"),
@@ -201,32 +200,31 @@ async def run(asset: str, goal: dict | None = None):
             if price_data is None:
                 raise RuntimeError("price adapter returned None — cannot evaluate strategy")
 
-            # Evaluate and potentially trade
             if _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}):
                 trade = _simulate_paper_trade(strategy, price_data)
-                _log_trade(trade)
-                closed_count = _count_closed_trades()
-                console.print(f"[green]Trade #{closed_count}: {trade['direction']} @ {trade['entry_price']} → pnl {trade['pnl_pct']:+.4%}[/green]")
-                _maybe_trigger_reflection(resolved_goal, closed_count)
+                _log_trade(state_dir, trade)
+                closed_count = _count_closed_trades(state_dir)
+                console.print(f"[green]{tag} Trade #{closed_count}: {trade['direction']} @ {trade['entry_price']} → pnl {trade['pnl_pct']:+.4%}[/green]")
+                _maybe_trigger_reflection(resolved_goal, closed_count, state_dir)
             else:
                 rsi_val = price_data.get("rsi_14", "?")
-                console.print(f"[dim]No entry · RSI={rsi_val} · price={price_data.get('price')}[/dim]")
+                console.print(f"[dim]{tag} No entry · RSI={rsi_val} · price={price_data.get('price')}[/dim]")
 
             consecutive_failures = 0
-            _write_heartbeat("ok", 0)
+            _write_heartbeat(state_dir, "ok", 0)
 
         except Exception as e:
             consecutive_failures += 1
-            console.print(f"[red]Loop error (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}[/red]")
+            console.print(f"[red]{tag} Loop error (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}[/red]")
             traceback.print_exc()
-            _write_heartbeat("error", consecutive_failures)
+            _write_heartbeat(state_dir, "error", consecutive_failures)
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                console.print("[bold red]Circuit breaker tripped — too many consecutive failures. Sleeping 10 minutes.[/bold red]")
+                console.print(f"[bold red]{tag} Circuit breaker tripped — sleeping 10 minutes.[/bold red]")
                 await asyncio.sleep(600)
                 consecutive_failures = 0
 
-        # Target: one tick per minute
+        # Tick every 5 minutes (matches the 5m candle timeframe)
         elapsed = time.monotonic() - tick_start
-        sleep_for = max(0, 60 - elapsed)
+        sleep_for = max(0, 300 - elapsed)
         await asyncio.sleep(sleep_for)
