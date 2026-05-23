@@ -28,19 +28,21 @@ def _get_exchange() -> ccxt.Exchange:
         if not api_key:
             raise ValueError("BYBIT_API_KEY must be set for live trading")
 
-        # RSA private key auth (Bybit now requires RSA for new keys)
+        # RSA auth if key path provided, otherwise fall back to HMAC secret
         key_path = os.getenv("BYBIT_RSA_PRIVATE_KEY_PATH", "")
-        if not key_path or not Path(key_path).exists():
-            raise ValueError(
-                f"BYBIT_RSA_PRIVATE_KEY_PATH must point to your private key PEM file "
-                f"(got: {key_path!r})"
-            )
-        private_key = Path(key_path).read_text()
+        if key_path and Path(key_path).exists():
+            secret = Path(key_path).read_text()
+        else:
+            secret = os.getenv("BYBIT_API_SECRET", "")
+            if not secret:
+                raise ValueError(
+                    "Either BYBIT_RSA_PRIVATE_KEY_PATH or BYBIT_API_SECRET must be set"
+                )
 
         _exchange = ccxt.bybit(
             {
                 "apiKey": api_key,
-                "secret": private_key,
+                "secret": secret,
                 "enableRateLimit": True,
                 "options": {"defaultType": "linear"},  # USDT perpetual
             }
