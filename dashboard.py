@@ -523,19 +523,80 @@ def _render_html(d: dict) -> str:
     # ── Trade history table ───────────────────────────────────────────────────
     recent_trades = sorted(all_trades_flat, key=lambda t: t.get("ts", ""), reverse=True)[:50]
 
+    # Short display names for indicators — keeps chips compact
+    _IND_SHORT = {
+        "rsi": "RSI", "ema_trend": "EMA", "macd": "MACD", "vwap": "VWAP",
+        "volume_spike": "VOL", "bb_squeeze": "BB", "fvg": "FVG",
+        "order_block": "OB", "sr_zone": "SR",
+    }
+
+    # Snapshot keys to show in the tooltip, with short labels
+    _SNAP_LABELS = [
+        ("rsi_14",        "RSI"),
+        ("macd_line",     "MACD"),
+        ("macd_hist",     "Hist"),
+        ("vwap",          "VWAP"),
+        ("volume_ratio",  "VolR"),
+        ("ema_50",        "EMA50"),
+        ("bb_upper",      "BB↑"),
+        ("bb_lower",      "BB↓"),
+        ("atr_14",        "ATR"),
+        ("support_1h4h",  "Sup"),
+        ("resistance_1h4h","Res"),
+    ]
+
+    def _signals_cell(t: dict) -> str:
+        fired    = t.get("indicators_fired") or {}
+        snapshot = t.get("indicators_snapshot") or {}
+
+        if not fired:
+            return "<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>—</td>"
+
+        # Build hover tooltip from snapshot values
+        tip_parts = []
+        for key, label in _SNAP_LABELS:
+            val = snapshot.get(key)
+            if val is not None:
+                try:
+                    tip_parts.append(f"{label}:{float(val):.2f}")
+                except Exception:
+                    pass
+        tooltip = "  |  ".join(tip_parts) if tip_parts else ""
+
+        # Build chips — green for fired, dim for not fired, skip None (no data)
+        chips = []
+        for name, result in sorted(fired.items()):
+            if result is None:
+                continue
+            short = _IND_SHORT.get(name, name[:3].upper())
+            if result:
+                chips.append(
+                    f"<span style='display:inline-block;padding:1px 5px;margin:1px;border-radius:3px;"
+                    f"background:rgba(29,158,117,0.15);color:#1D9E75;font-size:10px'>{short}</span>"
+                )
+            else:
+                chips.append(
+                    f"<span style='display:inline-block;padding:1px 5px;margin:1px;border-radius:3px;"
+                    f"background:rgba(0,0,0,0.04);color:var(--muted);font-size:10px'>{short}</span>"
+                )
+
+        chips_html = "".join(chips) if chips else "<span style='color:var(--muted);font-size:11px'>—</span>"
+        title_attr = f" title='{tooltip}'" if tooltip else ""
+        return f"<td style='padding:5px 8px'{title_attr}>{chips_html}</td>"
+
     def _trade_row(t: dict) -> str:
         ts_raw = t.get("ts", "")
         try:
             ts = datetime.fromisoformat(ts_raw).astimezone(AEST).strftime("%m-%d %H:%M")
         except Exception:
             ts = ts_raw[:16].replace("T", " ")
-        asset_l    = t.get("asset", "—")
-        dirn       = t.get("direction", "—")
-        dc         = "#1D9E75" if dirn == "long" else "#E24B4A"
-        entry      = t.get("entry_price", 0)
-        exitp      = t.get("exit_price")
-        abandoned  = t.get("abandoned", False)
-        pnl_r      = t.get("pnl_pct")
+        asset_l   = t.get("asset", "—")
+        dirn      = t.get("direction", "—")
+        dc        = "#1D9E75" if dirn == "long" else "#E24B4A"
+        entry     = t.get("entry_price", 0)
+        exitp     = t.get("exit_price")
+        abandoned = t.get("abandoned", False)
+        pnl_r     = t.get("pnl_pct")
         if abandoned:
             exit_s = "<span style='color:var(--muted);font-style:italic'>abandoned</span>"
             ps, pc = "—", "var(--muted)"
@@ -545,11 +606,11 @@ def _render_html(d: dict) -> str:
             pc     = _pnl_col(pv)
             exit_s = f"${float(exitp):,.2f}" if exitp is not None else "—"
         else:
-            exit_s  = "<span style='color:#EF9F27;font-weight:500'>open</span>"
-            ps, pc  = "open", "#EF9F27"
-        conf  = t.get("confidence_at_entry")
-        cs    = f"{float(conf)*100:.0f}%" if conf is not None else "—"
-        ver   = t.get("strategy_version", "—")
+            exit_s = "<span style='color:#EF9F27;font-weight:500'>open</span>"
+            ps, pc = "open", "#EF9F27"
+        conf = t.get("confidence_at_entry")
+        cs   = f"{float(conf)*100:.0f}%" if conf is not None else "—"
+        ver  = t.get("strategy_version", "—")
         return (
             f"<tr style='border-top:0.5px solid var(--border)'>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{ts}</td>"
@@ -558,6 +619,7 @@ def _render_html(d: dict) -> str:
             f"<td style='padding:5px 8px;font-size:11px'>${float(entry):,.2f}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{exit_s}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{cs}</td>"
+            + _signals_cell(t) +
             f"<td style='padding:5px 8px;font-size:12px;font-weight:500;color:{pc}'>{ps}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>v{ver}</td>"
             f"</tr>"
@@ -575,6 +637,7 @@ def _render_html(d: dict) -> str:
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">entry</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">exit</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">conf</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">signals fired</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">P&L</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">strat</th>
       </tr>
