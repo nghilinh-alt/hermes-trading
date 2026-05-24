@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -346,7 +347,7 @@ def _maybe_trigger_reflection(goal: dict, trade_count: int, state_dir: Path) -> 
         console.print(f"[bold cyan]{state_dir.name}: reflection at {trade_count} trades → {reflect_mode}[/bold cyan]")
         try:
             subprocess.run(
-                ["python", "-m", "hermes_trading.reflect", reflect_mode, "--state-dir", str(state_dir)],
+                [sys.executable, "-m", "hermes_trading.reflect", reflect_mode, "--state-dir", str(state_dir)],
                 check=True,
                 timeout=120,
             )
