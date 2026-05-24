@@ -1,0 +1,46 @@
+ HerMES-Trading Agent - Goal Configuration
+# This file defines the trading strategy and objectives for the autonomous agent
+
+asset: BTC/USDT   # Primary asset (used if assets list is absent)
+assets:           # All assets to monitor in parallel
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - TAO/USDT
+mode: live        # Options: 'paper' (mock) or 'live'
+timeframe: 5m     # Candle timeframe for all indicators
+# Risk Management Settings
+risk:
+  max_position_usd: 100.0           # Maximum position size in USD
+  stop_loss_pct: 5.0                # Stop loss percentage from entry
+  take_profit_pct: 10.0             # Take profit percentage from entry
+  trailing_stop_pct: 3.0            # Trailing stop activation threshold
+# Reflection & Learning
+reflection_every: 5                  # Reflect every N closed trades (overrides interval_seconds)
+reflection:
+  enabled: true
+  interval_seconds: 3600             # Fallback time-based cadence (ignored when reflection_every is set)
+  consider_past_trades: true         # Use historical trades for strategy improvement
+  target_improvement_pct: 1.5        # Aim for 1.5% better than baseline each cycle
+# Scoring System
+score:
+  metrics:
+    - pnl                             # Profit/Loss (primary)
+    - sharpe_ratio                    # Risk-adjusted returns
+    - win_rate                        % of winning trades
+    - max_drawdown                   # Worst loss streak
+# Data Sources
+data:
+  exchanges: ["binance"]             # CCXT exchange(s) to use
+  macro_sources: ["federalreserve", "tradingeconomics"]
+  news_api_key: ""                   # Leave blank for demo, or set key
+  onchain_api_key: ""                # Leave blank for demo, or set Glassnode key
+# Goal Definition for Self-Improvement
+objective:
+  type: pnl                          # Options: 'pnl' (maximize profit), 'sharpe' (risk-adjusted)
+  target_value: 25.0                 # Target return % over timeline_days (25.0 = +25%)
+  timeline_days: 30                  # Expected timeframe to reach goal
+# Environment Configuration
+environment:
+  log_level: "INFO"                  # Options: DEBUG, INFO, WARNING, ERROR
+  output_format: "rich"              # Use rich library for colorful console output
