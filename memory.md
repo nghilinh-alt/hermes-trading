@@ -37,13 +37,14 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-05-24 | dashboard.py uses yaml.safe_load for YAML parsing | Homebrew flat-key parser was missing nested goal values |
 
 ## Known Issues / TODOs
-- VPS SSH unreachable during 2026-05-24 session — push to GitHub, user pulls manually
-- Dashboard needs VPS SSH key to be configured; falls back gracefully to local state
-- state/strategy.yaml in root is legacy — per-asset dirs are the source of truth on VPS
+- state/strategy.yaml in root is legacy — per-asset dirs under state/{asset_slug}/ are the source of truth on VPS
+- VPS has stale state/hypotheses.jsonl and state/trades.jsonl at root level (old pre-per-asset structure) — safe to ignore, not read by loop.py
+- Dashboard requires SSH key auth to VPS; shows last-known-state banner when unreachable
+- Always activate venv before running agent: `source venv/bin/activate`
 
 ## Handoffs
-- Next session: confirm VPS pulled latest master, verify reflect.py --state-dir works in live loop
-- Handoff to: Linh (manual VPS pull + restart agent)
+- Agent is live ✓ — next session: check trade count and first reflection firing
+- Handoff to: Linh (monitor dashboard, check state/btc_usdt/memory.md after 5 trades)
 
 ## Session Log
 ### 2026-05-24
@@ -53,4 +54,5 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - Found dashboard bugs: homebrew YAML parser, wrong goal key names, no win rate, no indicator weights panel
 - Fixed dashboard.py: proper yaml.safe_load, correct nested goal parsing, win rate + indicator weights panel per asset, last-known-state fallback on SSH error, expanded log tail to 25 lines
 - Created memory.md (this file) and state/memory.md template
-- Committed and pushed to GitHub master
+- Pushed to GitHub, user pulled on VPS and restarted agent with venv activated
+- All 4 workers confirmed live: BTC/USDT, ETH/USDT, SOL/USDT, TAO/USDT in live mode

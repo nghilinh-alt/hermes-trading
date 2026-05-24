@@ -34,6 +34,28 @@ MAX_CONSECUTIVE_FAILURES = 5
 RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 2  # seconds
 
+# All indicator keys captured from price_data at entry — extend here when new
+# indicators are added to adapters/price.py
+_INDICATOR_SNAPSHOT_KEYS: list[str] = [
+    "rsi_14",
+    "ema_9", "ema_50",
+    "bb_upper", "bb_mid", "bb_lower",
+    "macd_line", "macd_signal", "macd_hist",
+    "atr_14",
+    "vwap",
+    "volume_ratio",
+    "fvg_bull_low", "fvg_bull_high",
+    "fvg_bear_low", "fvg_bear_high",
+    "ob_bull_low",  "ob_bull_high",
+    "ob_bear_low",  "ob_bear_high",
+    "support_1h4h", "resistance_1h4h",
+]
+
+
+def _snapshot_indicators(price_data: dict) -> dict:
+    """Capture a clean snapshot of all indicator values from price_data."""
+    return {k: price_data.get(k) for k in _INDICATOR_SNAPSHOT_KEYS}
+
 
 async def _fetch_with_retry(adapter, asset: str, name: str) -> dict | None:
     """Fetch from an adapter with exponential backoff. Returns None on total failure."""
@@ -176,7 +198,7 @@ def _check_indicator(name: str, params: dict, direction: str, price_data: dict) 
     return None  # unknown indicator — treat as unavailable
 
 
-def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_data: dict) -> bool:
+def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_data: dict) -> dict:
     """
     Modular weighted indicator registry.
 
@@ -185,25 +207,31 @@ def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_dat
       weight   (float) — contribution toward optional confidence score
       params   (dict)  — indicator-specific config
 
-    A trade fires when:
-      1. All required indicators return True
-      2. The sum of weights from passing optional indicators >= entry.min_confidence
+    Returns a dict:
+      fires            (bool)              — whether entry condition is met
+      confidence       (float)             — optional-indicator confidence score 0–1
+      indicators_fired (dict[str, bool|None]) — per-indicator result (None = no data)
     """
-    indicators = strategy.get("indicators", [])
-    direction  = strategy.get("entry", {}).get("direction", "long")
-    min_conf   = float(strategy.get("entry", {}).get("min_confidence", 0.0))
+    indicators       = strategy.get("indicators", [])
+    direction        = strategy.get("entry", {}).get("direction", "long")
+    min_conf         = float(strategy.get("entry", {}).get("min_confidence", 0.0))
+    indicators_fired: dict[str, bool | None] = {}
+
+    def _result(fires: bool, confidence: float = 0.0) -> dict:
+        return {"fires": fires, "confidence": round(confidence, 4), "indicators_fired": indicators_fired}
 
     # Fallback: if no indicator registry defined, replicate original RSI behaviour
     if not indicators:
         entry     = strategy.get("entry", {})
         rsi       = price_data.get("rsi_14", 50.0)
         threshold = float(entry.get("threshold", 30))
-        if direction == "long":
-            return rsi < threshold
-        return rsi > threshold
+        fired     = rsi < threshold if direction == "long" else rsi > threshold
+        indicators_fired["rsi"] = fired
+        return _result(fired, 1.0 if fired else 0.0)
 
     optional_total  = sum(float(i.get("weight", 1.0)) for i in indicators if not i.get("required", False))
     optional_passed = 0.0
+    fires           = True
 
     for ind in indicators:
         name     = ind.get("name", "")
@@ -212,61 +240,59 @@ def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_dat
         weight   = float(ind.get("weight", 1.0))
 
         result = _check_indicator(name, params, direction, price_data)
+        indicators_fired[name] = result   # True / False / None (no data)
 
         if result is None:
-            # Data unavailable — skip required indicators gracefully, skip optional
-            continue
+            continue   # data unavailable — skip gracefully
 
         if required and not result:
-            return False   # hard gate failed
+            fires = False   # hard gate failed — keep evaluating to log all indicators
 
         if not required and result:
             optional_passed += weight
 
-    # Check optional confidence threshold (only meaningful if there are optional indicators)
-    if optional_total > 0 and min_conf > 0:
-        confidence = optional_passed / optional_total
-        if confidence < min_conf:
-            return False
+    # Check optional confidence threshold
+    confidence = optional_passed / optional_total if optional_total > 0 else 1.0
+    if fires and optional_total > 0 and min_conf > 0 and confidence < min_conf:
+        fires = False
 
-    return True
+    return _result(fires, confidence)
 
 
-def _execute_trade(strategy: dict, price_data: dict) -> dict:
+def _execute_trade(strategy: dict, price_data: dict, entry_detail: dict) -> dict:
     """Dispatch to live execution or paper simulator based on HERMES_TRADING_MODE."""
     if os.getenv("HERMES_TRADING_MODE", "paper") == "live":
         from hermes_trading.adapters import execution as execution_adapter
-        return execution_adapter.place_live_trade(strategy, price_data)
-    return _simulate_paper_trade(strategy, price_data)
+        return execution_adapter.place_live_trade(strategy, price_data, entry_detail)
+    return _simulate_paper_trade(strategy, price_data, entry_detail)
 
 
-def _simulate_paper_trade(strategy: dict, price_data: dict) -> dict:
+def _simulate_paper_trade(strategy: dict, price_data: dict, entry_detail: dict) -> dict:
     """Generate a paper trade record (no real money moves)."""
-    entry_price = price_data.get("price", 0)
-    stop_loss_pct = float(strategy.get("stop_loss_pct", 2.0)) / 100
-    position_size_r = float(strategy.get("position_size_r", 0.5))
-    direction = strategy.get("entry", {}).get("direction", "long")
-
-    # Simulate a very short hold: assume 0.1–0.5% move for paper purposes
     import random
-    move_pct = random.uniform(-stop_loss_pct, stop_loss_pct * 1.5)
-    pnl_pct = move_pct * position_size_r if direction == "long" else -move_pct * position_size_r
 
+    entry_price     = price_data.get("price", 0)
+    stop_loss_pct   = float(strategy.get("stop_loss_pct", 2.0)) / 100
+    position_size_r = float(strategy.get("position_size_r", 0.5))
+    direction       = strategy.get("entry", {}).get("direction", "long")
+
+    move_pct  = random.uniform(-stop_loss_pct, stop_loss_pct * 1.5)
+    pnl_pct   = move_pct * position_size_r if direction == "long" else -move_pct * position_size_r
     exit_price = entry_price * (1 + move_pct)
 
     return {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "mode": os.getenv("HERMES_TRADING_MODE", "paper"),
-        "asset": price_data.get("asset", "BTC/USDT"),
-        "direction": direction,
-        "entry_price": entry_price,
-        "exit_price": round(exit_price, 4),
-        "pnl_pct": round(pnl_pct, 6),
+        "ts":               datetime.now(timezone.utc).isoformat(),
+        "mode":             os.getenv("HERMES_TRADING_MODE", "paper"),
+        "asset":            price_data.get("asset", "BTC/USDT"),
+        "direction":        direction,
+        "entry_price":      entry_price,
+        "exit_price":       round(exit_price, 4),
+        "pnl_pct":          round(pnl_pct, 6),
         "strategy_version": strategy.get("version", "01"),
-        "rsi_at_entry": price_data.get("rsi_14"),
-        "ema_9_at_entry": price_data.get("ema_9"),
-        "bb_lower_at_entry": price_data.get("bb_lower"),
-        "bb_upper_at_entry": price_data.get("bb_upper"),
+        # Full indicator snapshot at entry — used by reflect.py for richer learning
+        "indicators_snapshot": _snapshot_indicators(price_data),
+        "indicators_fired":    entry_detail.get("indicators_fired", {}),
+        "confidence_at_entry": entry_detail.get("confidence"),
     }
 
 
@@ -360,8 +386,10 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
             if price_data is None:
                 raise RuntimeError("price adapter returned None — cannot evaluate strategy")
 
-            ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-            if _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}):
+            ts           = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            entry_result = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {})
+
+            if entry_result["fires"]:
                 # Live mode: skip if already in a position for this asset
                 if os.getenv("HERMES_TRADING_MODE", "paper") == "live":
                     from hermes_trading.adapters import execution as execution_adapter
@@ -373,15 +401,24 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
                         await asyncio.sleep(max(0, 300 - elapsed))
                         continue
 
-                trade = _execute_trade(strategy, price_data)
+                trade = _execute_trade(strategy, price_data, entry_result)
                 _log_trade(state_dir, trade)
                 closed_count = _count_closed_trades(state_dir)
-                pnl_display = f"{trade['pnl_pct']:+.4%}" if trade.get("pnl_pct") is not None else "pending"
-                console.print(f"[green]{ts} {tag} Trade #{closed_count}: {trade['direction']} @ {trade['entry_price']} → pnl {pnl_display}[/green]")
+                pnl_display  = f"{trade['pnl_pct']:+.4%}" if trade.get("pnl_pct") is not None else "pending"
+                fired_names  = [k for k, v in entry_result.get("indicators_fired", {}).items() if v]
+                console.print(
+                    f"[green]{ts} {tag} Trade #{closed_count}: {trade['direction']} "
+                    f"@ {trade['entry_price']} · conf={entry_result['confidence']:.0%} "
+                    f"· fired={fired_names} · pnl {pnl_display}[/green]"
+                )
                 _maybe_trigger_reflection(resolved_goal, closed_count, state_dir)
             else:
-                rsi_val = price_data.get("rsi_14", "?")
-                console.print(f"[dim]{ts} {tag} No entry · RSI={rsi_val} · price={price_data.get('price')}[/dim]")
+                rsi_val   = price_data.get("rsi_14", "?")
+                conf_val  = entry_result.get("confidence", 0)
+                console.print(
+                    f"[dim]{ts} {tag} No entry · RSI={rsi_val} · "
+                    f"conf={conf_val:.0%} · price={price_data.get('price')}[/dim]"
+                )
 
             _reconcile_open_trades(asset, state_dir)
             consecutive_failures = 0

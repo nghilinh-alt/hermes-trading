@@ -129,34 +129,36 @@ def has_open_position(asset: str) -> bool:
 # ── Order placement ───────────────────────────────────────────────────────────
 
 
-def place_live_trade(strategy: dict, price_data: dict) -> dict:
+def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None = None) -> dict:
     """
     Place a real market order on Bybit USDT perpetual.
 
     - Position size = 20% of USDT balance (configurable via MAX_POSITION_PCT)
     - Leverage = 3–15x scaled by RSI signal strength (MIN_LEVERAGE / MAX_LEVERAGE)
     - SL/TP attached at order creation
+    - entry_detail: dict from loop._evaluate_entry with indicators_fired + confidence
     Returns a trade record dict matching the schema used by loop.py.
     """
+    from hermes_trading.loop import _snapshot_indicators
+
     exchange = _get_exchange()
 
-    asset = price_data.get("asset", "BTC/USDT")
-    symbol = _to_perp_symbol(asset)
-    direction = strategy.get("entry", {}).get("direction", "long")
-    side = "buy" if direction == "long" else "sell"
-
-    entry_price = float(price_data.get("price", 0))
+    asset         = price_data.get("asset", "BTC/USDT")
+    symbol        = _to_perp_symbol(asset)
+    direction     = strategy.get("entry", {}).get("direction", "long")
+    side          = "buy" if direction == "long" else "sell"
+    entry_price   = float(price_data.get("price", 0))
     stop_loss_pct = float(strategy.get("stop_loss_pct", 2.0)) / 100
 
     # Dynamic leverage based on RSI signal strength
-    rsi = price_data.get("rsi_14")
+    rsi       = price_data.get("rsi_14")
     threshold = float(strategy.get("entry", {}).get("threshold", 30))
-    leverage = _calc_leverage(rsi, threshold, direction)
+    leverage  = _calc_leverage(rsi, threshold, direction)
     exchange.set_leverage(leverage, symbol)
 
     # Position size = 20% of balance, notional value
     pos_usd = _calc_position_usd(exchange)
-    qty = exchange.amount_to_precision(symbol, pos_usd / entry_price)
+    qty     = exchange.amount_to_precision(symbol, pos_usd / entry_price)
 
     # SL/TP prices — 2:1 reward-to-risk
     if direction == "long":
@@ -168,36 +170,31 @@ def place_live_trade(strategy: dict, price_data: dict) -> dict:
 
     # Place market order with SL/TP attached
     order = exchange.create_order(
-        symbol,
-        "market",
-        side,
-        qty,
-        params={
-            "stopLoss": str(sl_price),
-            "takeProfit": str(tp_price),
-        },
+        symbol, "market", side, qty,
+        params={"stopLoss": str(sl_price), "takeProfit": str(tp_price)},
     )
 
     fill_price = float(order.get("average") or order.get("price") or entry_price)
+    ed         = entry_detail or {}
 
     return {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "mode": "live",
-        "asset": asset,
-        "direction": direction,
-        "entry_price": fill_price,
-        "exit_price": None,       # filled when position closes
-        "pnl_pct": None,          # filled when position closes
-        "order_id": order.get("id"),
-        "qty": qty,
-        "leverage": leverage,
-        "sl_price": sl_price,
-        "tp_price": tp_price,
+        "ts":               datetime.now(timezone.utc).isoformat(),
+        "mode":             "live",
+        "asset":            asset,
+        "direction":        direction,
+        "entry_price":      fill_price,
+        "exit_price":       None,     # filled when position closes via reconcile
+        "pnl_pct":          None,     # filled when position closes via reconcile
+        "order_id":         order.get("id"),
+        "qty":              qty,
+        "leverage":         leverage,
+        "sl_price":         sl_price,
+        "tp_price":         tp_price,
         "strategy_version": strategy.get("version", "01"),
-        "rsi_at_entry": rsi,
-        "ema_9_at_entry": price_data.get("ema_9"),
-        "bb_lower_at_entry": price_data.get("bb_lower"),
-        "bb_upper_at_entry": price_data.get("bb_upper"),
+        # Full indicator snapshot at entry — used by reflect.py for richer learning
+        "indicators_snapshot": _snapshot_indicators(price_data),
+        "indicators_fired":    ed.get("indicators_fired", {}),
+        "confidence_at_entry": ed.get("confidence"),
     }
 
 
