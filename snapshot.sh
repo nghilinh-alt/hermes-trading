@@ -86,8 +86,12 @@ else
     git config user.email "hermes-bot@rogue-night.ai"
     git config user.name  "Hermes Trading Bot"
     git commit -m "snapshot: $DATE ($changed files updated)"
-    git push origin "$BRANCH"
-    echo "[snapshot] Committed and pushed — $changed files updated."
+    if git push origin "$BRANCH"; then
+        echo "[snapshot] Committed and pushed — $changed files updated."
+    else
+        echo "[snapshot] WARNING: local commit succeeded but push failed (check SSH key / network)."
+        echo "[snapshot] Run manually: cd $REPO && git checkout $BRANCH && git push origin $BRANCH && git checkout master"
+    fi
 fi
 
 echo "[snapshot] Done."

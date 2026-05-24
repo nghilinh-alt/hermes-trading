@@ -324,12 +324,77 @@ def run_fallback(state_dir: Path) -> None:
 
 # -- Hermes (AI-powered) reflection --------------------------------------------
 
+def _call_llm(prompt: str) -> str:
+    """
+    Call a local Ollama instance (or any OpenAI-compatible endpoint).
+
+    Configured via env vars (set in .env):
+      HERMES_LLM_URL    base URL of the LLM server  (default: http://localhost:11434)
+      HERMES_LLM_MODEL  model name to use            (default: qwen2.5:3b)
+      HERMES_LLM_TIMEOUT seconds to wait             (default: 120)
+
+    Returns the raw text response, or raises RuntimeError on failure.
+    """
+    import urllib.request
+
+    base_url = os.getenv("HERMES_LLM_URL",     "http://localhost:11434")
+    model    = os.getenv("HERMES_LLM_MODEL",   "qwen2.5:3b")
+    timeout  = int(os.getenv("HERMES_LLM_TIMEOUT", "120"))
+
+    # System prompt — keep it tight so small models stay on task
+    system = (
+        "You are a trading strategy optimiser. "
+        "You receive JSON with recent trades and the current strategy. "
+        "You must output a single JSON object with exactly these keys: "
+        "changed_variable, old_value, new_value, reasoning, confidence. "
+        "No markdown, no explanation, no code blocks — raw JSON only."
+    )
+
+    payload = json.dumps({
+        "model":  model,
+        "stream": False,
+        "messages": [
+            {"role": "system",  "content": system},
+            {"role": "user",    "content": prompt},
+        ],
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{base_url}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read())
+    except OSError as exc:
+        raise RuntimeError(f"LLM unreachable at {base_url}: {exc}") from exc
+
+    content = body["choices"][0]["message"]["content"].strip()
+
+    # Strip markdown code fences if the model wrapped its output anyway
+    if content.startswith("```"):
+        lines = content.splitlines()
+        content = "\n".join(
+            l for l in lines if not l.startswith("```")
+        ).strip()
+
+    return content
+
+
 def run_hermes(state_dir: Path) -> None:
-    """AI-powered reflection -- calls hermes CLI with the trade/strategy context."""
+    """AI-powered reflection via local Ollama (or any OpenAI-compatible LLM)."""
     p          = _paths(state_dir)
     asset_slug = state_dir.name
+    model      = os.getenv("HERMES_LLM_MODEL", "qwen2.5:3b")
+    base_url   = os.getenv("HERMES_LLM_URL",   "http://localhost:11434")
 
-    console.print(f"[bold cyan]reflect --hermes [{asset_slug}]: loading context...[/bold cyan]")
+    console.print(
+        f"[bold cyan]reflect --hermes [{asset_slug}]: "
+        f"calling {model} @ {base_url}...[/bold cyan]"
+    )
 
     strategy = _load_yaml(p["strategy"])
     goal     = _load_yaml(p["goal"])
@@ -337,17 +402,48 @@ def run_hermes(state_dir: Path) -> None:
 
     memory_context = p["memory"].read_text() if p["memory"].exists() else ""
 
-    context = {
+    # Build a focused prompt — include win rate + indicator snapshot summaries
+    # so the model can reason about which signals are performing well
+    winning = [t for t in trades if t.get("pnl_pct") is not None and float(t["pnl_pct"]) > 0]
+    losing  = [t for t in trades if t.get("pnl_pct") is not None and float(t["pnl_pct"]) <= 0]
+
+    def _avg_indicators(trade_list: list[dict]) -> dict:
+        """Average each indicator snapshot value across a list of trades."""
+        keys = set()
+        for t in trade_list:
+            keys.update((t.get("indicators_snapshot") or {}).keys())
+        result = {}
+        for k in keys:
+            vals = [float(t["indicators_snapshot"][k])
+                    for t in trade_list
+                    if t.get("indicators_snapshot", {}).get(k) is not None]
+            if vals:
+                result[k] = round(sum(vals) / len(vals), 4)
+        return result
+
+    prompt_data = {
         "asset":            asset_slug,
         "goal":             goal,
         "current_strategy": strategy,
         "recent_trades":    trades,
+        "performance_summary": {
+            "total_trades":    len(trades),
+            "winning_trades":  len(winning),
+            "losing_trades":   len(losing),
+            "win_rate":        round(len(winning) / len(trades), 3) if trades else 0,
+            "total_pnl":       round(sum(float(t.get("pnl_pct", 0)) for t in trades), 6),
+            "avg_indicators_on_wins":   _avg_indicators(winning),
+            "avg_indicators_on_losses": _avg_indicators(losing),
+        },
         "memory":           memory_context[-3000:] if memory_context else "",
         "instruction": (
-            "You are the reflection engine for a self-improving trading agent. "
-            "Review the recent trades, current strategy, and memory of past decisions. "
-            "Generate 1-3 hypotheses. Each must change exactly ONE variable and predict "
-            "the score direction. Choose the highest-confidence hypothesis. "
+            "Review the recent trades, current strategy, performance summary, "
+            "and memory of past decisions. "
+            "The performance_summary shows average indicator values at entry for "
+            "winning vs losing trades — use this to identify which indicators "
+            "correlate with better outcomes. "
+            "Generate the single highest-confidence hypothesis that changes "
+            "exactly ONE variable to improve win rate or PnL. "
             "Tunable variables: stop_loss_pct, position_size_r, entry.min_confidence, "
             "indicators[rsi].params.threshold, indicators[ema_trend].weight, "
             "indicators[macd].weight, indicators[vwap].weight, "
@@ -357,34 +453,24 @@ def run_hermes(state_dir: Path) -> None:
             "indicators[sr_zone].weight, indicators[sr_zone].params.tolerance_pct. "
             "Do NOT change the required field on rsi. "
             "Do NOT repeat a change memory shows was tried recently without improvement. "
-            "Output JSON only: {changed_variable, old_value, new_value, reasoning, confidence}."
+            "Output raw JSON only — no markdown, no explanation: "
+            "{changed_variable, old_value, new_value, reasoning, confidence}"
         ),
     }
 
-    prompt = json.dumps(context, indent=2)
+    prompt = json.dumps(prompt_data, indent=2)
 
     try:
-        result = subprocess.run(
-            ["hermes"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        output = result.stdout.strip()
-    except FileNotFoundError:
-        console.print("[red]hermes command not found -- falling back to --fallback mode[/red]")
-        run_fallback(state_dir)
-        return
-    except subprocess.TimeoutExpired:
-        console.print("[red]Hermes timed out -- falling back to --fallback mode[/red]")
+        output = _call_llm(prompt)
+    except RuntimeError as exc:
+        console.print(f"[red]LLM call failed: {exc} -- falling back to --fallback[/red]")
         run_fallback(state_dir)
         return
 
     try:
         hypothesis_data = json.loads(output)
     except json.JSONDecodeError:
-        console.print(f"[yellow]Could not parse Hermes output as JSON:\n{output}[/yellow]")
+        console.print(f"[yellow]LLM output was not valid JSON:\n{output}[/yellow]")
         console.print("[yellow]Falling back to deterministic reflection.[/yellow]")
         run_fallback(state_dir)
         return
