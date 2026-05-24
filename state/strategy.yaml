@@ -41,5 +41,22 @@ indicators:
     weight: 0.3
     params: {}            # long: price at or below lower Bollinger Band
 
+  - name: fvg
+    required: false
+    weight: 0.4
+    params: {}            # long: price inside bullish Fair Value Gap (1h)
+
+  - name: order_block
+    required: false
+    weight: 0.4
+    params:
+      tolerance_pct: 0.5  # price within 0.5% of OB zone (1h)
+
+  - name: sr_zone
+    required: false
+    weight: 0.3
+    params:
+      tolerance_pct: 1.0  # price within 1% of support/resistance (1h/4h)
+
 stop_loss_pct: 2.0
 position_size_r: 0.5

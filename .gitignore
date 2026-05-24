@@ -1,56 +1,27 @@
-# Python
+# Python virtual environment and cache
+venv/
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
+.Python
 
-# Virtual environments
-.venv/
-venv/
-ENV/
-env/
-
-# Environment files (sensitive)
-.env
-.venv/
-
-# State and runtime data (should not be tracked)
-state/
-logs/
-*.log
-*.json  # Except package.json
-
-# IDE editors
+# IDE settings
 .idea/
 .vscode/
 *.swp
 *.swo
-*~
 
-# Build artifacts
-dist/
-build/
-*.egg-info/
-*.egg
-.eggs/
-
-# Lock files (optional - you can include if you want reproducible builds)
-# uv.lock
-# poetry.lock
-
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.tox/
-.nox/
-
-# OS generated
+# OS generated files
 .DS_Store
 Thumbs.db
 
-# Temporary files
-*.tmp
-*.bak
-temp/
-tmp/
+# Environment variables (secrets)
+.env
+state/.env
+
+# Trading state and logs (optional - remove from git if not tracked)
+state/*.json
+!state/goal.yaml  # Keep goal config tracked
+!state/strategy.yaml  # Keep strategy config tracked
+state/*.log
+!.gitkeep  # Allow .gitkeep marker file
