@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-05-24 (session 2)
+2026-05-24 (session 3)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -43,6 +43,10 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-05-24 | VPS running code at nested path hermes_trading/hermes_trading/ | Package installed inside its own package dir — SCP files here, not the top-level dir |
 | 2026-05-24 (s2) | loop.py reflection subprocess uses sys.executable | `python` not in PATH on VPS — was silently killing all reflections |
 | 2026-05-24 (s2) | reflect.py LLM prompt: explicit variable list + one-shot JSON example | Forces qwen2.5:3b to use indicators[name].field bracket notation correctly |
+| 2026-05-24 (s3) | RSI no longer required — min_indicators:2 gates entry instead | Any 2+ indicators firing together is safer than 1 mandatory gate |
+| 2026-05-24 (s3) | direction:both — agent evaluates long+short each tick | Higher confidence side wins; ambiguous (<0.1 diff) signals are skipped |
+| 2026-05-24 (s3) | _reconcile_open_trades: abandons ALL stale open records | Was leaving ghost "open" trades in trades.jsonl indefinitely |
+| 2026-05-24 (s3) | execution.py reads direction from entry_detail | Allows direction:both to place the correct long/short side |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -53,13 +57,47 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - [FIXED session 2] LLM bracket notation: prompt now has explicit newline-delimited variable list + one-shot JSON example; `python` → `sys.executable` in reflection subprocess
 
 ## Handoffs
-- Agent is live ✓, Ollama reflection working ✓
-- **Pending deploy**: push loop.py + reflect.py fixes to VPS (see Session Log for commands)
-- **Pending**: run setup_github_ssh.sh on VPS, add public key to GitHub → enables snapshot.sh
-- Next check: after 5 trades close on any asset, tail state/{asset}/hypotheses.jsonl — confirm changed_variable uses bracket notation e.g. `indicators[rsi].params.threshold` not `indicators.params.threshold`
-- Handoff to: Linh (deploy via Windows terminal, monitor dashboard)
+- **URGENT**: agent is DOWN (goal.yaml YAML error). 3 live Bybit positions unmanaged. Deploy immediately.
+- Deploy from Windows PowerShell (see Session 3 log for full commands)
+- After deploy: run `python3 patch_strategies.py` on VPS to update all 4 strategy.yaml files
+- After restart: confirm reconciliation cleans stale TAO open records in dashboard
+- Next check: monitor dashboard Live Positions section — should show exactly 3 (BTC/SOL/ETH)
+- Handoff to: Linh (deploy, verify dashboard)
 
 ## Session Log
+### 2026-05-24 (session 3)
+- **Diagnosed agent DOWN**: goal.yaml line 31 had `%` instead of `#` causing yaml.ParserError on startup. Fixed.
+- **Open trade reconciliation bug fixed**: _reconcile_open_trades previously only updated the most recent open trade. Old ghost records (TAO 05-23, ETH 05-23) stayed open forever. Now abandons ALL stale open records (pnl_pct=0, abandoned=True), keeping only the most recent (which matches the live Bybit position).
+- **direction:both added**: loop._evaluate_entry now takes force_direction param. run() evaluates long AND short every tick when strategy says "both", picks the higher-confidence side. Ambiguous signals (< 0.1 confidence diff) are skipped.
+- **min_indicators added**: entry.min_indicators (default 2) requires at least N optional indicators to fire. Replaces the single required RSI gate.
+- **RSI demoted to optional**: patch_strategies.py updates all 4 existing VPS strategy.yaml files to set required:False on RSI, direction:both, min_indicators:2. Run once on VPS after deploy.
+- **execution.py**: direction now read from entry_detail (resolved per-tick) not hardcoded from strategy, so direction:both correctly places long or short.
+- **Dashboard - Live Positions section**: new table showing open trades with unrealised P&L vs current price, SL/TP levels.
+- **Dashboard - Agent Activity**: replaced "Recent log" (showing crash tracebacks) with filtered event feed showing only trades, reflections, errors. "No entry" spam filtered out.
+- **Dashboard - trade history**: abandoned trades now show "abandoned" label in italic; conf column replaces RSI column (RSI was always "—" since field renamed).
+- **Deploy from Windows**:
+  ```
+  cd C:\Users\nghil\Projects\Hermes\Hermes-Trading
+  git add hermes_trading/loop.py hermes_trading/reflect.py hermes_trading/run.py hermes_trading/adapters/execution.py dashboard.py state/goal.yaml patch_strategies.py memory.md
+  git commit -m "fix: goal.yaml; reconcile stale open trades; direction:both; min_indicators; dashboard live positions"
+  git push origin master
+  ```
+- **Then on VPS**:
+  ```
+  cd /opt/trading/hermes-trading && git pull
+  cp hermes_trading/loop.py /opt/trading/hermes_trading/hermes_trading/loop.py
+  cp hermes_trading/reflect.py /opt/trading/hermes_trading/hermes_trading/reflect.py
+  cp hermes_trading/run.py /opt/trading/hermes_trading/hermes_trading/run.py
+  cp hermes_trading/adapters/execution.py /opt/trading/hermes_trading/hermes_trading/adapters/execution.py
+  cp state/goal.yaml /opt/trading/hermes_trading/hermes_trading/state/goal.yaml
+  cp patch_strategies.py /opt/trading/hermes_trading/hermes_trading/patch_strategies.py
+  cd /opt/trading/hermes_trading/hermes_trading
+  python3 patch_strategies.py
+  pkill -f hermes_trading.run
+  cd /opt/trading/hermes_trading && source venv/bin/activate
+  nohup python3 -m hermes_trading.run >> logs/hermes.log 2>&1 &
+  ```
+
 ### 2026-05-24 (session 2)
 - Identified critical bug: loop.py called subprocess.run(["python", ...]) — `python` not in PATH on VPS, so all reflections silently failed. Fixed to sys.executable.
 - Tightened run_hermes() LLM prompt: replaced inline variable list with newline-delimited list, added explicit "DO NOT use dot notation" rule, added concrete one-shot JSON example showing indicators[name].params.X format.

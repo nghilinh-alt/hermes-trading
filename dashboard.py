@@ -351,7 +351,8 @@ def _render_html(d: dict) -> str:
         if failures >= 3:
             return "<span style='color:#E24B4A' title='circuit breaker tripped'>&#9679;</span>"
         cols = {"ok": "#1D9E75", "error": "#E24B4A"}
-        return f"<span style='color:{cols.get(status, \"#888\")}''>&#9679;</span>"
+        col = cols.get(status, "#888")
+        return f"<span style='color:{col}'>&#9679;</span>"
 
     def _position_badge(last_trade: dict, cur_price) -> str:
         if not last_trade or last_trade.get("pnl_pct") is not None:
@@ -444,7 +445,82 @@ def _render_html(d: dict) -> str:
           {ind_bars}
         </div>"""
 
-    # trade history table
+    # ── Live positions ────────────────────────────────────────────────────────
+    open_trades = [
+        {**t, "_slug": s}
+        for s in ASSETS
+        for t in assets.get(s, {}).get("trades", [])
+        if t.get("pnl_pct") is None and not t.get("abandoned")
+    ]
+    open_trades.sort(key=lambda t: t.get("ts", ""), reverse=True)
+
+    def _unrealised(t: dict) -> str:
+        slug      = t.get("_slug", "")
+        cur_price = assets.get(slug, {}).get("current_price")
+        entry     = t.get("entry_price")
+        if not cur_price or not entry:
+            return "—"
+        direction = t.get("direction", "long")
+        move = (float(cur_price) - float(entry)) / float(entry)
+        pct  = move if direction == "long" else -move
+        col  = _pnl_col(pct * 100)
+        sign = "+" if pct >= 0 else ""
+        return f"<span style='color:{col};font-weight:500'>{sign}{pct*100:.2f}%</span>"
+
+    def _open_trade_row(t: dict) -> str:
+        ts_raw  = t.get("ts", "")
+        try:
+            ts_s = datetime.fromisoformat(ts_raw).astimezone(AEST).strftime("%m-%d %H:%M")
+        except Exception:
+            ts_s = ts_raw[:16].replace("T", " ")
+        asset_s = t.get("asset", "—")
+        dirn    = t.get("direction", "long")
+        dc      = "#1D9E75" if dirn == "long" else "#E24B4A"
+        entry   = t.get("entry_price", 0)
+        slug    = t.get("_slug", "")
+        cur     = assets.get(slug, {}).get("current_price")
+        cur_s   = f"${float(cur):,.2f}" if cur else "—"
+        sl      = t.get("sl_price")
+        tp      = t.get("tp_price")
+        sl_s    = f"${float(sl):,.2f}" if sl else "—"
+        tp_s    = f"${float(tp):,.2f}" if tp else "—"
+        unr     = _unrealised(t)
+        return (
+            f"<tr style='border-top:0.5px solid var(--border)'>"
+            f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{ts_s}</td>"
+            f"<td style='padding:5px 8px;font-size:12px;font-weight:500'>{asset_s}</td>"
+            f"<td style='padding:5px 8px;font-size:11px;color:{dc};font-weight:500'>{dirn}</td>"
+            f"<td style='padding:5px 8px;font-size:11px'>${float(entry):,.2f}</td>"
+            f"<td style='padding:5px 8px;font-size:11px'>{cur_s}</td>"
+            f"<td style='padding:5px 8px;font-size:12px'>{unr}</td>"
+            f"<td style='padding:5px 8px;font-size:11px;color:#E24B4A'>{sl_s}</td>"
+            f"<td style='padding:5px 8px;font-size:11px;color:#1D9E75'>{tp_s}</td>"
+            f"</tr>"
+        )
+
+    if open_trades:
+        positions_html = f"""
+<div style="background:var(--bg);border:0.5px solid var(--border);border-radius:8px;overflow:auto;margin-bottom:1.5rem">
+  <table style="width:100%;border-collapse:collapse;white-space:nowrap">
+    <thead>
+      <tr style="background:var(--surface)">
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">opened (AEST)</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">asset</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">side</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">entry</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">mark</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">unreal P&L</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:#E24B4A;text-align:left">stop loss</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:#1D9E75;text-align:left">take profit</th>
+      </tr>
+    </thead>
+    <tbody>{"".join(_open_trade_row(t) for t in open_trades)}</tbody>
+  </table>
+</div>"""
+    else:
+        positions_html = "<div style='font-size:12px;color:var(--muted);margin-bottom:1.5rem'>No open positions.</div>"
+
+    # ── Trade history table ───────────────────────────────────────────────────
     recent_trades = sorted(all_trades_flat, key=lambda t: t.get("ts", ""), reverse=True)[:50]
 
     def _trade_row(t: dict) -> str:
@@ -453,30 +529,35 @@ def _render_html(d: dict) -> str:
             ts = datetime.fromisoformat(ts_raw).astimezone(AEST).strftime("%m-%d %H:%M")
         except Exception:
             ts = ts_raw[:16].replace("T", " ")
-        asset   = t.get("asset", "—")
-        dirn    = t.get("direction", "—")
-        dc      = "#1D9E75" if dirn == "long" else "#E24B4A"
-        entry   = t.get("entry_price", 0)
-        exitp   = t.get("exit_price")
-        exit_s  = f"${float(exitp):,.2f}" if exitp is not None else "open"
-        pnl_r   = t.get("pnl_pct")
-        if pnl_r is not None:
-            pv  = float(pnl_r) * 100
-            ps  = f"{'+' if pv >= 0 else ''}{pv:.3f}%"
-            pc  = _pnl_col(pv)
+        asset_l    = t.get("asset", "—")
+        dirn       = t.get("direction", "—")
+        dc         = "#1D9E75" if dirn == "long" else "#E24B4A"
+        entry      = t.get("entry_price", 0)
+        exitp      = t.get("exit_price")
+        abandoned  = t.get("abandoned", False)
+        pnl_r      = t.get("pnl_pct")
+        if abandoned:
+            exit_s = "<span style='color:var(--muted);font-style:italic'>abandoned</span>"
+            ps, pc = "—", "var(--muted)"
+        elif pnl_r is not None:
+            pv     = float(pnl_r) * 100
+            ps     = f"{'+' if pv >= 0 else ''}{pv:.3f}%"
+            pc     = _pnl_col(pv)
+            exit_s = f"${float(exitp):,.2f}" if exitp is not None else "—"
         else:
-            ps, pc = "open", "var(--muted)"
-        rsi     = t.get("rsi_at_entry")
-        rs      = f"{float(rsi):.1f}" if rsi is not None else "—"
-        ver     = t.get("strategy_version", "—")
+            exit_s  = "<span style='color:#EF9F27;font-weight:500'>open</span>"
+            ps, pc  = "open", "#EF9F27"
+        conf  = t.get("confidence_at_entry")
+        cs    = f"{float(conf)*100:.0f}%" if conf is not None else "—"
+        ver   = t.get("strategy_version", "—")
         return (
             f"<tr style='border-top:0.5px solid var(--border)'>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{ts}</td>"
-            f"<td style='padding:5px 8px;font-size:11px'>{asset}</td>"
+            f"<td style='padding:5px 8px;font-size:11px'>{asset_l}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:{dc}'>{dirn}</td>"
             f"<td style='padding:5px 8px;font-size:11px'>${float(entry):,.2f}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{exit_s}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{rs}</td>"
+            f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{cs}</td>"
             f"<td style='padding:5px 8px;font-size:12px;font-weight:500;color:{pc}'>{ps}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>v{ver}</td>"
             f"</tr>"
@@ -493,7 +574,7 @@ def _render_html(d: dict) -> str:
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">side</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">entry</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">exit</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">RSI</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">conf</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">P&L</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">strat</th>
       </tr>
@@ -563,10 +644,23 @@ def _render_html(d: dict) -> str:
         else "<div style='font-size:12px;color:var(--muted)'>No reflections yet — fires after every N closed trades.</div>"
     )
 
+    # Filter log to only meaningful events — skip constant "No entry" noise
+    _KEEP_PATTERNS = ("Trade #", "reflect", "Reflection", "error", "Error",
+                      "circuit breaker", "Reconcil", "Abandoned", "Booting",
+                      "ParserError", "Traceback", "Exception", "CRITICAL")
+    _SKIP_PATTERNS = ("No entry",)
+
+    def _is_meaningful(line: str) -> bool:
+        if any(p in line for p in _SKIP_PATTERNS):
+            return False
+        return any(p in line for p in _KEEP_PATTERNS)
+
+    activity_lines = [l for l in logs if _is_meaningful(l)]
+
     log_lines = (
-        "\n".join(_log_line(l) for l in logs)
-        if logs
-        else "<div style='font-size:11px;color:var(--muted)'>No log data — VPS unreachable or agent not running.</div>"
+        "\n".join(_log_line(l) for l in activity_lines)
+        if activity_lines
+        else "<div style='font-size:11px;color:var(--muted)'>No significant activity — agent is running quietly (no trades, reflections, or errors since last check).</div>"
     )
 
     mode_bg  = "rgba(226,75,74,0.15)" if mode == "live" else "rgba(29,158,117,0.15)"
@@ -615,6 +709,9 @@ def _render_html(d: dict) -> str:
   {asset_cards}
 </div>
 
+<h2>Live Positions <span style="font-weight:400">({len(open_trades)} open)</span></h2>
+{positions_html}
+
 <h2>Running P&L</h2>
 {pnl_summary}
 
@@ -624,7 +721,7 @@ def _render_html(d: dict) -> str:
 <h2>Strategy reflections</h2>
 {reflection_html}
 
-<h2>Recent log <span style="font-weight:400">(last 25 lines)</span></h2>
+<h2>Agent Activity <span style="font-weight:400">(trades · reflections · errors)</span></h2>
 <div style="background:var(--bg);border:0.5px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;overflow-x:auto;margin-bottom:1.5rem">
   {log_lines}
 </div>

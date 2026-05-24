@@ -143,10 +143,15 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
 
     exchange = _get_exchange()
 
-    asset         = price_data.get("asset", "BTC/USDT")
-    symbol        = _to_perp_symbol(asset)
-    direction     = strategy.get("entry", {}).get("direction", "long")
-    side          = "buy" if direction == "long" else "sell"
+    asset      = price_data.get("asset", "BTC/USDT")
+    symbol     = _to_perp_symbol(asset)
+    # Prefer the resolved direction from evaluation (entry_detail); fall back to strategy config.
+    # This correctly handles direction:both where the resolved side is set per-tick.
+    ed        = entry_detail or {}
+    direction = ed.get("direction") or strategy.get("entry", {}).get("direction", "long")
+    if direction not in ("long", "short"):
+        direction = "long"   # safety: never send an invalid side to the exchange
+    side      = "buy" if direction == "long" else "sell"
     entry_price   = float(price_data.get("price", 0))
     stop_loss_pct = float(strategy.get("stop_loss_pct", 2.0)) / 100
 
@@ -175,7 +180,6 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
     )
 
     fill_price = float(order.get("average") or order.get("price") or entry_price)
-    ed         = entry_detail or {}
 
     return {
         "ts":               datetime.now(timezone.utc).isoformat(),

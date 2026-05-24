@@ -199,31 +199,51 @@ def _check_indicator(name: str, params: dict, direction: str, price_data: dict) 
     return None  # unknown indicator — treat as unavailable
 
 
-def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_data: dict) -> dict:
+def _evaluate_entry(
+    strategy: dict,
+    price_data: dict,
+    macro_data: dict,
+    news_data: dict,
+    force_direction: str | None = None,
+) -> dict:
     """
     Modular weighted indicator registry.
 
     Each indicator in strategy['indicators'] has:
-      required (bool)  — if True, failure blocks the trade outright
+      required (bool)  — if True, failure blocks the trade outright (legacy; prefer min_indicators)
       weight   (float) — contribution toward optional confidence score
       params   (dict)  — indicator-specific config
 
+    strategy['entry'] may include:
+      min_confidence  (float) — minimum weighted confidence score required (0–1)
+      min_indicators  (int)   — minimum number of indicators that must fire (default 1)
+
+    force_direction overrides strategy['entry']['direction'] — used when evaluating
+    both long and short in the same tick.
+
     Returns a dict:
       fires            (bool)              — whether entry condition is met
-      confidence       (float)             — optional-indicator confidence score 0–1
+      confidence       (float)             — weighted confidence score 0–1
       indicators_fired (dict[str, bool|None]) — per-indicator result (None = no data)
+      direction        (str)               — the direction evaluated ("long" or "short")
     """
-    indicators       = strategy.get("indicators", [])
-    direction        = strategy.get("entry", {}).get("direction", "long")
-    min_conf         = float(strategy.get("entry", {}).get("min_confidence", 0.0))
+    indicators = strategy.get("indicators", [])
+    entry      = strategy.get("entry", {})
+    direction  = force_direction or entry.get("direction", "long")
+    min_conf   = float(entry.get("min_confidence", 0.0))
+    min_ind    = int(entry.get("min_indicators", 1))
     indicators_fired: dict[str, bool | None] = {}
 
     def _result(fires: bool, confidence: float = 0.0) -> dict:
-        return {"fires": fires, "confidence": round(confidence, 4), "indicators_fired": indicators_fired}
+        return {
+            "fires":            fires,
+            "confidence":       round(confidence, 4),
+            "indicators_fired": indicators_fired,
+            "direction":        direction,
+        }
 
-    # Fallback: if no indicator registry defined, replicate original RSI behaviour
+    # Fallback: if no indicator registry defined, use simple RSI check
     if not indicators:
-        entry     = strategy.get("entry", {})
         rsi       = price_data.get("rsi_14", 50.0)
         threshold = float(entry.get("threshold", 30))
         fired     = rsi < threshold if direction == "long" else rsi > threshold
@@ -232,6 +252,7 @@ def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_dat
 
     optional_total  = sum(float(i.get("weight", 1.0)) for i in indicators if not i.get("required", False))
     optional_passed = 0.0
+    fired_count     = 0   # count of indicators that returned True
     fires           = True
 
     for ind in indicators:
@@ -249,12 +270,24 @@ def _evaluate_entry(strategy: dict, price_data: dict, macro_data: dict, news_dat
         if required and not result:
             fires = False   # hard gate failed — keep evaluating to log all indicators
 
-        if not required and result:
-            optional_passed += weight
+        if result:
+            fired_count += weight if not required else 0
+            if not required:
+                optional_passed += weight
 
-    # Check optional confidence threshold
+    # Weighted confidence from optional indicators
     confidence = optional_passed / optional_total if optional_total > 0 else 1.0
+
+    # Gate 1: minimum confidence threshold
     if fires and optional_total > 0 and min_conf > 0 and confidence < min_conf:
+        fires = False
+
+    # Gate 2: minimum indicator count (count of optional indicators that fired)
+    fired_optional_count = sum(
+        1 for ind in indicators
+        if not ind.get("required", False) and indicators_fired.get(ind.get("name")) is True
+    )
+    if fires and fired_optional_count < min_ind:
         fires = False
 
     return _result(fires, confidence)
@@ -275,10 +308,11 @@ def _simulate_paper_trade(strategy: dict, price_data: dict, entry_detail: dict) 
     entry_price     = price_data.get("price", 0)
     stop_loss_pct   = float(strategy.get("stop_loss_pct", 2.0)) / 100
     position_size_r = float(strategy.get("position_size_r", 0.5))
-    direction       = strategy.get("entry", {}).get("direction", "long")
+    # Prefer the resolved direction from evaluation (supports direction:both)
+    direction = entry_detail.get("direction") or strategy.get("entry", {}).get("direction", "long")
 
-    move_pct  = random.uniform(-stop_loss_pct, stop_loss_pct * 1.5)
-    pnl_pct   = move_pct * position_size_r if direction == "long" else -move_pct * position_size_r
+    move_pct   = random.uniform(-stop_loss_pct, stop_loss_pct * 1.5)
+    pnl_pct    = move_pct * position_size_r if direction == "long" else -move_pct * position_size_r
     exit_price = entry_price * (1 + move_pct)
 
     return {
@@ -299,14 +333,24 @@ def _simulate_paper_trade(strategy: dict, price_data: dict, entry_detail: dict) 
 
 def _reconcile_open_trades(asset: str, state_dir: Path) -> None:
     """
-    In live mode: if a trade is recorded as open (pnl_pct=None) but Bybit
-    shows no open position, fetch the closed PnL and update trades.jsonl.
+    In live mode: reconcile trades.jsonl against actual Bybit position state.
+
+    Rules:
+      - If a live position exists  → keep the most recent open trade as-is;
+        mark all earlier open trades as abandoned (pnl_pct=0, abandoned=True).
+      - If no live position exists → fetch the most recent closed PnL from Bybit,
+        update the most recent open trade with it, and mark all earlier open
+        trades as abandoned.
+
+    This ensures trades.jsonl never accumulates permanent "open" ghost records
+    from previous agent runs.
     """
     if os.getenv("HERMES_TRADING_MODE", "paper") != "live":
         return
     trades_file = state_dir / "trades.jsonl"
     if not trades_file.exists():
         return
+
     lines = [l.strip() for l in trades_file.read_text().splitlines() if l.strip()]
     trades = []
     for l in lines:
@@ -314,26 +358,48 @@ def _reconcile_open_trades(asset: str, state_dir: Path) -> None:
             trades.append(json.loads(l))
         except Exception:
             pass
+
     open_indices = [i for i, t in enumerate(trades) if t.get("pnl_pct") is None]
     if not open_indices:
         return
+
     try:
         from hermes_trading.adapters import execution as execution_adapter
-        if execution_adapter.has_open_position(asset):
-            return  # position still live — nothing to reconcile
-        closed = execution_adapter.fetch_last_closed_pnl(asset)
-        if not closed:
-            return
-        # Update the most recent open trade with real exit data
-        idx = open_indices[-1]
-        trades[idx]["exit_price"]      = closed["exit_price"]
-        trades[idx]["pnl_pct"]         = closed["pnl_pct"]
-        trades[idx]["closed_pnl_usdt"] = closed["closed_pnl_usdt"]
+        has_position = execution_adapter.has_open_position(asset)
+
+        # Always abandon all open trades EXCEPT the most recent one
+        stale_indices = open_indices[:-1]
+        for idx in stale_indices:
+            trades[idx]["pnl_pct"]    = 0.0
+            trades[idx]["exit_price"] = trades[idx].get("entry_price")
+            trades[idx]["abandoned"]  = True
+
+        if has_position:
+            # Live position matches the most recent open trade — leave it open
+            pass
+        else:
+            # No live position — reconcile the most recent open trade with actual PnL
+            closed = execution_adapter.fetch_last_closed_pnl(asset)
+            most_recent_idx = open_indices[-1]
+            if closed:
+                trades[most_recent_idx]["exit_price"]      = closed["exit_price"]
+                trades[most_recent_idx]["pnl_pct"]         = closed["pnl_pct"]
+                trades[most_recent_idx]["closed_pnl_usdt"] = closed.get("closed_pnl_usdt")
+                console.print(
+                    f"[cyan][{asset}] Reconciled: exit={closed['exit_price']} "
+                    f"pnl={closed['pnl_pct']:+.4%}[/cyan]"
+                )
+            else:
+                # No closed PnL available — mark as abandoned with zero PnL
+                trades[most_recent_idx]["pnl_pct"]    = 0.0
+                trades[most_recent_idx]["exit_price"] = trades[most_recent_idx].get("entry_price")
+                trades[most_recent_idx]["abandoned"]  = True
+
+        if stale_indices:
+            console.print(f"[cyan][{asset}] Abandoned {len(stale_indices)} stale open record(s)[/cyan]")
+
         trades_file.write_text("\n".join(json.dumps(t) for t in trades) + "\n")
-        console.print(
-            f"[cyan][{asset}] Reconciled: exit={closed['exit_price']} "
-            f"pnl={closed['pnl_pct']:+.4%}[/cyan]"
-        )
+
     except Exception as e:
         console.print(f"[yellow][{asset}] Reconcile error: {e}[/yellow]")
 
@@ -387,8 +453,31 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
             if price_data is None:
                 raise RuntimeError("price adapter returned None — cannot evaluate strategy")
 
-            ts           = datetime.now(timezone.utc).strftime("%H:%M UTC")
-            entry_result = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {})
+            ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+            # Evaluate entry — support direction:both (long and short simultaneously)
+            strategy_direction = strategy.get("entry", {}).get("direction", "long")
+            if strategy_direction == "both":
+                long_result  = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}, force_direction="long")
+                short_result = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}, force_direction="short")
+                if long_result["fires"] and short_result["fires"]:
+                    # Both sides signal — take the higher confidence; skip if too close (ambiguous)
+                    if abs(long_result["confidence"] - short_result["confidence"]) < 0.1:
+                        entry_result = {"fires": False, "confidence": 0.0, "indicators_fired": {}, "direction": "both"}
+                        console.print(f"[dim]{ts} [{asset}] Ambiguous signal (long {long_result['confidence']:.0%} vs short {short_result['confidence']:.0%}) — skipping[/dim]")
+                    elif long_result["confidence"] >= short_result["confidence"]:
+                        entry_result = long_result
+                    else:
+                        entry_result = short_result
+                elif long_result["fires"]:
+                    entry_result = long_result
+                elif short_result["fires"]:
+                    entry_result = short_result
+                else:
+                    best_conf    = max(long_result["confidence"], short_result["confidence"])
+                    entry_result = {"fires": False, "confidence": best_conf, "indicators_fired": {}, "direction": "both"}
+            else:
+                entry_result = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {})
 
             if entry_result["fires"]:
                 # Live mode: skip if already in a position for this asset
@@ -414,10 +503,11 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
                 )
                 _maybe_trigger_reflection(resolved_goal, closed_count, state_dir)
             else:
-                rsi_val   = price_data.get("rsi_14", "?")
-                conf_val  = entry_result.get("confidence", 0)
+                rsi_val  = price_data.get("rsi_14", "?")
+                conf_val = entry_result.get("confidence", 0)
+                dir_val  = entry_result.get("direction", strategy_direction)
                 console.print(
-                    f"[dim]{ts} {tag} No entry · RSI={rsi_val} · "
+                    f"[dim]{ts} {tag} No entry · dir={dir_val} · RSI={rsi_val} · "
                     f"conf={conf_val:.0%} · price={price_data.get('price')}[/dim]"
                 )
 

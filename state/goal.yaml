@@ -1,4 +1,4 @@
- HerMES-Trading Agent - Goal Configuration
+# HerMES-Trading Agent - Goal Configuration
 # This file defines the trading strategy and objectives for the autonomous agent
 
 asset: BTC/USDT   # Primary asset (used if assets list is absent)
@@ -27,7 +27,7 @@ score:
   metrics:
     - pnl                             # Profit/Loss (primary)
     - sharpe_ratio                    # Risk-adjusted returns
-    - win_rate                        % of winning trades
+    - win_rate                        # % of winning trades
     - max_drawdown                   # Worst loss streak
 # Data Sources
 data:

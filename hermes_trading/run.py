@@ -24,16 +24,25 @@ STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
 GOAL_FILE = STATE_DIR / "goal.yaml"
 
 _DEFAULT_STRATEGY = {
-    "version": "02",
+    "version": "01",
     "entry": {
-        "indicator": "rsi",
-        "threshold": 30,
-        "direction": "long",
-        "ema_period": 9,
-        "bb_filter": True,
+        "direction":      "both",   # evaluate long + short each tick; pick best signal
+        "min_confidence": 0.3,      # minimum weighted indicator score (0–1)
+        "min_indicators": 2,        # at least N indicators must fire (no single required gate)
     },
-    "stop_loss_pct": 2.0,
-    "position_size_r": 0.5,
+    "stop_loss_pct":    2.0,
+    "position_size_r":  0.5,
+    "indicators": [
+        {"name": "rsi",          "required": False, "weight": 1.0, "params": {"threshold": 30}},
+        {"name": "ema_trend",    "required": False, "weight": 0.6, "params": {"period": 50}},
+        {"name": "macd",         "required": False, "weight": 0.5, "params": {}},
+        {"name": "vwap",         "required": False, "weight": 0.4, "params": {}},
+        {"name": "volume_spike", "required": False, "weight": 0.3, "params": {"min_ratio": 1.5}},
+        {"name": "bb_squeeze",   "required": False, "weight": 0.3, "params": {}},
+        {"name": "fvg",          "required": False, "weight": 0.4, "params": {}},
+        {"name": "order_block",  "required": False, "weight": 0.4, "params": {"tolerance_pct": 0.5}},
+        {"name": "sr_zone",      "required": False, "weight": 0.3, "params": {"tolerance_pct": 1.0}},
+    ],
 }
 
 

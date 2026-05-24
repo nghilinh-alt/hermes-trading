@@ -449,6 +449,7 @@ def run_hermes(state_dir: Path) -> None:
             "  stop_loss_pct\n"
             "  position_size_r\n"
             "  entry.min_confidence\n"
+            "  entry.min_indicators\n"
             "  indicators[rsi].params.threshold\n"
             "  indicators[ema_trend].weight\n"
             "  indicators[macd].weight\n"
