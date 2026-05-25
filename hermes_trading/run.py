@@ -30,8 +30,14 @@ _DEFAULT_STRATEGY = {
         "min_confidence": 0.3,      # minimum weighted indicator score (0–1)
         "min_indicators": 2,        # at least N indicators must fire (no single required gate)
     },
-    "stop_loss_pct":    2.0,
-    "position_size_r":  0.5,
+    # ── Fixed % fallback (used if no structural level is found) ──────────────
+    "stop_loss_pct":    2.0,        # % below/above entry if no structural support/resistance
+    "position_size_r":  0.5,        # legacy paper-sim scale factor (kept for reflect tuning)
+    # ── SMC / Phase 1 risk parameters ─────────────────────────────────────────
+    "risk_per_trade":   0.10,       # fraction of account risked per trade (10%)
+    "sl_buffer_pct":    0.3,        # buffer below/above structural level before placing SL (%)
+    "max_sl_pct":       5.0,        # max allowed SL distance (% of entry); skip if exceeded
+    "default_leverage": 5,          # fixed leverage (no longer RSI-scaled)
     "indicators": [
         {"name": "rsi",          "required": False, "weight": 1.0, "params": {"threshold": 30}},
         {"name": "ema_trend",    "required": False, "weight": 0.6, "params": {"period": 50}},

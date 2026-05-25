@@ -485,6 +485,14 @@ def _render_html(d: dict) -> str:
         sl_s    = f"${float(sl):,.2f}" if sl else "—"
         tp_s    = f"${float(tp):,.2f}" if tp else "—"
         unr     = _unrealised(t)
+        # R:R ratio — prefer stored value; recompute from prices if missing
+        rr = t.get("rr_ratio")
+        if rr is None and sl and tp and entry:
+            sl_dist = abs(float(entry) - float(sl))
+            tp_dist = abs(float(tp) - float(entry))
+            rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else None
+        rr_col  = "#1D9E75" if rr and float(rr) >= 1.5 else "#E8A838" if rr else "var(--muted)"
+        rr_s    = f"<span style='color:{rr_col};font-weight:500'>{rr:.1f}R</span>" if rr else "—"
         return (
             f"<tr style='border-top:0.5px solid var(--border)'>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{ts_s}</td>"
@@ -495,6 +503,7 @@ def _render_html(d: dict) -> str:
             f"<td style='padding:5px 8px;font-size:12px'>{unr}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:#E24B4A'>{sl_s}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:#1D9E75'>{tp_s}</td>"
+            f"<td style='padding:5px 8px;font-size:11px;text-align:center'>{rr_s}</td>"
             f"</tr>"
         )
 
@@ -512,6 +521,7 @@ def _render_html(d: dict) -> str:
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">unreal P&L</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:#E24B4A;text-align:left">stop loss</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:#1D9E75;text-align:left">take profit</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:center">R:R</th>
       </tr>
     </thead>
     <tbody>{"".join(_open_trade_row(t) for t in open_trades)}</tbody>

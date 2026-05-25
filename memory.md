@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-05-24 (session 3)
+2026-05-25 (session 4)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -15,8 +15,8 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 
 ## Architecture Summary
 - `run.py` — entrypoint, bootstraps per-asset state dirs under `state/{asset_slug}/`
-- `loop.py` — async 5-min tick loop; fetches 4 adapters, evaluates strategy, trades, triggers reflection every N trades
-- `adapters/price.py` — 5m + 1h + 4h OHLCV; computes RSI, EMA, BB, MACD, ATR, VWAP, FVG, OB, S/R
+- `loop.py` — async 15m tick loop; fetches 4 adapters, evaluates strategy, trades, triggers reflection every N trades
+- `adapters/price.py` — 15m + 1h + 4h OHLCV; computes RSI, EMA, BB, MACD, ATR, VWAP (15m), FVG/OB (1h), S/R (1h+4h)
 - `adapters/execution.py` — Bybit HMAC auth, live order placement
 - `reflect.py` — `--fallback` (rule-based) or `--hermes` (AI via local Ollama qwen2.5:3b); changes exactly ONE variable per reflection
 - `dashboard.py` — local Windows dashboard at localhost:8888, SSH-fetches VPS state
@@ -47,6 +47,11 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-05-24 (s3) | direction:both — agent evaluates long+short each tick | Higher confidence side wins; ambiguous (<0.1 diff) signals are skipped |
 | 2026-05-24 (s3) | _reconcile_open_trades: abandons ALL stale open records | Was leaving ghost "open" trades in trades.jsonl indefinitely |
 | 2026-05-24 (s3) | execution.py reads direction from entry_detail | Allows direction:both to place the correct long/short side |
+| 2026-05-25 (s4) | Phase 1 SMC: structural SL/TP from support_1h4h/resistance_1h4h | Replaces fixed % SL/TP; SL below swing low + sl_buffer_pct, TP at nearest resistance |
+| 2026-05-25 (s4) | Risk-based position sizing: (balance × risk_per_trade) / sl_dist_pct | Replaces fixed 20% of balance; risk_per_trade=10%, capped at MAX_POSITION_USD=$500 |
+| 2026-05-25 (s4) | Fixed default_leverage=5 replaces RSI-scaled 3–15x | Simpler; SMC trades sized by risk not leverage |
+| 2026-05-25 (s4) | max_sl_pct=5.0% guard: skip trade if structural SL too wide | Prevents entering when S/R level is too far from current price |
+| 2026-05-25 (s4) | R:R ratio shown in Live Positions dashboard | Structural TP/SL → real R:R per trade; green ≥1.5R, amber <1.5R |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -57,14 +62,45 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - [FIXED session 2] LLM bracket notation: prompt now has explicit newline-delimited variable list + one-shot JSON example; `python` → `sys.executable` in reflection subprocess
 
 ## Handoffs
-- **URGENT**: agent is DOWN (goal.yaml YAML error). 3 live Bybit positions unmanaged. Deploy immediately.
-- Deploy from Windows PowerShell (see Session 3 log for full commands)
-- After deploy: run `python3 patch_strategies.py` on VPS to update all 4 strategy.yaml files
-- After restart: confirm reconciliation cleans stale TAO open records in dashboard
-- Next check: monitor dashboard Live Positions section — should show exactly 3 (BTC/SOL/ETH)
-- Handoff to: Linh (deploy, verify dashboard)
+- **Action required**: Push session 4 changes + deploy to VPS (see Session 4 log below)
+- After deploy: run `python3 patch_strategies.py` on VPS to patch all 4 strategy.yaml with new SMC risk fields
+- Verify dashboard Live Positions shows R:R column and structural SL/TP prices
+- Monitor first few entries: agent should log "structural SL too wide" skips when S/R is distant
+- Handoff to: Linh (deploy + verify)
 
 ## Session Log
+### 2026-05-25 (session 4) — Phase 1 SMC implementation
+- **Phase 1 SMC: structural SL/TP** — `execution.py` now derives SL from `support_1h4h` (long) or `resistance_1h4h` (short) with a `sl_buffer_pct` (0.3%) buffer. TP set at nearest structural resistance/support. Both fall back to fixed `stop_loss_pct` when no structural level is available.
+- **Risk-based position sizing** — replaced fixed 20% of balance with `(balance × risk_per_trade) / sl_dist_pct`. `risk_per_trade=10%`, capped at `MAX_POSITION_USD=$500` env var.
+- **max_sl_pct guard** — if structural SL is >5% from entry, trade is skipped (raises ValueError). loop.py catches this and logs "Entry skipped — structural SL too wide".
+- **Fixed leverage** — `default_leverage=5` replaces RSI-scaled 3–15x. Simpler, more consistent.
+- **R:R ratio** — stored in trade records (`rr_ratio`); dashboard Live Positions table shows it in colour (green ≥1.5R, amber <1.5R). Computed from structural TP/SL distances.
+- **Paper sim updated** — `_simulate_paper_trade` uses `_structural_sl_tp` for consistent paper/live behaviour.
+- **reflect.py** — added `risk_per_trade`, `sl_buffer_pct`, `max_sl_pct`, `default_leverage` to AI tunable vars.
+- **risk_per_trade set to 10%** per Linh's request (was 1%).
+- **Deploy from Windows PowerShell**:
+  ```
+  cd C:\Users\nghil\Projects\Hermes\Hermes-Trading
+  Remove-Item .git\index.lock -Force -ErrorAction SilentlyContinue
+  git add hermes_trading/adapters/execution.py hermes_trading/loop.py hermes_trading/run.py hermes_trading/reflect.py dashboard.py patch_strategies.py memory.md
+  git commit -m "feat: Phase 1 SMC — structural SL/TP, risk-based sizing (10%), fixed leverage, R:R in dashboard"
+  git push origin master
+  ```
+- **Then on VPS**:
+  ```
+  cd /opt/trading/hermes-trading && git pull
+  cp hermes_trading/adapters/execution.py /opt/trading/hermes_trading/hermes_trading/adapters/execution.py
+  cp hermes_trading/loop.py /opt/trading/hermes_trading/hermes_trading/loop.py
+  cp hermes_trading/run.py /opt/trading/hermes_trading/hermes_trading/run.py
+  cp hermes_trading/reflect.py /opt/trading/hermes_trading/hermes_trading/reflect.py
+  cp patch_strategies.py /opt/trading/hermes_trading/hermes_trading/patch_strategies.py
+  cd /opt/trading/hermes_trading/hermes_trading
+  python3 patch_strategies.py
+  pkill -f hermes_trading.run
+  cd /opt/trading/hermes_trading && source venv/bin/activate
+  nohup python3 -m hermes_trading.run >> logs/hermes.log 2>&1 &
+  ```
+
 ### 2026-05-24 (session 3)
 - **Diagnosed agent DOWN**: goal.yaml line 31 had `%` instead of `#` causing yaml.ParserError on startup. Fixed.
 - **Open trade reconciliation bug fixed**: _reconcile_open_trades previously only updated the most recent open trade. Old ghost records (TAO 05-23, ETH 05-23) stayed open forever. Now abandons ALL stale open records (pnl_pct=0, abandoned=True), keeping only the most recent (which matches the live Bybit position).

@@ -2,14 +2,19 @@
 patch_strategies.py — One-time patch for existing per-asset strategy.yaml files.
 
 Run from the working directory where state/{asset}/ dirs live:
-  cd /opt/trading/hermes_trading/hermes_trading
+  cd /opt/trading/hermes_trading
   python3 patch_strategies.py
 
 Changes applied (version preserved):
-  - entry.direction    → "both"  (was "long")
-  - entry.min_indicators → 2     (new field)
-  - entry.min_confidence → 0.3   (new if missing)
-  - indicators[rsi].required → False  (was True — RSI is now optional like all others)
+  - entry.direction      → "both"   (was "long")
+  - entry.min_indicators → 2        (new field)
+  - entry.min_confidence → 0.3      (new if missing)
+  - indicators[rsi].required → False (was True — RSI now optional like all others)
+  --- Phase 1 SMC risk fields (added if missing) ---
+  - risk_per_trade       → 0.01     (1% account risk per trade)
+  - sl_buffer_pct        → 0.3      (% buffer below/above structural level for SL)
+  - max_sl_pct           → 5.0      (max allowed SL distance %; skip trade if exceeded)
+  - default_leverage     → 5        (fixed leverage; no longer RSI-scaled)
 """
 from pathlib import Path
 import yaml
@@ -38,11 +43,18 @@ def patch(path: Path) -> None:
         if ind.get("name") == "rsi":
             ind["required"] = False
 
+    # ── Phase 1 SMC risk fields (setdefault = only add if missing) ────────────
+    s.setdefault("risk_per_trade",   0.10)   # 10% account risk per trade
+    s.setdefault("sl_buffer_pct",    0.3)    # % buffer below/above structural SL level
+    s.setdefault("max_sl_pct",       5.0)    # max allowed SL distance before skipping
+    s.setdefault("default_leverage", 5)      # fixed leverage (replaces RSI-scaled)
+
     with open(path, "w") as f:
         yaml.dump(s, f, default_flow_style=False, sort_keys=False)
 
     print(f"  ✓ {path.parent.name}/strategy.yaml  v{old_version}  "
-          f"→ direction=both, min_indicators=2, rsi.required=False")
+          f"→ direction=both, min_indicators=2, rsi.required=False, "
+          f"risk_per_trade=0.01, sl_buffer_pct=0.3, max_sl_pct=5.0, default_leverage=5")
 
 
 def main() -> None:

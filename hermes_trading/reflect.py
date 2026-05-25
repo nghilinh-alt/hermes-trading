@@ -448,6 +448,10 @@ def run_hermes(state_dir: Path) -> None:
             "TUNABLE VARIABLE NAMES (copy exactly — bracket notation is required for indicators):\n"
             "  stop_loss_pct\n"
             "  position_size_r\n"
+            "  risk_per_trade\n"
+            "  sl_buffer_pct\n"
+            "  max_sl_pct\n"
+            "  default_leverage\n"
             "  entry.min_confidence\n"
             "  entry.min_indicators\n"
             "  indicators[rsi].params.threshold\n"
@@ -560,6 +564,136 @@ def main() -> None:
         run_fallback(state_dir)
     else:
         console.print("[red]Specify --fallback or --hermes[/red]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+            "TUNABLE VARIABLE NAMES (copy exactly — bracket notation is required for indicators):\n"
+            "  stop_loss_pct\n"
+            "  position_size_r\n"
+            "  risk_per_trade\n"
+            "  sl_buffer_pct\n"
+            "  max_sl_pct\n"
+            "  default_leverage\n"
+            "  entry.min_confidence\n"
+            "  entry.min_indicators\n"
+            "  indicators[rsi].params.threshold\n"
+            "  indicators[ema_trend].weight\n"
+            "  indicators[macd].weight\n"
+            "  indicators[vwap].weight\n"
+            "  indicators[volume_spike].params.min_ratio\n"
+            "  indicators[volume_spike].weight\n"
+            "  indicators[bb_squeeze].weight\n"
+            "  indicators[fvg].weight\n"
+            "  indicators[order_block].weight\n"
+            "  indicators[order_block].params.tolerance_pct\n"
+            "  indicators[sr_zone].weight\n"
+            "  indicators[sr_zone].params.tolerance_pct\n"
+            "\n"
+            "RULES:\n"
+            "  - Do NOT use dot notation like 'indicators.params.X' — always use 'indicators[name].field'.\n"
+            "  - Do NOT change the 'required' field on any indicator.\n"
+            "  - Do NOT repeat a change that memory shows was tried recently without improvement.\n"
+            "\n"
+            "OUTPUT FORMAT — raw JSON only, no markdown, no code fences, no explanation.\n"
+            "Example output:\n"
+            '{"changed_variable": "indicators[volume_spike].params.min_ratio", '
+            '"old_value": 1.5, "new_value": 2.0, '
+            '"reasoning": "Volume spike fired on 80% of losing trades at ratio 1.5; '
+            'raising threshold to filter noise.", "confidence": 0.75}\n'
+            "\n"
+            "Your output must follow that exact structure with these five keys: "
+            "changed_variable, old_value, new_value, reasoning, confidence."
+        ),
+    }
+
+    prompt = json.dumps(prompt_data, indent=2)
+
+    try:
+        output = _call_llm(prompt)
+    except RuntimeError as exc:
+        console.print(f"[red]LLM call failed: {exc} -- falling back to --fallback[/red]")
+        run_fallback(state_dir)
+        return
+
+    try:
+        hypothesis_data = json.loads(output)
+    except json.JSONDecodeError:
+        console.print(f"[yellow]LLM output was not valid JSON:\n{output}[/yellow]")
+        console.print("[yellow]Falling back to deterministic reflection.[/yellow]")
+        run_fallback(state_dir)
+        return
+
+    old_version = str(strategy.get("version", "01"))
+    new_version = _bump_version(old_version)
+    archive_path = _archive_strategy(strategy, p["history"])
+    console.print(f"  Archived v{old_version} -> {archive_path}")
+
+    changed_var = hypothesis_data.get("changed_variable", "")
+    new_val     = hypothesis_data.get("new_value")
+    old_val     = hypothesis_data.get("old_value")
+
+    if not _set_nested(strategy, changed_var, new_val):
+        console.print(f"[yellow]Could not apply '{changed_var}' -- key not found. Falling back.[/yellow]")
+        run_fallback(state_dir)
+        return
+
+    strategy["version"] = new_version
+    _save_yaml(p["strategy"], strategy)
+
+    hypothesis = {
+        "ts":               datetime.now(timezone.utc).isoformat(),
+        "mode":             "hermes",
+        "version_from":     old_version,
+        "version_to":       new_version,
+        "changed_variable": changed_var,
+        "old_value":        old_val,
+        "new_value":        new_val,
+        "reasoning":        hypothesis_data.get("reasoning", ""),
+        "confidence":       hypothesis_data.get("confidence"),
+        "trades_evaluated": len(trades),
+    }
+    _append_hypothesis(p["hypotheses"], hypothesis)
+    _update_memory(p["memory"], hypothesis, asset_slug)
+
+    console.print(f"[green]Hermes: v{old_version} -> v{new_version}: {changed_var} {old_val} -> {new_val}[/green]")
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Hermes Trading Reflect")
+    parser.add_argument("--fallback",  action="store_true", help="Deterministic fallback reflection")
+    parser.add_argument("--hermes",    action="store_true", help="AI-powered reflection via Hermes CLI")
+    parser.add_argument(
+        "--state-dir",
+        type=str,
+        default=None,
+        help="Per-asset state directory (e.g. state/btc_usdt). "
+             "Falls back to STATE_DIR env var, then 'state/'.",
+    )
+    args = parser.parse_args()
+
+    raw_dir   = args.state_dir or os.getenv("STATE_DIR", "state")
+    state_dir = Path(raw_dir)
+
+    if not state_dir.exists():
+        console.print(f"[red]state-dir '{state_dir}' does not exist[/red]")
+        sys.exit(1)
+
+    if args.hermes:
+        run_hermes(state_dir)
+    elif args.fallback:
+        run_fallback(state_dir)
+    else:
+        console.print("[red]Specify --fallback or --hermes[/red]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+print("[red]Specify --fallback or --hermes[/red]")
         sys.exit(1)
 
 

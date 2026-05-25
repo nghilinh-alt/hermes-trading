@@ -303,26 +303,58 @@ def _evaluate_entry(
     return _result(fires, confidence)
 
 
-def _execute_trade(strategy: dict, price_data: dict, entry_detail: dict) -> dict:
-    """Dispatch to live execution or paper simulator based on HERMES_TRADING_MODE."""
+def _execute_trade(strategy: dict, price_data: dict, entry_detail: dict) -> dict | None:
+    """
+    Dispatch to live execution or paper simulator based on HERMES_TRADING_MODE.
+
+    Returns None (and logs a skip message) if the structural SL is too wide —
+    this lets the loop continue normally rather than crashing the tick.
+    """
     if os.getenv("HERMES_TRADING_MODE", "paper") == "live":
         from hermes_trading.adapters import execution as execution_adapter
-        return execution_adapter.place_live_trade(strategy, price_data, entry_detail)
+        try:
+            return execution_adapter.place_live_trade(strategy, price_data, entry_detail)
+        except ValueError as e:
+            asset = price_data.get("asset", "?")
+            console.print(f"[yellow][{asset}] Entry skipped — {e}[/yellow]")
+            return None
     return _simulate_paper_trade(strategy, price_data, entry_detail)
 
 
 def _simulate_paper_trade(strategy: dict, price_data: dict, entry_detail: dict) -> dict:
-    """Generate a paper trade record (no real money moves)."""
-    import random
+    """
+    Generate a paper trade record (no real money moves).
 
-    entry_price     = price_data.get("price", 0)
-    stop_loss_pct   = float(strategy.get("stop_loss_pct", 2.0)) / 100
+    Uses structural SL/TP from price_data when available (matching live behaviour).
+    Falls back to fixed stop_loss_pct when structural levels are absent.
+    """
+    import random
+    from hermes_trading.adapters.execution import _structural_sl_tp
+
+    entry_price     = float(price_data.get("price", 0))
     position_size_r = float(strategy.get("position_size_r", 0.5))
+    risk_per_trade  = float(strategy.get("risk_per_trade", 0.10))
     # Prefer the resolved direction from evaluation (supports direction:both)
     direction = entry_detail.get("direction") or strategy.get("entry", {}).get("direction", "long")
 
-    move_pct   = random.uniform(-stop_loss_pct, stop_loss_pct * 1.5)
-    pnl_pct    = move_pct * position_size_r if direction == "long" else -move_pct * position_size_r
+    # Attempt structural SL/TP (same logic as live); fall back to fixed %
+    try:
+        sl_price, tp_price = _structural_sl_tp(price_data, direction, strategy)
+    except ValueError:
+        # SL too wide — skip (matches live behaviour)
+        asset = price_data.get("asset", "?")
+        console.print(f"[yellow][{asset}] Paper entry skipped — structural SL too wide[/yellow]")
+        raise   # re-raise so caller can handle it (same as live path returning None)
+
+    sl_dist_pct = abs(entry_price - sl_price) / entry_price if entry_price else 0.02
+    tp_dist     = abs(tp_price - entry_price)
+    sl_dist_abs = abs(entry_price - sl_price)
+    rr_ratio    = round(tp_dist / sl_dist_abs, 2) if sl_dist_abs > 0 else None
+
+    # Simulate a random outcome between SL and TP
+    move_pct   = random.uniform(-sl_dist_pct, sl_dist_pct * (rr_ratio or 2.0))
+    pnl_pct    = move_pct * (1 / sl_dist_pct) * risk_per_trade if direction == "long" \
+                 else -move_pct * (1 / sl_dist_pct) * risk_per_trade
     exit_price = entry_price * (1 + move_pct)
 
     return {
@@ -333,6 +365,9 @@ def _simulate_paper_trade(strategy: dict, price_data: dict, entry_detail: dict) 
         "entry_price":      entry_price,
         "exit_price":       round(exit_price, 4),
         "pnl_pct":          round(pnl_pct, 6),
+        "sl_price":         sl_price,
+        "tp_price":         tp_price,
+        "rr_ratio":         rr_ratio,
         "strategy_version": strategy.get("version", "01"),
         # Full indicator snapshot at entry — used by reflect.py for richer learning
         "indicators_snapshot": _snapshot_indicators(price_data),
@@ -502,17 +537,27 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
                         await asyncio.sleep(max(0, tick_seconds - elapsed))
                         continue
 
-                trade = _execute_trade(strategy, price_data, entry_result)
-                _log_trade(state_dir, trade)
-                closed_count = _count_closed_trades(state_dir)
-                pnl_display  = f"{trade['pnl_pct']:+.4%}" if trade.get("pnl_pct") is not None else "pending"
-                fired_names  = [k for k, v in entry_result.get("indicators_fired", {}).items() if v]
-                console.print(
-                    f"[green]{ts} {tag} Trade #{closed_count}: {trade['direction']} "
-                    f"@ {trade['entry_price']} · conf={entry_result['confidence']:.0%} "
-                    f"· fired={fired_names} · pnl {pnl_display}[/green]"
-                )
-                _maybe_trigger_reflection(resolved_goal, closed_count, state_dir)
+                try:
+                    trade = _execute_trade(strategy, price_data, entry_result)
+                except ValueError:
+                    # Paper mode re-raises ValueError when structural SL is too wide — skip gracefully
+                    trade = None
+
+                if trade is None:
+                    # Entry skipped (structural SL too wide) — treat as no-entry tick
+                    pass
+                else:
+                    _log_trade(state_dir, trade)
+                    closed_count = _count_closed_trades(state_dir)
+                    pnl_display  = f"{trade['pnl_pct']:+.4%}" if trade.get("pnl_pct") is not None else "pending"
+                    rr_display   = f" · RR={trade['rr_ratio']}" if trade.get("rr_ratio") else ""
+                    fired_names  = [k for k, v in entry_result.get("indicators_fired", {}).items() if v]
+                    console.print(
+                        f"[green]{ts} {tag} Trade #{closed_count}: {trade['direction']} "
+                        f"@ {trade['entry_price']} · conf={entry_result['confidence']:.0%} "
+                        f"· fired={fired_names} · pnl {pnl_display}{rr_display}[/green]"
+                    )
+                    _maybe_trigger_reflection(resolved_goal, closed_count, state_dir)
             else:
                 rsi_val  = price_data.get("rsi_14", "?")
                 conf_val = entry_result.get("confidence", 0)
@@ -542,3 +587,4 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
         tick_seconds   = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
         sleep_for      = max(0, tick_seconds - elapsed)
         await asyncio.sleep(sleep_for)
+               
