@@ -8,7 +8,7 @@ assets:           # All assets to monitor in parallel
   - SOL/USDT
   - TAO/USDT
 mode: live        # Options: 'paper' (mock) or 'live'
-timeframe: 5m     # Candle timeframe for all indicators
+timeframe: 15m    # Candle timeframe for all indicators
 # Risk Management Settings
 risk:
   max_position_usd: 100.0           # Maximum position size in USD

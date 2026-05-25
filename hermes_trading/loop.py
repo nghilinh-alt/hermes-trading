@@ -31,6 +31,16 @@ console = Console()
 
 _BASE_STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
 
+
+def _timeframe_to_seconds(tf: str) -> int:
+    """Convert a ccxt-style timeframe string to seconds. e.g. '15m' → 900, '1h' → 3600."""
+    _map = {"m": 60, "h": 3600, "d": 86400}
+    try:
+        unit = tf[-1].lower()
+        return int(tf[:-1]) * _map.get(unit, 60)
+    except Exception:
+        return 900   # default to 15m if unparseable
+
 MAX_CONSECUTIVE_FAILURES = 5
 RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 2  # seconds
@@ -487,8 +497,9 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
                         console.print(f"[dim]{ts} {tag} Entry signal — position already open, skipping[/dim]")
                         _write_heartbeat(state_dir, "ok", 0)
                         consecutive_failures = 0
-                        elapsed = time.monotonic() - tick_start
-                        await asyncio.sleep(max(0, 300 - elapsed))
+                        elapsed      = time.monotonic() - tick_start
+                        tick_seconds = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
+                        await asyncio.sleep(max(0, tick_seconds - elapsed))
                         continue
 
                 trade = _execute_trade(strategy, price_data, entry_result)
@@ -526,7 +537,8 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
                 await asyncio.sleep(600)
                 consecutive_failures = 0
 
-        # Tick every 5 minutes (matches the 5m candle timeframe)
-        elapsed = time.monotonic() - tick_start
-        sleep_for = max(0, 300 - elapsed)
+        # Tick interval matches the candle timeframe so we evaluate once per new candle
+        elapsed        = time.monotonic() - tick_start
+        tick_seconds   = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
+        sleep_for      = max(0, tick_seconds - elapsed)
         await asyncio.sleep(sleep_for)
