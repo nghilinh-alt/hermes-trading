@@ -1,59 +1,53 @@
-version: "02"
-
+version: '02'
 entry:
-  direction: long
+  direction: both
   min_confidence: 0.4
-
+  min_indicators: 2
 indicators:
-  - name: rsi
-    required: true
-    weight: 1.0
-    params:
-      threshold: 30
-
-  - name: ema_trend
-    required: false
-    weight: 0.6
-    params:
-      period: 50
-
-  - name: macd
-    required: false
-    weight: 0.5
-    params: {}
-
-  - name: vwap
-    required: false
-    weight: 0.4
-    params: {}
-
-  - name: volume_spike
-    required: false
-    weight: 0.3
-    params:
-      min_ratio: 1.5
-
-  - name: bb_squeeze
-    required: false
-    weight: 0.3
-    params: {}
-
-  - name: fvg
-    required: false
-    weight: 0.4
-    params: {}
-
-  - name: order_block
-    required: false
-    weight: 0.4
-    params:
-      tolerance_pct: 0.5
-
-  - name: sr_zone
-    required: false
-    weight: 0.3
-    params:
-      tolerance_pct: 1.0
-
+- name: rsi
+  required: false
+  weight: 1.0
+  params:
+    threshold: 30
+- name: ema_trend
+  required: false
+  weight: 0.6
+  params:
+    period: 50
+- name: macd
+  required: false
+  weight: 0.5
+  params: {}
+- name: vwap
+  required: false
+  weight: 0.4
+  params: {}
+- name: volume_spike
+  required: false
+  weight: 0.3
+  params:
+    min_ratio: 1.5
+- name: bb_squeeze
+  required: false
+  weight: 0.3
+  params: {}
+- name: fvg
+  required: false
+  weight: 0.4
+  params: {}
+- name: order_block
+  required: false
+  weight: 0.4
+  params:
+    tolerance_pct: 0.5
+- name: sr_zone
+  required: false
+  weight: 0.3
+  params:
+    tolerance_pct: 1.0
 stop_loss_pct: 2.0
 position_size_r: 0.5
+risk_per_trade: 0.1
+sl_buffer_pct: 0.3
+max_sl_pct: 5.0
+default_leverage: 5
