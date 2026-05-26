@@ -70,7 +70,13 @@ def _fetch_usdt_balance(exchange: ccxt.Exchange) -> float:
     """Return available USDT balance in the unified/contract wallet."""
     balance = exchange.fetch_balance({"type": "contract"})
     usdt = balance.get("USDT", {})
-    return float(usdt.get("free", usdt.get("total", 0)) or 0)
+    raw_bal = usdt.get("free", usdt.get("total", 0)) or 0
+    
+    # DEBUG: Log actual balance for troubleshooting
+    import sys
+    print(f"DEBUG [_fetch_usdt_balance]: Exchange={exchange.id}, Balance=${raw_bal:.2f}, Symbol={balance.get('info', {})}", file=sys.stderr)
+    
+    return float(raw_bal)
 
 
 # ── Structural SL/TP ──────────────────────────────────────────────────────────
@@ -228,9 +234,20 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
     # ── Structural SL/TP (may raise ValueError if SL too wide) ───────────────
     sl_price, tp_price = _structural_sl_tp(price_data, direction, strategy)
 
-    # ── Fixed leverage (no longer RSI-scaled) ─────────────────────────────────
-    leverage = int(strategy.get("default_leverage", 5))
-    exchange.set_leverage(leverage, symbol)
+    # ── Fixed leverage (skip Bybit unless default_leverage exists in strategy) ──
+    leverage_val = strategy.get("default_leverage")
+    leverage = int(leverage_val or 5)
+    if exchange.id != "bybit" or leverage_val:  # Bybit needs permission; skip if commented out
+        try:
+            exchange.set_leverage(leverage, symbol)
+        except ccxt.AuthenticationError:
+            pass  # API key may not have leverage permission
+        except ccxt.ExchangeError as e:
+            # Bybit retCode 110043 ("leverage not modified") is benign — the
+            # value is already set to what we requested. Anything else re-raises.
+            msg = str(e)
+            if "110043" not in msg and "not modified" not in msg.lower():
+                raise
 
     # ── Risk-based position size ───────────────────────────────────────────────
     qty = _risk_based_qty(exchange, entry_price, sl_price, strategy, symbol)

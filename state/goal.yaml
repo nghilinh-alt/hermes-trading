@@ -31,7 +31,7 @@ score:
     - max_drawdown                   # Worst loss streak
 # Data Sources
 data:
-  exchanges: ["binance"]             # CCXT exchange(s) to use
+  exchanges: ["bybit"]               # CCXT exchange(s) to use
   macro_sources: ["federalreserve", "tradingeconomics"]
   news_api_key: ""                   # Leave blank for demo, or set key
   onchain_api_key: ""                # Leave blank for demo, or set Glassnode key

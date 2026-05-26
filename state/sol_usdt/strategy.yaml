@@ -1,28 +1,61 @@
-# SOL/USDT Trading Strategy Configuration
 asset: SOL/USDT
-position_size_r: 0.8  # 80% position size (aggressive growth)
-risk_per_trade: 0.10  # 10% of margin balance per trade
-stop_loss_pct: 2.0   # 2% stop loss from entry price
-max_sl_pct: 5.0      # Maximum allowed stop loss percentage
-take_profit_pct: 5.0 # Take profit at 5x sl distance (1:2.5 R:R)
-trailing_stop_r: 0.5 # Trailing stop activates at 0.5R profit
-
-# Risk management
-max_leverage: 5      # Maximum leverage allowed (default: 5x)
-use_fbb: false       # Disable Full Kelly Betting
-risk_adjustment: "fixed"  # Fixed risk per trade, no dynamic adjustment
-
-# Position sizing logic
-# qty_usd = min((balance × risk_per_trade) / sl_dist_pct, position_size_r × max_pos_usd)
-# With MAX_POSITION_USD=999.99 and risk_per_trade=0.10:
-#   - $773 balance at 2% SL → $77 trade (773×0.10/0.02=$3,865 → capped to 80% of theoretical max)
-
-# Entry triggers
-rsi_entry_overbought: 70    # Consider reducing position if RSI > 70
-rsi_entry_oversold: 30      # Consider increasing if RSI < 30
-max_trades_per_day: 10      # Daily trade limit (optional)
-
-# Notes:
-# - Position scales dynamically with balance: $1000 = $100/trade, $2000 = $200/trade
-# - Leverage provides equivalent position size (e.g., $100 notional at 5x leverage)
-# - Stop loss placed at structural support levels or fixed 2% from entry
+position_size_r: 0.8
+risk_per_trade: 0.1
+stop_loss_pct: 2.0
+max_sl_pct: 5.0
+take_profit_pct: 5.0
+trailing_stop_r: 0.5
+max_leverage: 5
+use_fbb: false
+risk_adjustment: fixed
+rsi_entry_overbought: 70
+rsi_entry_oversold: 30
+max_trades_per_day: 10
+entry:
+  direction: both
+  min_indicators: 2
+  min_confidence: 0.3
+indicators:
+- name: rsi
+  required: false
+  weight: 1.0
+  params:
+    threshold: 30
+- name: ema_trend
+  required: false
+  weight: 0.6
+  params:
+    period: 50
+- name: macd
+  required: false
+  weight: 0.5
+  params: {}
+- name: vwap
+  required: false
+  weight: 0.4
+  params: {}
+- name: volume_spike
+  required: false
+  weight: 0.3
+  params:
+    min_ratio: 1.5
+- name: bb_squeeze
+  required: false
+  weight: 0.3
+  params: {}
+- name: fvg
+  required: false
+  weight: 0.4
+  params: {}
+- name: order_block
+  required: false
+  weight: 0.4
+  params:
+    tolerance_pct: 0.5
+- name: sr_zone
+  required: false
+  weight: 0.3
+  params:
+    tolerance_pct: 1.0
+sl_buffer_pct: 0.3
+default_leverage: 5

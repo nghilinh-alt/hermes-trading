@@ -10,7 +10,7 @@ services:
     environment:
       - CCXT_API_KEY=${CCXT_API_KEY}
       - CCXT_API_SECRET=${CCXT_API_SECRET}
-      - EXCHANGE=binance  # Change as needed
+      - EXCHANGE=bybit  # Change as needed
       - TRADING_MODE=spot  # or 'futures'
     command: python -m hermes_trading.run
     restart: unless-stopped
