@@ -366,20 +366,30 @@ def _render_html(d: dict) -> str:
             return ""
         rows = []
         for ind in indicators:
-            name = ind.get("name", "")
-            w    = float(ind.get("weight", 0))
-            req  = ind.get("required", False)
-            col  = "#EF9F27" if req else ("#1D9E75" if w > 0 else "#555")
-            tag  = "★" if req else ""
-            bw   = max(3, int(w * 42))
+            name   = ind.get("name", "")
+            w      = float(ind.get("weight", 0))
+            req    = ind.get("required", False)
+            params = ind.get("params", {})
+            col    = "#EF9F27" if req else ("#1D9E75" if w > 0 else "#555")
+            tag    = "★" if req else ""
+            bw     = max(3, int(w * 42))
+            req_label = " · required gate" if req else ""
+            params_str = ", ".join(f"{k}={v}" for k, v in params.items()) if params else ""
+            tooltip = f"weight {w}{req_label}" + (f" · {params_str}" if params_str else "")
             rows.append(
-                f"<div style='display:flex;align-items:center;gap:5px;margin-bottom:2px'>"
+                f"<div style='display:flex;align-items:center;gap:5px;margin-bottom:2px' title='{tooltip}'>"
                 f"<span style='font-size:9px;width:70px;color:var(--muted);overflow:hidden;white-space:nowrap'>{tag}{name}</span>"
                 f"<div style='height:4px;width:{bw}px;background:{col};border-radius:2px;flex-shrink:0'></div>"
                 f"<span style='font-size:9px;color:var(--muted)'>{w}</span>"
                 f"</div>"
             )
-        return "<div style='margin-top:10px;border-top:0.5px solid var(--border);padding-top:8px'>" + "".join(rows) + "</div>"
+        legend = (
+            "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:5px'>"
+            "<span style='font-size:9px;color:var(--muted)'>indicators · bar = weight</span>"
+            "<span style='font-size:9px;color:var(--muted)' title='★ = required gate (must fire); bar width = relative weight; hover for details'>★ = required &nbsp; <span style='color:#1D9E75'>■</span> active</span>"
+            "</div>"
+        )
+        return "<div style='margin-top:10px;border-top:0.5px solid var(--border);padding-top:8px'>" + legend + "".join(rows) + "</div>"
 
     asset_cards = ""
     for slug in ASSETS:
@@ -439,8 +449,6 @@ def _render_html(d: dict) -> str:
             <span style="font-size:12px;text-align:right">{ep_str}</span>
             <span style="font-size:11px;color:var(--muted)">last P&L</span>
             <span style="font-size:12px;text-align:right;color:{lp_col}">{lp_str}</span>
-            <span style="font-size:11px;color:var(--muted)">last tick</span>
-            <span style="font-size:12px;text-align:right;color:var(--muted)">{lt_str}</span>
           </div>
           {ind_bars}
         </div>"""
@@ -531,7 +539,10 @@ def _render_html(d: dict) -> str:
         positions_html = "<div style='font-size:12px;color:var(--muted);margin-bottom:1.5rem'>No open positions.</div>"
 
     # ── Trade history table ───────────────────────────────────────────────────
-    recent_trades = sorted(all_trades_flat, key=lambda t: t.get("ts", ""), reverse=True)[:50]
+    recent_trades = sorted(
+        [t for t in all_trades_flat if not t.get("abandoned")],
+        key=lambda t: t.get("ts", ""), reverse=True
+    )[:50]
 
     # Short display names for indicators — keeps chips compact
     _IND_SHORT = {
@@ -763,7 +774,10 @@ def _render_html(d: dict) -> str:
       synced {updated} &nbsp;·&nbsp; <span id="clk"></span> &nbsp;·&nbsp; refreshes every {POLL_SECS}s
     </div>
   </div>
-  <span style="font-size:11px;padding:3px 10px;border-radius:6px;background:{mode_bg};color:{mode_col}">{mode} mode</span>
+  <div style="display:flex;align-items:center;gap:8px">
+    <a href="/?refresh=1" style="font-size:11px;padding:3px 10px;border-radius:6px;background:var(--surface);border:0.5px solid var(--border);color:var(--muted);text-decoration:none">↻ sync now</a>
+    <span style="font-size:11px;padding:3px 10px;border-radius:6px;background:{mode_bg};color:{mode_col}">{mode} mode</span>
+  </div>
 </div>
 
 <script>
@@ -788,7 +802,7 @@ def _render_html(d: dict) -> str:
 <h2>Running P&L</h2>
 {pnl_summary}
 
-<h2>Trade history <span style="font-weight:400">(last 50 · newest first)</span></h2>
+<h2>Trade history <span style="font-weight:400">(last 50 · newest first · abandoned excluded)</span></h2>
 {trade_table}
 
 <h2>Strategy reflections</h2>
@@ -800,7 +814,7 @@ def _render_html(d: dict) -> str:
 </div>
 
 <div style="font-size:11px;color:var(--muted);text-align:center;padding-bottom:1.5rem">
-  Hermes Trading &nbsp;·&nbsp; {VPS} &nbsp;·&nbsp; <a href="/" style="color:var(--muted)">force refresh</a>
+  Hermes Trading &nbsp;·&nbsp; {VPS} &nbsp;·&nbsp; <a href="/?refresh=1" style="color:var(--muted)">force refresh</a>
 </div>
 
 </body></html>"""
@@ -826,6 +840,18 @@ def _poll_loop() -> None:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        if "refresh" in params:
+            # Force an immediate SSH re-fetch, bypassing the poll cache
+            with _cache["lock"]:
+                last = dict(_cache["data"])
+            fresh = _fetch_data(last_known=last or None)
+            with _cache["lock"]:
+                _cache["data"] = fresh
+
         with _cache["lock"]:
             data = _cache["data"]
         if not data:

@@ -36,7 +36,7 @@ strategy:
 risk_management:
   max_daily_loss_pct: 10.0   # Maximum daily drawdown before stop trading
   max_weekly_trades: 5       # Maximum trades per week to prevent overtrading
-  position_limit_usd: 100    # Hard cap on any single trade size (USD)
+  position_limit_usd: 77     # Hard cap on any single trade size (USD) - matches your 10% balance goal
 
 # Reflection & Self-Improvement
 reflection:
