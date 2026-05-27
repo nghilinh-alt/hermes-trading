@@ -11,6 +11,11 @@ Safety constraints:
   - SL = structural support/resistance ± sl_buffer_pct; fallback to fixed stop_loss_pct
   - TP = nearest structural resistance/support; fallback to 2:1 RR from SL
   - SL/TP always attached to every order
+
+Phase 2.1 structural guards (sessions 6+):
+  - max_sl_pct       — skip trade if SL is too far from entry  (existing)
+  - min_tp_pct       — skip trade if structural TP is too close to entry (Option B filter)
+  - min_rr_ratio     — soft: if R:R below threshold, extend TP to hit it (do not skip)
 """
 import os
 from datetime import datetime, timezone
@@ -71,11 +76,11 @@ def _fetch_usdt_balance(exchange: ccxt.Exchange) -> float:
     balance = exchange.fetch_balance({"type": "contract"})
     usdt = balance.get("USDT", {})
     raw_bal = usdt.get("free", usdt.get("total", 0)) or 0
-    
+
     # DEBUG: Log actual balance for troubleshooting
     import sys
     print(f"DEBUG [_fetch_usdt_balance]: Exchange={exchange.id}, Balance=${raw_bal:.2f}, Symbol={balance.get('info', {})}", file=sys.stderr)
-    
+
     return float(raw_bal)
 
 
@@ -88,7 +93,7 @@ def _structural_sl_tp(
     strategy: dict,
 ) -> tuple[float, float]:
     """
-    Derive stop-loss and take-profit from structural swing levels.
+    Derive stop-loss and take-profit from structural swing levels with three guards.
 
     Long:
       SL = support_1h4h × (1 - sl_buffer_pct)   (fallback: entry × (1 - stop_loss_pct))
@@ -97,52 +102,70 @@ def _structural_sl_tp(
       SL = resistance_1h4h × (1 + sl_buffer_pct) (fallback: entry × (1 + stop_loss_pct))
       TP = support_1h4h                            (fallback: entry - 2×SL-distance)
 
-    Raises ValueError if the structural SL distance exceeds max_sl_pct.
+    Guards (in order):
+      1. max_sl_pct        — raise ValueError if SL distance from entry exceeds threshold (default 5%)
+      2. min_tp_pct        — raise ValueError if structural TP distance from entry is below threshold
+                             (default 3%). Implements "Option B" target-return filter.
+      3. min_rr_ratio      — soft guard: if structural R:R is below threshold (default 2.0), extend
+                             TP to (entry ± sl_dist × min_rr_ratio). Does NOT skip the trade.
     """
-    entry      = float(price_data.get("price", 0))
-    sl_buffer  = float(strategy.get("sl_buffer_pct", 0.3)) / 100
-    fallback_sl = float(strategy.get("stop_loss_pct", 2.0)) / 100
-    max_sl     = float(strategy.get("max_sl_pct", 5.0)) / 100
-    support    = price_data.get("support_1h4h")
-    resistance = price_data.get("resistance_1h4h")
+    entry        = float(price_data.get("price", 0))
+    sl_buffer    = float(strategy.get("sl_buffer_pct", 0.3)) / 100
+    fallback_sl  = float(strategy.get("stop_loss_pct", 2.0)) / 100
+    max_sl       = float(strategy.get("max_sl_pct", 5.0)) / 100
+    min_tp_pct   = float(strategy.get("min_tp_pct", 3.0)) / 100
+    min_rr_ratio = float(strategy.get("min_rr_ratio", 2.0))
+    support      = price_data.get("support_1h4h")
+    resistance   = price_data.get("resistance_1h4h")
+
+    if entry <= 0:
+        raise ValueError(f"Invalid entry price: {entry}")
 
     if direction == "long":
-        # SL: below structural support with buffer, or fixed fallback
         if support and float(support) < entry:
             sl_price = round(float(support) * (1 - sl_buffer), 4)
         else:
             sl_price = round(entry * (1 - fallback_sl), 4)
-
         sl_dist = abs(entry - sl_price)
-
-        # TP: structural resistance above entry, or 2:1 RR fallback
         if resistance and float(resistance) > entry:
             tp_price = round(float(resistance), 4)
         else:
             tp_price = round(entry + sl_dist * 2, 4)
-
     else:  # short
-        # SL: above structural resistance with buffer, or fixed fallback
         if resistance and float(resistance) > entry:
             sl_price = round(float(resistance) * (1 + sl_buffer), 4)
         else:
             sl_price = round(entry * (1 + fallback_sl), 4)
-
         sl_dist = abs(sl_price - entry)
-
-        # TP: structural support below entry, or 2:1 RR fallback
         if support and float(support) < entry:
             tp_price = round(float(support), 4)
         else:
             tp_price = round(entry - sl_dist * 2, 4)
 
-    # Guard: reject if SL is too far from entry
+    # Guard 1: SL not too wide
     sl_dist_pct = abs(entry - sl_price) / entry
     if sl_dist_pct > max_sl:
         raise ValueError(
             f"Structural SL too wide: {sl_dist_pct:.2%} > max {max_sl:.2%} "
             f"(entry={entry}, sl={sl_price})"
         )
+
+    # Guard 2 (Option B filter): TP must be at least min_tp_pct from entry
+    tp_dist_pct = abs(tp_price - entry) / entry
+    if tp_dist_pct < min_tp_pct:
+        raise ValueError(
+            f"Structural TP too thin: {tp_dist_pct:.2%} < min {min_tp_pct:.2%} "
+            f"(entry={entry}, tp={tp_price}) — Option B target-return filter"
+        )
+
+    # Guard 3 (Soft R:R): extend TP if R:R below threshold
+    if sl_dist > 0:
+        rr_ratio = abs(tp_price - entry) / sl_dist
+        if rr_ratio < min_rr_ratio:
+            if direction == "long":
+                tp_price = round(entry + sl_dist * min_rr_ratio, 4)
+            else:
+                tp_price = round(entry - sl_dist * min_rr_ratio, 4)
 
     return sl_price, tp_price
 
@@ -163,7 +186,7 @@ def _risk_based_qty(
     qty_usd = (balance × risk_per_trade) / sl_dist_pct
     Capped at MAX_POSITION_USD env var (default $500).
     """
-    risk_per_trade = float(strategy.get("risk_per_trade", 0.10))   # 10% default
+    risk_per_trade = float(strategy.get("risk_per_trade", 0.10))
     max_pos_usd    = float(os.getenv("MAX_POSITION_USD", "500"))
 
     balance = _fetch_usdt_balance(exchange)
@@ -192,7 +215,6 @@ def has_open_position(asset: str) -> bool:
             if abs(float(pos.get("contracts", 0) or 0)) > 0:
                 return True
     except Exception as e:
-        # If we can't confirm, be safe and assume a position exists
         raise RuntimeError(f"Could not fetch positions for {asset}: {e}")
     return False
 
@@ -204,15 +226,13 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
     """
     Place a real market order on Bybit USDT perpetual.
 
-    - SL/TP: structural swing levels (support_1h4h / resistance_1h4h) with sl_buffer_pct.
-             Falls back to fixed stop_loss_pct when no structural level is available.
-             Raises ValueError if structural SL > max_sl_pct — caller should skip entry.
-    - Position size: risk-based — (balance × risk_per_trade) / sl_dist_pct, capped at MAX_POSITION_USD.
-    - Leverage: fixed default_leverage (default 5x).
+    - SL/TP: structural swing levels with max_sl_pct / min_tp_pct / min_rr_ratio guards.
+    - Position size: risk-based, capped at MAX_POSITION_USD.
+    - Leverage: fixed default_leverage. Idempotent against Bybit retCode 110043.
     - entry_detail: dict from loop._evaluate_entry with indicators_fired + confidence + direction.
 
-    Returns a trade record dict matching the schema used by loop.py.
-    Raises ValueError if structural SL is too wide (caller should catch and skip).
+    Returns a trade record dict matching loop.py schema.
+    Raises ValueError if any structural guard fails (caller catches and skips).
     """
     from hermes_trading.loop import _snapshot_indicators
 
@@ -221,43 +241,34 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
     asset     = price_data.get("asset", "BTC/USDT")
     symbol    = _to_perp_symbol(asset)
 
-    # Prefer the resolved direction from evaluation (entry_detail); fall back to strategy config.
-    # This correctly handles direction:both where the resolved side is set per-tick.
     ed        = entry_detail or {}
     direction = ed.get("direction") or strategy.get("entry", {}).get("direction", "long")
     if direction not in ("long", "short"):
-        direction = "long"   # safety: never send an invalid side to the exchange
+        direction = "long"
     side      = "buy" if direction == "long" else "sell"
 
     entry_price = float(price_data.get("price", 0))
 
-    # ── Structural SL/TP (may raise ValueError if SL too wide) ───────────────
     sl_price, tp_price = _structural_sl_tp(price_data, direction, strategy)
 
-    # ── Fixed leverage (skip Bybit unless default_leverage exists in strategy) ──
     leverage_val = strategy.get("default_leverage")
     leverage = int(leverage_val or 5)
-    if exchange.id != "bybit" or leverage_val:  # Bybit needs permission; skip if commented out
+    if exchange.id != "bybit" or leverage_val:
         try:
             exchange.set_leverage(leverage, symbol)
         except ccxt.AuthenticationError:
-            pass  # API key may not have leverage permission
+            pass
         except ccxt.ExchangeError as e:
-            # Bybit retCode 110043 ("leverage not modified") is benign — the
-            # value is already set to what we requested. Anything else re-raises.
             msg = str(e)
             if "110043" not in msg and "not modified" not in msg.lower():
                 raise
 
-    # ── Risk-based position size ───────────────────────────────────────────────
     qty = _risk_based_qty(exchange, entry_price, sl_price, strategy, symbol)
 
-    # ── R:R ratio for logging / dashboard ─────────────────────────────────────
     sl_dist = abs(entry_price - sl_price)
     tp_dist = abs(tp_price - entry_price)
     rr_ratio = round(tp_dist / sl_dist, 2) if sl_dist > 0 else None
 
-    # ── Place market order with SL/TP attached ─────────────────────────────────
     order = exchange.create_order(
         symbol, "market", side, qty,
         params={"stopLoss": str(sl_price), "takeProfit": str(tp_price)},
@@ -271,8 +282,8 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
         "asset":            asset,
         "direction":        direction,
         "entry_price":      fill_price,
-        "exit_price":       None,      # filled when position closes via reconcile
-        "pnl_pct":          None,      # filled when position closes via reconcile
+        "exit_price":       None,
+        "pnl_pct":          None,
         "order_id":         order.get("id"),
         "qty":              qty,
         "leverage":         leverage,
@@ -280,7 +291,6 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
         "tp_price":         tp_price,
         "rr_ratio":         rr_ratio,
         "strategy_version": strategy.get("version", "01"),
-        # Full indicator snapshot at entry — used by reflect.py for richer learning
         "indicators_snapshot": _snapshot_indicators(price_data),
         "indicators_fired":    ed.get("indicators_fired", {}),
         "confidence_at_entry": ed.get("confidence"),
