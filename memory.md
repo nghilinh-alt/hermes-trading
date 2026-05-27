@@ -2,11 +2,17 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-05-27 (session 5 — diagnosis only, no code changes)
+2026-05-28 (session 6 — Phase 2.4: reflect.py truncate-fix, Bybit backfill tool, $5/trade hard guard)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
-- **VPS path**: `/opt/trading/hermes_trading`
+- **VPS layout** (confirmed session 5b, 2026-05-27):
+  - **Git pull clone**: `/opt/trading/hermes-trading/` (hyphen) — only used as deploy staging
+  - **Running agent dir**: `/opt/trading/hermes_trading/` (underscore) — has `.venv/`, `bot.log` at top level, package at `hermes_trading/`, per-asset state at `state/<slug>/`
+  - **State is NOT nested** inside the package dir. It's a sibling: `/opt/trading/hermes_trading/state/<slug>/strategy.yaml` (correct), NOT `/opt/trading/hermes_trading/hermes_trading/state/...` (wrong, this path doesn't exist)
+  - **Venv**: `.venv/` (dot-prefixed), activate with `source /opt/trading/hermes_trading/.venv/bin/activate`
+  - **Log**: top-level `bot.log` (NOT `logs/hermes.log` — that dir doesn't exist)
+  - Fossilized old install at `/opt/trading/` top-level (May-24-dated `strategy.yaml`, `dashboard.py`, `state/`) — unused, safe to clean up later
 - **Repo**: https://github.com/nghilinh-alt/hermes-trading.git (master branch)
 - **Local path**: `C:\Users\nghil\Projects\Hermes\Hermes-Trading`
 - **Trading mode**: Live on Bybit, HMAC key auth
@@ -54,6 +60,9 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-05-25 (s4) | R:R ratio shown in Live Positions dashboard | Structural TP/SL → real R:R per trade; green ≥1.5R, amber <1.5R |
 | 2026-05-27 (s5) | Diagnosed 0% confidence / no-entry symptom — root causes in state/<slug>/strategy.yaml shape, NOT in execution.py | ETH/SOL/TAO YAMLs lack `indicators:` registry → loop falls into long-only RSI<30 fallback. BTC still has rsi.required:true. See diagnosis-session-5.md. |
 | 2026-05-27 (s5) | retCode 110043 traced to execution.py:243 only catching ccxt.AuthenticationError | Bybit returns ExchangeError "leverage not modified" when leverage already set; current handler doesn't swallow it. Proposed 7-line idempotent wrapper documented in diagnosis-session-5.md, NOT applied. |
+| 2026-05-28 (s6) | $5 hard profit floor: new `_guard_min_profit_usd` in execution.py + `min_profit_usd: 5.0` in all 4 yamls | Linh directive "aim to win at least $5 per trade." Hard skip in `place_live_trade` after qty is computed (qty × \|tp − entry\| < $5 → ValueError). Co-located with Phase 2.1 guards as Guard 4. |
+| 2026-05-28 (s6) | reflect.py truncated from 702 → 572 lines (IndentationError fix) | Duplicated `run_hermes` + `main` bodies at lines 572+ from prior Edit-tool corruption. Fixed via Python heredoc; py_compile + ast.parse OK. |
+| 2026-05-28 (s6) | `tools/backfill_trades.py` (NEW) — direction-correct pnl_pct via closedPnl/cumEntryValue | Sidesteps the still-broken `(exit-entry)/entry` formula in `fetch_last_closed_pnl` (Phase 2.5 will fix that). Idempotent dedup by order_id. 6 unit tests pass. |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -64,14 +73,58 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - [FIXED session 2] LLM bracket notation: prompt now has explicit newline-delimited variable list + one-shot JSON example; `python` → `sys.executable` in reflection subprocess
 
 ## Handoffs
-- **Action required (session 5)**: Linh to review `diagnosis-session-5.md` and decide on Steps 1–3 (verify VPS YAML state → re-apply patch_strategies.py → optional idempotent leverage handler). No code or YAML was modified in session 5.
-- **Carried over from session 4**: Push session 4 changes + deploy to VPS (see Session 4 log)
-- After deploy: run `python3 patch_strategies.py` on VPS to patch all 4 strategy.yaml with new SMC risk fields
-- Verify dashboard Live Positions shows R:R column and structural SL/TP prices
-- Monitor first few entries: agent should log "structural SL too wide" skips when S/R is distant
-- Handoff to: Linh (review diagnosis → approve Steps 1–3 → deploy + verify)
+- **Status (end of session 6, 2026-05-28)**: Phase 2.4 fully landed LOCAL only. reflect.py fixed (702→572 lines), `_guard_min_profit_usd` wired into execution.py, all 4 yamls have `min_profit_usd: 5.0`, `tools/backfill_trades.py` written + tested (6/6 unit tests pass). Awaiting Linh's PowerShell push + SSH deploy per `session-6-phase-2.4.md`.
+- **Next-session candidate**: Phase 2.5 (`fetch_last_closed_pnl` direction-aware pnl_pct) + Phase 2.3 (`fetch_recent_closed_trades` for dashboard merge) — same function, do together.
+- **Status (end of session 5c)**: VPS agent is RUNNING — PID 1290662, all 4 workers booted in live mode. Awaiting first 15m tick to confirm `dir=both · conf=NN%` lines and absence of new 110043 tracebacks.
+- **Linh to do next**:
+  1. `tail -f /opt/trading/hermes_trading/bot.log` and verify first tick shows real conf% per asset
+  2. If first 2-3 ticks show `dir=both · conf=0%` across the board, signal is genuinely flat (different problem — would need to inspect price adapter output)
+  3. If `Trade #1` fires: verify on dashboard that R:R column shows the structural value, and that SL/TP are at swing levels not fixed % distances
+  4. SCP `/tmp/hermes-backup-<STAMP>/` to local if you want to preserve pre-session-5 yamls (else they'll vanish on VPS reboot)
+  5. Consider Option B (collapse to single folder) vs Option A (keep two-folder pattern) for the `/opt/trading/hermes-trading/` + `/opt/trading/hermes_trading/` situation — separate session
+- **Carried over from session 4**: dashboard Live Positions R:R display (verify on next live tick)
+- **Handoff to**: Linh (monitor + decide on next-session topics)
+
+#### Session 5d — Strategy review document
+- Linh raised 6 strategy questions (min R:R 2.0, TP zones, trailing stops, dashboard-Bybit reconciliation, swing vs SMC style, 3% return target).
+- Wrote up answers in `strategy-review-session-5.md` with: empirical context from TAO Trade #1 (R:R 1.73, conf 54.76%), per-question analysis, proposed Phase 2 implementation order (min TP guard + min R:R + target-return filter in one session; trailing stops next; Bybit backfill after; TP zones deferred to Phase 3).
+- **No code or YAML changes.** Phase 2 starts only after Linh answers 5 open questions in the doc (soft vs hard R:R guard, return-enforcement option A/B/C, trailing stop fixed vs ATR, timeframe 15m vs 1h, duplicate-trade-record bug timing).
+- **Anomaly logged for later:** TAO trades.jsonl had 1 line at scp time, 4 identical lines at later ssh-cat time. Only one real Bybit order was placed. Pure bookkeeping bug. Defer to post-Phase-2.
+
+#### Session 5e — Phase 2.1 implementation (2026-05-27)
+- **Decisions locked**: soft R:R (extend TP, don't skip), Option B target-return filter, ATR-based trail next, dupe-bug deferred.
+- **execution.py rewritten** with three guards in `_structural_sl_tp`: max_sl_pct (existing), min_tp_pct (new), min_rr_ratio (new soft). Written atomically via Python (Write tool truncated on Windows mount AGAIN — same hazard as Edit, now confirmed both tools have this failure mode).
+- **All 4 strategy.yamls** got `min_tp_pct: 3.0` and `min_rr_ratio: 2.0`.
+- **6 unit tests pass.** Crucially: TAO Trade #1 replay (entry $282, support $278.8 / 1.13% from entry) **correctly skips** under new Option B filter. That trade would NOT fire under new rules.
+- **Commit `55cbbaa`** landed locally despite `.git/index.lock` permissions noise on Windows mount.
+- **Push to GitHub**: pending Linh's PowerShell.
+- **Deploy to VPS**: pending Linh's PowerShell + SSH.
+- **Expected post-deploy effect**: trade frequency drops 60-80%; trades that fire have R:R ≥ 2.0 and structural target ≥ 3% price move; the 10001 "TP too close" Bybit rejection on BTC/ETH should disappear since 3% >> typical slippage.
+
+### Persistent operational issue: Windows-mount file tool corruption
+- Both `Edit` AND `Write` tools have truncated files on the C:\Users\nghil mount. Always use `python -c '...'` or `python <<EOF` heredoc via bash for Python file changes. Validate with `python -m py_compile` immediately. Never trust the file tool's "success" response for Python files on this mount.
+
+### SSH setup for dashboard (session 5f, 2026-05-27)
+- Local Windows machine had NO ssh keys at all (only known_hosts). Dashboard's `BatchMode=yes` SSH was falling through to password auth, which the VPS rejects for root (standard `PermitRootLogin prohibit-password` policy).
+- Generated `C:\Users\nghil\.ssh\hermes_vps` (passphraseless ed25519) on Windows.
+- Added the pubkey to VPS `/root/.ssh/authorized_keys` (preserved the pre-existing `hermes-dashboard` orphan key).
+- Added `Host 187.127.108.173` block to `~/.ssh/config` with `IdentityFile ~/.ssh/hermes_vps` and `IdentitiesOnly yes`.
+- `ssh -o BatchMode=yes ... "echo OK"` now succeeds → dashboard's `_ssh_batch` works.
+- **Tripwire to remember**: the pre-existing `hermes-dashboard` key entry in authorized_keys had no trailing newline. `echo >> file` concatenated the appended line onto the same line, corrupting both entries. Always rebuild authorized_keys via heredoc (`cat > file <<'EOF' ... EOF`) and verify with `wc -l` afterward.
 
 ## Session Log
+### 2026-05-28 (session 6) — Phase 2.4 reflection rebuild + $5 hard guard
+- **reflect.py was corrupted** with duplicated `run_hermes` + `main` bodies at lines 572-701 (prior Edit-tool corruption). Final 5 lines had `console.print` truncated to bare `print` at module-level indent → `IndentationError` on line 572. Reflection subprocess had been failing on every invocation since.
+- **Fix:** truncated cleanly at the first occurrence of `if __name__ == "__main__":\n    main()\n`. File 702 → 572 lines. Validated with `python -m py_compile` and `ast.parse`. Written atomically via Python heredoc + `.tmp` → `replace()` (never trust Edit/Write on the Windows mount; lesson re-confirmed).
+- **TAO trade visibility:** local `state/tao_usdt/trades.jsonl` had 1 line (the open Trade #1 from session 5). Linh reported "lots of small TAO short trades" — those were all on Bybit, invisible locally. `_count_closed_trades` was therefore returning ~0 for every asset and reflection was never crossing its cadence threshold.
+- **New `tools/backfill_trades.py`** — one-shot Bybit closed-trade backfill, calls `private_get_v5_position_closed_pnl` per asset (paginated via `nextPageCursor`, 30-day default lookback), appends missing records to `trades.jsonl` deduped by `order_id`. Idempotent. **Direction-correct pnl_pct** computed as `closedPnl / cumEntryValue` (sidesteps the broken `(exit-entry)/entry` in `fetch_last_closed_pnl` — that's Phase 2.5). Synthetic records flagged `backfilled: true`, `strategy_version: "backfilled"`. CLI supports `--asset`, `--dry-run`, `--lookback-days`. New `tools/__init__.py` so `python -m tools.backfill_trades` works.
+- **New $5/trade hard guard** (`_guard_min_profit_usd` in execution.py). Called in `place_live_trade` between `_risk_based_qty` and `create_order`. Raises ValueError if `qty × |tp − entry| < min_profit_usd`. Loop catches and logs "Entry skipped — Expected TP profit too small: $X.XX < min $5.00". Added `min_profit_usd: 5.0` to all 4 strategy.yamls.
+- **Test coverage:** 6 backfill unit tests (winning-short → +pnl, losing-long → -pnl, malformed → None, dedup, idempotency, dry-run safety) + 6 guard tests (floor pass/fail, custom floor, zero-profit edge, TAO Trade #1 replay still blocked by min_tp_pct, constructed trade passing Phase 2.1 but failing $-guard). All green.
+- **TAO Trade #1 (entry $282, R:R 1.73) would not fire under any combination of current guards** — already blocked by `min_tp_pct: 3.0` since `|278.8 − 282|/282 = 1.13% < 3%`. Confirmed in test B.
+- **Not committed/pushed yet** — local `.git` clean of locks at session end but Linh deploys from PowerShell. Deploy block in `session-6-phase-2.4.md`.
+- **Files I did NOT touch** (still uncommitted from prior sessions, Linh should review separately): `state/goal.yaml`, `snapshot.sh`, `state/tao_usdt/trades.jsonl`, `next-session-prompt.md`, `state/btc_usdt/goal.yaml`, deleted `*.tar.gz` artifacts.
+- **Watchlist:** Phase 2.5 `fetch_last_closed_pnl` direction-aware pnl_pct fix; Phase 2.3 `fetch_recent_closed_trades` for dashboard merge (pair with 2.5); Phase 2.2 ATR trailing stop (waits for 5–10 calibration trades).
+
 ### 2026-05-27 (session 5) — Diagnosis of 0% confidence / no-entry symptom
 - **Read-only session.** No Python, YAML, or runtime state modified.
 - **Bug 1 (critical, 3 of 4 assets):** `state/eth_usdt/strategy.yaml`, `state/sol_usdt/strategy.yaml`, `state/tao_usdt/strategy.yaml` are in a legacy flat schema (`position_size_r`, `rsi_entry_oversold`, etc.) with NO `indicators:` block and NO `entry:` block. `loop._evaluate_entry` therefore falls into the no-indicators fallback at line 256–261, which is hard-coded to `direction="long"` and `threshold=30`. RSI in 60–75 → `rsi < 30` is False → fires=False, conf=0%. Matches reported symptom exactly.
@@ -89,6 +142,25 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **BTC default_leverage change:** BTC YAML had `default_leverage:` commented out (let Bybit use 12.5x default). Patch re-set it to 5. Combined with the new idempotent 110043 handler, this is safe — but it IS a behavior change.
 - **Not committed/pushed yet** — `.git/index.lock` exists from Windows and the sandbox can't unlink it. Full PowerShell + VPS deploy block written into `diagnosis-session-5.md` (Session 5 — Applied section).
 - **Lesson logged:** `Edit` tool is unsafe on files visible via the Windows mount. Always `python -m py_compile` after every Python edit. Prefer Read + Write (full overwrite) over Edit for `.py` files in this project.
+
+#### Session 5c (same day) — Push, deploy, recovery, agent restart
+- Push from sandbox blocked (no GitHub creds); Linh pushed `36bfbb3` from PowerShell.
+- VPS deploy went WRONG on first attempt: my deploy block in `diagnosis-session-5.md` used incorrect paths (nested `hermes_trading/hermes_trading/state/...`, `venv` instead of `.venv`, `logs/hermes.log` instead of top-level `bot.log`). Linh ran it, `pkill` killed the agent, all `cp` commands failed, `source venv/bin/activate` failed, `nohup` exited 1 → **agent down for ~15 minutes**.
+- Read-only diagnostic block mapped the actual VPS layout (see "VPS layout" section above). Confirmed:
+  - `/opt/trading/hermes_trading/hermes_trading/adapters/execution.py` on the VPS was already byte-identical to my session 5 version (someone had applied the 110043 handler locally before; the `M` in earlier `git status` was for that).
+  - All 4 `state/<slug>/strategy.yaml` files in running dir still had the pre-session-5 shapes → critical to copy.
+  - Per-asset `trades.jsonl` files were all 0 lines → confirms signal generation, not execution, was the root cause.
+- Recovery deploy: backup → copy 4 strategy.yamls → restart with correct paths. Agent up as PID 1290662, all 4 workers booted in live mode at correct state dirs.
+- **Backup of pre-deploy strategy.yamls at `/tmp/hermes-backup-<STAMP>/` on VPS.** Will persist until VPS reboot or `/tmp` cleanup. Should be SCP'd to local for permanence if Hermes-evolved values matter.
+- **Awaiting first 15m tick** to confirm `dir=both · conf=NN%` lines appear and no new `110043` tracebacks.
+
+### Lessons added to deploy doctrine (apply going forward)
+1. **`logs/hermes.log` does not exist on this VPS.** Top-level `bot.log` is the log. Update all deploy blocks.
+2. **`venv` does not exist; it's `.venv`.** Update all deploy blocks.
+3. **State dirs are siblings of the package, not nested inside it.** Path is `/opt/trading/hermes_trading/state/<slug>/strategy.yaml`. The "nested package inside package dir" line in earlier memory was misleading — the package IS nested (`/opt/trading/hermes_trading/hermes_trading/`), but state is not.
+4. **Always run a `diff` between SOURCE and RUNNING before any `cp`** — execution.py was already up-to-date on this VPS, so the `cp` would have been a no-op but the discipline matters.
+5. **Always backup state files before overwriting** — `mkdir -p /tmp/hermes-backup-$(date +%Y%m%d_%H%M%S)/` then `cp` the running yamls there first.
+6. **Prefer single-line semicolon-separated bash blocks for SSH paste.** Multi-line PowerShell-style blocks misbehave at `>>` continuation prompts and break in PowerShell when Linh pastes into the wrong window.
 
 ### 2026-05-25 (session 4) — Phase 1 SMC implementation
 - **Phase 1 SMC: structural SL/TP** — `execution.py` now derives SL from `support_1h4h` (long) or `resistance_1h4h` (short) with a `sl_buffer_pct` (0.3%) buffer. TP set at nearest structural resistance/support. Both fall back to fixed `stop_loss_pct` when no structural level is available.
@@ -131,4 +203,74 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **execution.py**: direction now read from entry_detail (resolved per-tick) not hardcoded from strategy, so direction:both correctly places long or short.
 - **Dashboard - Live Positions section**: new table showing open trades with unrealised P&L vs current price, SL/TP levels.
 - **Dashboard - Agent Activity**: replaced "Recent log" (showing crash tracebacks) with filtered event feed showing only trades, reflections, errors. "No entry" spam filtered out.
-- **Dashboard - trade history**: abandoned trades now show "abandoned" label in italic; conf column replaces RSI colu
+- **Dashboard - trade history**: abandoned trades now show "abandoned" label in italic; conf column replaces RSI column (RSI was always "—" since field renamed).
+- **Deploy from Windows**:
+  ```
+  cd C:\Users\nghil\Projects\Hermes\Hermes-Trading
+  git add hermes_trading/loop.py hermes_trading/reflect.py hermes_trading/run.py hermes_trading/adapters/execution.py dashboard.py state/goal.yaml patch_strategies.py memory.md
+  git commit -m "fix: goal.yaml; reconcile stale open trades; direction:both; min_indicators; dashboard live positions"
+  git push origin master
+  ```
+- **Then on VPS**:
+  ```
+  cd /opt/trading/hermes-trading && git pull
+  cp hermes_trading/loop.py /opt/trading/hermes_trading/hermes_trading/loop.py
+  cp hermes_trading/reflect.py /opt/trading/hermes_trading/hermes_trading/reflect.py
+  cp hermes_trading/run.py /opt/trading/hermes_trading/hermes_trading/run.py
+  cp hermes_trading/adapters/execution.py /opt/trading/hermes_trading/hermes_trading/adapters/execution.py
+  cp state/goal.yaml /opt/trading/hermes_trading/hermes_trading/state/goal.yaml
+  cp patch_strategies.py /opt/trading/hermes_trading/hermes_trading/patch_strategies.py
+  cd /opt/trading/hermes_trading/hermes_trading
+  python3 patch_strategies.py
+  pkill -f hermes_trading.run
+  cd /opt/trading/hermes_trading && source venv/bin/activate
+  nohup python3 -m hermes_trading.run >> logs/hermes.log 2>&1 &
+  ```
+
+### 2026-05-24 (session 2)
+- Identified critical bug: loop.py called subprocess.run(["python", ...]) — `python` not in PATH on VPS, so all reflections silently failed. Fixed to sys.executable.
+- Tightened run_hermes() LLM prompt: replaced inline variable list with newline-delimited list, added explicit "DO NOT use dot notation" rule, added concrete one-shot JSON example showing indicators[name].params.X format.
+- Created setup_github_ssh.sh: generates ~/.ssh/id_ed25519_hermes, configures ~/.ssh/config, converts remote from HTTPS to SSH, prints public key for GitHub. Run once on VPS, then add key to GitHub to enable snapshot.sh push.
+- Updated memory.md and key decisions table.
+- git push blocked by stale index.lock in sandbox (Windows mount) — deploy instructions below.
+- **Deploy from Windows PowerShell**:
+  ```
+  cd C:\Users\nghil\Projects\Hermes\Hermes-Trading
+  git add hermes_trading/loop.py hermes_trading/reflect.py setup_github_ssh.sh memory.md
+  git commit -m "fix: sys.executable in reflection subprocess; tighten LLM bracket notation; SSH setup"
+  git push origin master
+  ```
+- **Then on VPS**:
+  ```
+  cd /opt/trading/hermes-trading && git pull
+  cp hermes_trading/loop.py /opt/trading/hermes_trading/hermes_trading/loop.py
+  cp hermes_trading/reflect.py /opt/trading/hermes_trading/hermes_trading/reflect.py
+  cp setup_github_ssh.sh /opt/trading/hermes_trading/setup_github_ssh.sh
+  # Restart agent:
+  pkill -f hermes_trading.run
+  cd /opt/trading/hermes_trading
+  source venv/bin/activate
+  nohup python3 -m hermes_trading.run >> logs/hermes.log 2>&1 &
+  # Then set up GitHub SSH:
+  bash /opt/trading/hermes_trading/setup_github_ssh.sh
+  # Copy the printed key → GitHub Settings → SSH keys → New key (title: hermes-vps)
+  # Verify: ssh -T git@github.com
+  # Test snapshot: bash /opt/trading/hermes_trading/snapshot.sh
+  ```
+
+### 2026-05-24
+- Read full codebase: run.py, loop.py, reflect.py, dashboard.py, adapters
+- Found 3 reflect.py bugs: missing --state-dir, module-level globals, broken indicator key parsing
+- Fixed reflect.py: added --state-dir arg, refactored all paths to use state_dir, fixed _set_nested/_get_nested for indicators[name].field notation, added win_rate to hypothesis, memory.md update on every reflection
+- Found dashboard bugs: homebrew YAML parser, wrong goal key names, no win rate, no indicator weights panel
+- Fixed dashboard.py: proper yaml.safe_load, correct nested goal parsing, win rate + indicator weights panel per asset, last-known-state fallback on SSH error, expanded log tail to 25 lines
+- Created memory.md (this file) and state/memory.md template
+- Pushed to GitHub, user pulled on VPS and restarted agent with venv activated
+- All 4 workers confirmed live: BTC/USDT, ETH/USDT, SOL/USDT, TAO/USDT in live mode
+- Enriched trade records: added indicators_snapshot (22 keys), indicators_fired, confidence_at_entry to loop.py and execution.py
+- Built snapshot.sh: nightly git worktree commit of evolved strategies to state-snapshots branch
+- Wired up Ollama local LLM: _call_llm() in reflect.py uses urllib.request to POST to localhost:11434
+- Installed Ollama on VPS, pulled qwen2.5:3b (1.9GB), added HERMES_LLM_* env vars
+- Verified first AI reflection: v02 -> v03, changed indicators.params.min_ratio 1.5 -> 3.0
+- Initialised fallback reflection for eth/sol/tao: all at v03
+- Fixed state/goal.yaml YAML parse error (missing # on line 1)

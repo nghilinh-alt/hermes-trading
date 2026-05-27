@@ -202,6 +202,29 @@ def _risk_based_qty(
     return exchange.amount_to_precision(symbol, qty_usd / entry_price)
 
 
+# ── Minimum-profit guard ─────────────────────────────────────────────────────
+
+
+def _guard_min_profit_usd(qty, entry_price: float, tp_price: float, strategy: dict) -> None:
+    """
+    Raise ValueError if the expected profit at TP is below min_profit_usd.
+
+    Complements the percentage-based min_tp_pct and ratio-based min_rr_ratio guards
+    by enforcing an absolute dollar floor. Triggers when notional is too small —
+    typically due to low USDT balance or the MAX_POSITION_USD cap forcing a tiny
+    position even though the structural setup itself is valid.
+
+    Default $5/trade floor per Linh's directive (2026-05-28).
+    """
+    min_profit = float(strategy.get("min_profit_usd", 5.0))
+    expected_profit = float(qty) * abs(float(tp_price) - float(entry_price))
+    if expected_profit < min_profit:
+        raise ValueError(
+            f"Expected TP profit too small: ${expected_profit:.2f} < min ${min_profit:.2f} "
+            f"(qty={qty}, entry={entry_price}, tp={tp_price})"
+        )
+
+
 # ── Position guard ────────────────────────────────────────────────────────────
 
 
@@ -228,6 +251,7 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
 
     - SL/TP: structural swing levels with max_sl_pct / min_tp_pct / min_rr_ratio guards.
     - Position size: risk-based, capped at MAX_POSITION_USD.
+    - $-floor: skipped if expected profit at TP < min_profit_usd (default $5).
     - Leverage: fixed default_leverage. Idempotent against Bybit retCode 110043.
     - entry_detail: dict from loop._evaluate_entry with indicators_fired + confidence + direction.
 
@@ -264,6 +288,9 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
                 raise
 
     qty = _risk_based_qty(exchange, entry_price, sl_price, strategy, symbol)
+
+    # Guard 4 ($-floor): expected TP profit must clear min_profit_usd
+    _guard_min_profit_usd(qty, entry_price, tp_price, strategy)
 
     sl_dist = abs(entry_price - sl_price)
     tp_dist = abs(tp_price - entry_price)
