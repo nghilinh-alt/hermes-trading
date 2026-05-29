@@ -137,23 +137,27 @@ def _row_to_trade(row: dict) -> dict | None:
 
 def _trade_key(asset: str, entry, exit_, qty) -> tuple | None:
     """
-    Time-independent dedup fingerprint: (asset, entry@2dp, exit@2dp, qty@4dp).
+    Time-independent dedup fingerprint: (asset, exit@2dp, qty@4dp).
 
-    Local trades record OPEN time; Bybit CSV records CLOSE time — they're typically
-    several hours apart for the same trade. We deduplicate on entry+exit+qty instead,
-    which is highly unique in practice. Open trades (no exit yet) are matched on
-    (asset, entry, None, qty) and will only collide with another open at exact same
-    entry and qty — vanishingly unlikely.
+    entry is NOT in the key because:
+      - Local records entry_price from order.get("average") at submit time
+        (initial fill price)
+      - Bybit CSV "Entry Price" is the position-averaged entry across all
+        contributing fills (can differ by cents to dollars after DCA / re-entry)
+    Exit price and qty are identical across both sources, so they fingerprint
+    the same trade reliably.
+
+    Open trades (exit is None) get a synthetic key that won't collide with
+    CSV records (which always have a real exit).
     """
     try:
-        e = round(float(entry), 2) if entry is not None else None
         x = round(float(exit_), 2) if exit_ is not None else None
         q = round(float(qty), 4)   if qty   is not None else None
     except (TypeError, ValueError):
         return None
-    if asset and e is not None and q is not None:
-        return (asset, e, x, q)
-    return None
+    if not asset or q is None:
+        return None
+    return (asset, x, q)
 
 
 def _existing_keys(trades_path: Path) -> set[tuple]:
