@@ -336,7 +336,11 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
 def fetch_last_closed_pnl(asset: str) -> dict | None:
     """
     Fetch the most recently closed position P&L from Bybit's closed-pnl endpoint.
-    Returns {exit_price, pnl_pct, closed_pnl_usdt} or None if unavailable.
+    Returns {exit_price, pnl_pct, closed_pnl_usdt, direction, qty} or None.
+
+    pnl_pct is computed from closedPnl / cumEntryValue, which is direction-correct
+    for both long and short (positive for wins, negative for losses regardless of side).
+    The naive (exit-entry)/entry formula was wrong for shorts — fixed Phase 2.5.
     """
     exchange = _get_exchange()
     symbol_clean = _to_perp_symbol(asset).replace("/", "").replace(":USDT", "")
@@ -353,11 +357,28 @@ def fetch_last_closed_pnl(asset: str) -> dict | None:
         exit_price  = float(item.get("avgExitPrice", 0) or 0)
         entry_price = float(item.get("avgEntryPrice", 0) or 0)
         closed_pnl  = float(item.get("closedPnl", 0) or 0)
-        pnl_pct = round((exit_price - entry_price) / entry_price, 6) if entry_price else 0.0
+        cum_entry   = float(item.get("cumEntryValue", 0) or 0)
+        qty         = float(item.get("qty", 0) or 0)
+        side        = (item.get("side") or "").lower()
+        direction   = "long" if side == "buy" else ("short" if side == "sell" else None)
+
+        # Direction-correct pnl_pct: closedPnl is signed (negative for losses),
+        # cumEntryValue is always positive (entry notional in USDT).
+        if cum_entry > 0:
+            pnl_pct = round(closed_pnl / cum_entry, 6)
+        elif entry_price > 0 and direction:
+            # Fallback if cumEntryValue absent: compute from prices, direction-aware
+            move = (exit_price - entry_price) / entry_price
+            pnl_pct = round(move if direction == "long" else -move, 6)
+        else:
+            pnl_pct = 0.0
+
         return {
             "exit_price":       round(exit_price, 4),
             "pnl_pct":          pnl_pct,
             "closed_pnl_usdt":  round(closed_pnl, 4),
+            "direction":        direction,
+            "qty":              qty,
         }
     except Exception:
         return None

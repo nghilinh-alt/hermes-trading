@@ -388,6 +388,11 @@ def _call_llm(prompt: str) -> str:
         "No markdown, no explanation, no code blocks — raw JSON only."
     )
 
+    # num_ctx bumps Ollama's context window from the default 4096 to 8192 tokens.
+    # qwen2.5:3b natively supports 32K, but Ollama caps at 4K unless told otherwise.
+    # Combined with the compact-trades prompt shrink, 8K leaves comfortable headroom.
+    # RAM cost: ~1GB extra for KV cache (VPS has 6GB+ free).
+    num_ctx = int(os.getenv("HERMES_LLM_NUM_CTX", "8192"))
     payload = json.dumps({
         "model":  model,
         "stream": False,
@@ -395,6 +400,7 @@ def _call_llm(prompt: str) -> str:
             {"role": "system",  "content": system},
             {"role": "user",    "content": prompt},
         ],
+        "options": {"num_ctx": num_ctx},
     }).encode()
 
     req = urllib.request.Request(
@@ -460,11 +466,27 @@ def run_hermes(state_dir: Path) -> None:
                 result[k] = round(sum(vals) / len(vals), 4)
         return result
 
+    # Compact per-trade summary so the prompt fits Ollama's 4K context window.
+    # Full audit data (indicators_snapshot, confidence_breakdown, entry_gates) stays
+    # in trades.jsonl; we only send what the LLM needs for hypothesis generation.
+    def _compact(t: dict) -> dict:
+        return {
+            "ts":       t.get("ts"),
+            "dir":      t.get("direction"),
+            "pnl_pct":  t.get("pnl_pct"),
+            "conf":     t.get("confidence_at_entry"),
+            "fired":    [k for k, v in (t.get("indicators_fired") or {}).items() if v],
+            "close":    t.get("close_reason"),
+            "rr":       t.get("rr_ratio"),
+        }
+
+    compact_trades = [_compact(t) for t in trades]
+
     prompt_data = {
         "asset":            asset_slug,
         "goal":             goal,
         "current_strategy": strategy,
-        "recent_trades":    trades,
+        "recent_trades":    compact_trades,
         "performance_summary": {
             "total_trades":    len(trades),
             "closed_trades":   len(closed),
@@ -476,7 +498,7 @@ def run_hermes(state_dir: Path) -> None:
             "avg_indicators_on_wins":   _avg_indicators(winning),
             "avg_indicators_on_losses": _avg_indicators(losing),
         },
-        "memory":           memory_context[-3000:] if memory_context else "",
+        "memory":           memory_context[-1500:] if memory_context else "",
         "instruction": (
             "Review the recent trades, current strategy, performance summary, "
             "and memory of past decisions. "

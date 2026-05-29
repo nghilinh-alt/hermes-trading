@@ -313,6 +313,26 @@ def _render_html(d: dict) -> str:
 
     all_trades_flat = [t for s in ASSETS for t in assets.get(s, {}).get("trades", [])]
 
+    def _pnl_usd(t: dict):
+        """
+        Resolve a trade's $ P&L. Prefer the authoritative closed_pnl_usdt
+        from Bybit (when present); else compute from pnl_pct * entry * qty.
+        Returns float or None if neither is computable.
+        """
+        cp = t.get("closed_pnl_usdt")
+        if cp is not None:
+            try: return float(cp)
+            except (TypeError, ValueError): pass
+        pnl_pct = t.get("pnl_pct")
+        entry   = t.get("entry_price")
+        qty     = t.get("qty")
+        if pnl_pct is None or entry is None or qty is None:
+            return None
+        try:
+            return float(pnl_pct) * float(entry) * float(qty)
+        except (TypeError, ValueError):
+            return None
+
     def _period_pnl(since_iso: str) -> float:
         return sum(
             float(t["pnl_pct"])
@@ -320,29 +340,52 @@ def _render_html(d: dict) -> str:
             if t.get("pnl_pct") is not None and t.get("ts", "") >= since_iso
         ) * 100
 
+    def _period_pnl_usd(since_iso: str) -> float:
+        return sum(
+            (v for t in all_trades_flat
+             if t.get("ts", "") >= since_iso and (v := _pnl_usd(t)) is not None),
+            0.0,
+        )
+
     agg = {
         "day":   _period_pnl(_cutoff(1)),
         "week":  _period_pnl(_cutoff(7)),
         "month": _period_pnl(_cutoff(30)),
         "all":   _period_pnl(""),
     }
+    agg_usd = {
+        "day":   _period_pnl_usd(_cutoff(1)),
+        "week":  _period_pnl_usd(_cutoff(7)),
+        "month": _period_pnl_usd(_cutoff(30)),
+        "all":   _period_pnl_usd(""),
+    }
+
+    def _usd_chip(v: float) -> str:
+        col = "#1D9E75" if v >= 0 else "#E24B4A"
+        sign = "+" if v >= 0 else "-"
+        return f"<span style='color:{col};font-size:13px;font-weight:500'>{sign}${abs(v):,.2f}</span>"
+
     pnl_summary = f"""
 <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1.5rem">
   <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
     <div style="font-size:11px;color:var(--muted);margin-bottom:4px">today P&L</div>
     <div style="font-size:20px;font-weight:500">{_pnl_chip(agg["day"])}</div>
+    <div style="margin-top:2px">{_usd_chip(agg_usd["day"])}</div>
   </div>
   <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
     <div style="font-size:11px;color:var(--muted);margin-bottom:4px">7-day P&L</div>
     <div style="font-size:20px;font-weight:500">{_pnl_chip(agg["week"])}</div>
+    <div style="margin-top:2px">{_usd_chip(agg_usd["week"])}</div>
   </div>
   <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
     <div style="font-size:11px;color:var(--muted);margin-bottom:4px">30-day P&L</div>
     <div style="font-size:20px;font-weight:500">{_pnl_chip(agg["month"])}</div>
+    <div style="margin-top:2px">{_usd_chip(agg_usd["month"])}</div>
   </div>
   <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
     <div style="font-size:11px;color:var(--muted);margin-bottom:4px">all-time P&L</div>
     <div style="font-size:20px;font-weight:500">{_pnl_chip(agg["all"])}</div>
+    <div style="margin-top:2px">{_usd_chip(agg_usd["all"])}</div>
   </div>
 </div>"""
 
@@ -632,6 +675,18 @@ def _render_html(d: dict) -> str:
         conf = t.get("confidence_at_entry")
         cs   = f"{float(conf)*100:.0f}%" if conf is not None else "—"
         ver  = t.get("strategy_version", "—")
+        # $ P&L cell — matches the % cell's coloring/state
+        pnl_usd_val = _pnl_usd(t)
+        if abandoned:
+            usd_s, usd_c = "—", "var(--muted)"
+        elif pnl_usd_val is not None:
+            usd_s = f"{'+' if pnl_usd_val >= 0 else '-'}${abs(pnl_usd_val):,.2f}"
+            usd_c = _pnl_col(pnl_usd_val)
+        elif pnl_r is None:
+            usd_s, usd_c = "—", "#EF9F27"
+        else:
+            usd_s, usd_c = "—", "var(--muted)"
+
         return (
             f"<tr style='border-top:0.5px solid var(--border)'>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{ts}</td>"
@@ -642,6 +697,7 @@ def _render_html(d: dict) -> str:
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{cs}</td>"
             + _signals_cell(t) +
             f"<td style='padding:5px 8px;font-size:12px;font-weight:500;color:{pc}'>{ps}</td>"
+            f"<td style='padding:5px 8px;font-size:12px;font-weight:500;color:{usd_c}'>{usd_s}</td>"
             f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>v{ver}</td>"
             f"</tr>"
         )
@@ -659,7 +715,8 @@ def _render_html(d: dict) -> str:
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">exit</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">conf</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">signals fired</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">P&L</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">P&L %</th>
+        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">P&L $</th>
         <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">strat</th>
       </tr>
     </thead>
