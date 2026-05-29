@@ -147,22 +147,32 @@ def _realised_return(trades: list[dict]) -> float:
 
 
 def _max_drawdown(trades: list[dict]) -> float:
-    # Open trades have pnl_pct=None; exclude them from the drawdown calc.
+    """
+    Max drawdown as a fraction (0.0..1.0) using compound returns.
+
+    Wealth path: start at 1.0, multiply by (1 + pnl_pct) for each closed trade.
+    Drawdown at each point = (peak_so_far - current) / peak_so_far.
+    Result is bounded in [0, 1] — fixes the prior bug where dividing by a
+    near-zero peak amplified small dips into 80%+ false drawdowns.
+
+    Open trades (pnl_pct=None) are excluded.
+    """
     pnl_pcts = [float(t["pnl_pct"]) for t in trades if t.get("pnl_pct") is not None]
     if not pnl_pcts:
         return 0.0
-    cumulative, running = [], 0.0
+
+    wealth = 1.0
+    peak = 1.0
+    max_dd = 0.0
     for p in pnl_pcts:
-        running += p
-        cumulative.append(running)
-    peak, max_dd = cumulative[0], 0.0
-    for c in cumulative:
-        if c > peak:
-            peak = c
-        dd = (peak - c) / (abs(peak) + 1e-9)
+        # Cap per-trade pnl at -99% to avoid wealth going negative
+        wealth = wealth * (1 + max(p, -0.99))
+        if wealth > peak:
+            peak = wealth
+        dd = (peak - wealth) / peak if peak > 0 else 0.0
         if dd > max_dd:
             max_dd = dd
-    return max_dd
+    return round(max_dd, 6)
 
 
 def _win_rate(trades: list[dict]) -> float:
