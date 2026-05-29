@@ -174,7 +174,20 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - ATR-based trailing stop (Phase 2.2) — wait for more clean trades.
 - Bot continues to win small ($5–15 per trade) on ~50% win rate.
 
-#### Session 6 cont. — Audit trail additions + reflect.py None-safety hotfix#### Session 6 cont. — Audit trail additions + reflect.py None-safety hotfix
+**Doctrine added this session (apply going forward)**:
+1. **PowerShell -> SSH -> bash quote tax is real.** PowerShell strips embedded `"..."` from single-quoted strings unpredictably, especially when the string contains `(`, `)`, `|`, or nested quotes. For any complex bash command via ssh, use one of:
+   - Double-up single quotes: `'sed -i ''s/x/y/'' file'` (the `''` collapses to one `'` in the literal)
+   - PowerShell here-string piped to ssh: `@'...'@ | ssh root@host`
+   - SCP a `.sh` file to /tmp and execute it remotely
+   Never trust quoted output that worked once — it can break on the next invocation depending on the surrounding command.
+2. **Always run a real verify after a `cp` rollback.** The `cp v0001.yaml strategy.yaml` failed silently because v0001.yaml didn't exist, and the diagnostic was assumed to confirm it worked. Verify with `grep` for an EXPECTED value (e.g. `grep position_size_r`) and explicitly confirm the value. Don't just check the file parses.
+3. **`rich` markup eats bracket-pair strings in console.print.** Always escape `[name]` in printed paths by replacing `[` with `\[` if the variable might contain bracket notation. Hypotheses.jsonl is the truth source, not stdout. Fixed today in run_hermes display.
+4. **LLM hypothesis recording must happen BEFORE strategy.yaml is overwritten.** Currently it does (the failed-application path records `error_reason: key_not_found` before falling back). Keep this invariant.
+5. **One-step deploy blocks per logical action.** Today's "Step 2: diff + cp" combined both, only the diff was run, downstream tools failed with `ModuleNotFoundError`. Each `cp`, each `git pull`, each restart should be its own labeled code block.
+6. **Backups before destructive ops.** purge_abandoned writes `.jsonl.bak-<unix>`; recompute_pnl_pct preserves `pnl_pct_old`; rollback should backup current strategy.yaml to `/tmp/` first. Every tool that mutates a state file should leave a trail.
+7. **`_set_nested` clobber guards added.** Rejects dot-notation indicator paths (`indicators.params.X` without `[name]`) and refuses to overwrite an existing list with a dict. Defense against the next time the LLM forgets bracket notation.
+
+#### Session 6 cont. — Audit trail additions + reflect.py None-safety hotfix
 - **Triggered by**: first manual `reflect --hermes` for TAO crashed with `TypeError: float() argument must be a string or a real number, not 'NoneType'` at reflect.py:434. Root cause: `t.get("pnl_pct", 0)` returns `None` when the key exists with value `None` (every open trade), not the `0` default. Same bug pattern in `_realised_return` and `_max_drawdown`. Latent for weeks because the IndentationError masked it.
 - **None-safety fix**: filtered `pnl_pct is not None` in `_realised_return`, `_max_drawdown`, and the `run_hermes` performance_summary aggregation. Also restructured `run_hermes` to compute `closed = [...]` once and reuse for `winning/losing/win_rate/total_pnl`, and added explicit `closed_trades` + `open_trades` counts to the prompt the LLM sees (more informative).
 - **Trade-record audit additions** (essential scope, per Linh): added 4 new fields to every trade record at entry time:
