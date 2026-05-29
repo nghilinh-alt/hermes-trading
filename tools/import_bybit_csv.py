@@ -135,14 +135,32 @@ def _row_to_trade(row: dict) -> dict | None:
     }
 
 
-def _existing_keys(trades_path: Path) -> set[tuple[str, str, float]]:
+def _trade_key(asset: str, entry, exit_, qty) -> tuple | None:
     """
-    Build dedup key set from existing trades.jsonl: (asset, ts_minute, entry_rounded).
-    Why ts_minute: CSV timestamps are minute-precision; native logs are second-precision.
+    Time-independent dedup fingerprint: (asset, entry@2dp, exit@2dp, qty@4dp).
+
+    Local trades record OPEN time; Bybit CSV records CLOSE time — they're typically
+    several hours apart for the same trade. We deduplicate on entry+exit+qty instead,
+    which is highly unique in practice. Open trades (no exit yet) are matched on
+    (asset, entry, None, qty) and will only collide with another open at exact same
+    entry and qty — vanishingly unlikely.
     """
+    try:
+        e = round(float(entry), 2) if entry is not None else None
+        x = round(float(exit_), 2) if exit_ is not None else None
+        q = round(float(qty), 4)   if qty   is not None else None
+    except (TypeError, ValueError):
+        return None
+    if asset and e is not None and q is not None:
+        return (asset, e, x, q)
+    return None
+
+
+def _existing_keys(trades_path: Path) -> set[tuple]:
+    """Build dedup key set from existing trades.jsonl using _trade_key fingerprint."""
     if not trades_path.exists():
         return set()
-    keys: set[tuple[str, str, float]] = set()
+    keys: set[tuple] = set()
     for line in trades_path.read_text().splitlines():
         line = line.strip()
         if not line:
@@ -151,14 +169,9 @@ def _existing_keys(trades_path: Path) -> set[tuple[str, str, float]]:
             t = json.loads(line)
         except json.JSONDecodeError:
             continue
-        ts = (t.get("ts") or "")[:16]    # YYYY-MM-DDTHH:MM
-        entry = t.get("entry_price")
-        try:
-            entry_rounded = round(float(entry), 2) if entry else None
-        except (TypeError, ValueError):
-            entry_rounded = None
-        if t.get("asset") and ts and entry_rounded is not None:
-            keys.add((t["asset"], ts, entry_rounded))
+        k = _trade_key(t.get("asset"), t.get("entry_price"), t.get("exit_price"), t.get("qty"))
+        if k is not None:
+            keys.add(k)
     return keys
 
 
@@ -190,8 +203,8 @@ def import_csv(csv_path: Path, state_root: Path, dry_run: bool) -> dict:
         new_records = []
         skipped_dupe = 0
         for t in trades:
-            key = (t["asset"], t["ts"][:16], round(t["entry_price"], 2))
-            if key in existing:
+            key = _trade_key(t.get("asset"), t.get("entry_price"), t.get("exit_price"), t.get("qty"))
+            if key is None or key in existing:
                 skipped_dupe += 1
                 continue
             new_records.append(t)
