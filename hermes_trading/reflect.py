@@ -212,8 +212,21 @@ def _get_nested(obj: dict, key_path: str):
 def _set_nested(obj: dict, key_path: str, new_value) -> bool:
     """
     Set a value by dot-path, supporting indicators[name].field notation.
-    Returns True on success, False if the target path doesn't exist.
+    Returns True on success, False if the target path doesn't exist or is invalid.
+
+    Safety guards:
+      1. Rejects dot-notation paths that target the indicators list
+         (e.g. "indicators.params.X" without [name]) — these would
+         silently clobber the entire 9-indicator registry by overwriting
+         the list with a dict. Forces the caller to use bracket notation
+         "indicators[name].field" for any indicator-targeted change.
+      2. Refuses to overwrite an existing list with a new dict.
     """
+    # Guard 1: bare "indicators.*" without bracket notation is a registry-clobber
+    # attempt — common LLM mistake. Reject explicitly so the caller can fall back.
+    if key_path.startswith("indicators.") and not key_path.startswith("indicators[" + ""):
+        return False
+
     m = re.match(r'^indicators\[(\w+)\]\.(.+)$', key_path)
     if m:
         ind_name, rest = m.group(1), m.group(2)
@@ -227,6 +240,10 @@ def _set_nested(obj: dict, key_path: str, new_value) -> bool:
     if len(parts) == 1:
         obj[parts[0]] = new_value
         return True
+    # Guard 2: never replace an existing list with a dict
+    existing = obj.get(parts[0])
+    if isinstance(existing, list):
+        return False
     if parts[0] not in obj or not isinstance(obj[parts[0]], dict):
         obj[parts[0]] = {}
     return _set_nested(obj[parts[0]], parts[1], new_value)
@@ -623,7 +640,10 @@ def run_hermes(state_dir: Path) -> None:
     _append_hypothesis(p["hypotheses"], base_hypothesis)
     _update_memory(p["memory"], base_hypothesis, asset_slug)
 
-    console.print(f"[green]Hermes: v{old_version} -> v{new_version}: {changed_var} {old_val} -> {new_val}[/green]")
+    # Escape brackets so rich doesn't strip indicator names like [volume_spike]
+    # from the display (real changed_var stored in hypotheses.jsonl is untouched).
+    display_var = changed_var.replace("[", "\\[")
+    console.print(f"[green]Hermes: v{old_version} -> v{new_version}: {display_var} {old_val} -> {new_val}[/green]")
 
 
 # -- CLI -----------------------------------------------------------------------

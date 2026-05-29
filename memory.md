@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-05-28 (session 6 — Phase 2.4: reflect.py truncate-fix, Bybit backfill tool, $5/trade hard guard)
+2026-05-29 (session 6 wave 4 — pnl_pct/drawdown bugs fixed, CSV import, purge, Hermes succeeds with v02→v03)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -144,7 +144,37 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **Ollama is healthy** — not the bottleneck. Issue was prompt size (18K vs 4K limit) and the model truncating then hanging. Fixed by both shrink + num_ctx bump.
 - **Not yet deployed.** Combined deploy block coming next. Files changed: execution.py, reflect.py, dashboard.py (local only — no VPS deploy needed), tools/recompute_pnl_pct.py (NEW), tools/import_bybit_csv.py (NEW), data/bybit-closed-pnl-2026-05-29.csv (NEW reference copy).
 
-#### Session 6 cont. — Audit trail additions + reflect.py None-safety hotfix
+#### Session 6 wave 4 — Data repair + first successful Hermes reflection (2026-05-29)
+**The big win**: first Hermes-driven (LLM, not fallback) strategy mutation in project history. TAO v02 → v03: `indicators[volume_spike].params.min_ratio 1.5 → 2.0` based on actual decision_context (~30 closed trades, 50% win rate, +5.6% realized).
+
+**Bugs found and fixed (in order encountered)**:
+1. `fetch_last_closed_pnl` direction-blind formula — Linh confirmed via Bybit CSV (45 trades total +$44.41) that all short trade pnl_pct signs were inverted in trades.jsonl. Fixed: now uses `closedPnl / cumEntryValue`. Plus wrote `tools/recompute_pnl_pct.py` to repair existing records (11 sign-flips: BTC 2, ETH 2, TAO 7).
+2. `_max_drawdown` divide-by-near-zero — old formula `(peak - c) / (abs(peak) + 1e-9)` amplified small dips into 80%+ false drawdowns. Fixed to compound wealth-curve `(peak - wealth) / peak`, bounded [0,1]. Sanity-checked: Linh's 24-trade balanced book now reports ~2% drawdown, not 82%.
+3. CSV importer (Bybit truth source) was missing on day 1 — wrote `tools/import_bybit_csv.py`, but dedup logic went through three iterations:
+   - v1: (asset, ts_minute, entry) — failed because local ts = OPEN, CSV ts = CLOSE (6–8h gap)
+   - v2: (asset, entry, exit, qty) — failed because Bybit's avg-entry differs from local fill price by cents
+   - v3: (asset, exit, qty) — works, dedupes the 11 real local closed trades exactly
+4. Local trades.jsonl polluted by abandoned stubs from prior agent restarts (17 of 25 TAO records had `entry==exit AND abandoned: true`). Wrote `tools/purge_abandoned.py` — removed 20 stubs across all assets. Backups at `*.jsonl.bak-<unix>`.
+5. Ollama timed out at 120s on every Hermes call — root cause was first-call cold reload of model with new num_ctx=8192 (added earlier in session). Fixed by bumping `HERMES_LLM_TIMEOUT=300` in .env + pre-warming with one trivial curl. Reflection now completes in 30–60s.
+6. LLM dot-notation clobber risk — first Hermes mutation today's payload looked like it used dot notation (`indicators.params.min_ratio`) because rich library silently stripped `[volume_spike]` from the live display. Actual stored changed_variable was the correct bracket form, and `_set_nested` updated volume_spike correctly. Display-only bug. Pushed two defensive guards anyway: reject any `indicators.*` path without brackets, refuse to overwrite a list with a dict. Also escaped brackets in the rich-print to prevent the display confusion recurring.
+
+**Tools shipped this wave** (all in `tools/`):
+- `recompute_pnl_pct.py` — direction-correct pnl_pct from entry+exit+direction (preserves old as pnl_pct_old)
+- `import_bybit_csv.py` — Bybit CSV → trades.jsonl, infers direction from sign(P&L) vs sign(exit-entry), dedupes by (exit, qty)
+- `purge_abandoned.py` — removes entry==exit OR abandoned=true stubs, writes timestamped backup
+
+**Dashboard ($ figures shipped earlier in wave)**: each Running P&L card now shows % above $; trade history has both "P&L %" and "P&L $" columns. Resolved from `closed_pnl_usdt` if present, else computed from `pnl_pct × entry × qty`.
+
+**Strategy mutation chain on TAO**:
+- v01 (original) → v02 fallback (drawdown bug, position_size_r 0.8 → 0.85, rolled back) → re-mutated v01 → v02 fallback (drawdown fixed, position_size_r 0.8 → 0.85, KEPT) → v03 Hermes (volume_spike.min_ratio 1.5 → 2.0, KEPT)
+
+**Remaining known issues (defer)**:
+- strategy.yaml lacks a top-level `version` field, so archive always uses default "00" → v0000.yaml overwrites itself. Cosmetic; the version IS being read+bumped (just from somewhere else in the file).
+- Dashboard merge with Bybit closed-pnl for full audit (Phase 2.3 originally) — partly addressed by CSV import but not by API merge.
+- ATR-based trailing stop (Phase 2.2) — wait for more clean trades.
+- Bot continues to win small ($5–15 per trade) on ~50% win rate.
+
+#### Session 6 cont. — Audit trail additions + reflect.py None-safety hotfix#### Session 6 cont. — Audit trail additions + reflect.py None-safety hotfix
 - **Triggered by**: first manual `reflect --hermes` for TAO crashed with `TypeError: float() argument must be a string or a real number, not 'NoneType'` at reflect.py:434. Root cause: `t.get("pnl_pct", 0)` returns `None` when the key exists with value `None` (every open trade), not the `0` default. Same bug pattern in `_realised_return` and `_max_drawdown`. Latent for weeks because the IndentationError masked it.
 - **None-safety fix**: filtered `pnl_pct is not None` in `_realised_return`, `_max_drawdown`, and the `run_hermes` performance_summary aggregation. Also restructured `run_hermes` to compute `closed = [...]` once and reuse for `winning/losing/win_rate/total_pnl`, and added explicit `closed_trades` + `open_trades` counts to the prompt the LLM sees (more informative).
 - **Trade-record audit additions** (essential scope, per Linh): added 4 new fields to every trade record at entry time:
