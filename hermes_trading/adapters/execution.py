@@ -258,7 +258,7 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
     Returns a trade record dict matching loop.py schema.
     Raises ValueError if any structural guard fails (caller catches and skips).
     """
-    from hermes_trading.loop import _snapshot_indicators
+    from hermes_trading.loop import _snapshot_indicators, _entry_gates_snapshot
 
     exchange = _get_exchange()
 
@@ -318,9 +318,15 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
         "tp_price":         tp_price,
         "rr_ratio":         rr_ratio,
         "strategy_version": strategy.get("version", "01"),
-        "indicators_snapshot": _snapshot_indicators(price_data),
-        "indicators_fired":    ed.get("indicators_fired", {}),
-        "confidence_at_entry": ed.get("confidence"),
+        "indicators_snapshot":  _snapshot_indicators(price_data),
+        "indicators_fired":     ed.get("indicators_fired", {}),
+        "confidence_at_entry":  ed.get("confidence"),
+        # Audit additions (session 6, 2026-05-28): WHY the trade was opened
+        "confidence_breakdown": ed.get("confidence_breakdown", {}),
+        "evaluation_summary":   ed.get("evaluation_summary", ""),
+        "entry_gates":          _entry_gates_snapshot(strategy),
+        # close_reason is set later by _reconcile_open_trades when the position closes
+        "close_reason":         None,
     }
 
 

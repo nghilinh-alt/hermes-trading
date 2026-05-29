@@ -120,14 +120,35 @@ def _update_memory(memory_path: Path, hypothesis: dict, asset_slug: str) -> None
         f.write(entry)
 
 
+# ── Audit helpers (session 6, 2026-05-28) ────────────────────────────────────
+
+
+def _trade_range(trades: list[dict]) -> dict:
+    """
+    Compact summary of which trades a reflection decision was based on.
+    Stored on every hypothesis record so audits can re-fetch the exact trade
+    window the LLM (or rule engine) was reasoning over.
+    """
+    if not trades:
+        return {"count": 0, "from_ts": None, "to_ts": None, "trade_ids": []}
+    return {
+        "count":     len(trades),
+        "from_ts":   trades[0].get("ts"),
+        "to_ts":     trades[-1].get("ts"),
+        "trade_ids": [t.get("order_id") for t in trades if t.get("order_id")],
+    }
+
+
 # ── Performance metrics ────────────────────────────────────────────────────────
 
 def _realised_return(trades: list[dict]) -> float:
-    return sum(float(t.get("pnl_pct", 0.0)) for t in trades)
+    # Open trades have pnl_pct=None; exclude them from the sum.
+    return sum(float(t["pnl_pct"]) for t in trades if t.get("pnl_pct") is not None)
 
 
 def _max_drawdown(trades: list[dict]) -> float:
-    pnl_pcts = [float(t.get("pnl_pct", 0.0)) for t in trades]
+    # Open trades have pnl_pct=None; exclude them from the drawdown calc.
+    pnl_pcts = [float(t["pnl_pct"]) for t in trades if t.get("pnl_pct") is not None]
     if not pnl_pcts:
         return 0.0
     cumulative, running = [], 0.0
@@ -301,19 +322,36 @@ def run_fallback(state_dir: Path) -> None:
     strategy["version"] = new_version
     _save_yaml(p["strategy"], strategy)
 
+    # Audit additions (session 6, 2026-05-28): record WHY the change was made
+    decision_context = {
+        "total_trades":    len(trades),
+        "closed_trades":   sum(1 for t in trades if t.get("pnl_pct") is not None),
+        "open_trades":     sum(1 for t in trades if t.get("pnl_pct") is None),
+        "realised_return": round(realised, 6),
+        "max_drawdown":    round(drawdown, 6),
+        "win_rate":        round(win_r, 4),
+        "target_return":   target_ret,
+        "max_dd_goal":     max_dd_goal,
+    }
+
     hypothesis = {
-        "ts":               datetime.now(timezone.utc).isoformat(),
-        "mode":             "fallback",
-        "version_from":     old_version,
-        "version_to":       new_version,
-        "changed_variable": changed_var,
-        "old_value":        old_val,
-        "new_value":        new_val,
-        "reasoning":        reasoning,
-        "trades_evaluated": len(trades),
-        "realised_return":  round(realised, 6),
-        "max_drawdown":     round(drawdown, 6),
-        "win_rate":         round(win_r, 4),
+        "ts":                   datetime.now(timezone.utc).isoformat(),
+        "mode":                 "fallback",
+        "version_from":         old_version,
+        "version_to":           new_version,
+        "changed_variable":     changed_var,
+        "old_value":            old_val,
+        "new_value":            new_val,
+        "reasoning":            reasoning,
+        "trades_evaluated":     len(trades),
+        "realised_return":      round(realised, 6),
+        "max_drawdown":         round(drawdown, 6),
+        "win_rate":             round(win_r, 4),
+        # Audit additions
+        "decision_context":     decision_context,
+        "trade_range":          _trade_range(trades),
+        "applied_successfully": True,   # fallback always operates on known keys
+        "llm_raw_output":       None,   # not an LLM mode
     }
     _append_hypothesis(p["hypotheses"], hypothesis)
     _update_memory(p["memory"], hypothesis, asset_slug)
@@ -404,8 +442,9 @@ def run_hermes(state_dir: Path) -> None:
 
     # Build a focused prompt — include win rate + indicator snapshot summaries
     # so the model can reason about which signals are performing well
-    winning = [t for t in trades if t.get("pnl_pct") is not None and float(t["pnl_pct"]) > 0]
-    losing  = [t for t in trades if t.get("pnl_pct") is not None and float(t["pnl_pct"]) <= 0]
+    closed  = [t for t in trades if t.get("pnl_pct") is not None]
+    winning = [t for t in closed if float(t["pnl_pct"]) > 0]
+    losing  = [t for t in closed if float(t["pnl_pct"]) <= 0]
 
     def _avg_indicators(trade_list: list[dict]) -> dict:
         """Average each indicator snapshot value across a list of trades."""
@@ -428,10 +467,12 @@ def run_hermes(state_dir: Path) -> None:
         "recent_trades":    trades,
         "performance_summary": {
             "total_trades":    len(trades),
+            "closed_trades":   len(closed),
+            "open_trades":     len(trades) - len(closed),
             "winning_trades":  len(winning),
             "losing_trades":   len(losing),
-            "win_rate":        round(len(winning) / len(trades), 3) if trades else 0,
-            "total_pnl":       round(sum(float(t.get("pnl_pct", 0)) for t in trades), 6),
+            "win_rate":        round(len(winning) / len(closed), 3) if closed else 0,
+            "total_pnl":       round(sum(float(t["pnl_pct"]) for t in closed), 6),
             "avg_indicators_on_wins":   _avg_indicators(winning),
             "avg_indicators_on_losses": _avg_indicators(losing),
         },
@@ -510,28 +551,45 @@ def run_hermes(state_dir: Path) -> None:
     new_val     = hypothesis_data.get("new_value")
     old_val     = hypothesis_data.get("old_value")
 
-    if not _set_nested(strategy, changed_var, new_val):
-        console.print(f"[yellow]Could not apply '{changed_var}' -- key not found. Falling back.[/yellow]")
+    # Audit additions (session 6, 2026-05-28): capture the LLM's-eye view
+    decision_context = prompt_data.get("performance_summary", {})
+    trade_range_info = _trade_range(trades)
+
+    applied_ok = _set_nested(strategy, changed_var, new_val)
+
+    # Build hypothesis upfront — recorded whether application succeeded or not,
+    # so the LLM's reasoning is preserved even when its proposed key is unknown.
+    base_hypothesis = {
+        "ts":                   datetime.now(timezone.utc).isoformat(),
+        "mode":                 "hermes",
+        "version_from":         old_version,
+        "version_to":           new_version if applied_ok else old_version,
+        "changed_variable":     changed_var,
+        "old_value":            old_val,
+        "new_value":            new_val,
+        "reasoning":            hypothesis_data.get("reasoning", ""),
+        "confidence":           hypothesis_data.get("confidence"),
+        "trades_evaluated":     len(trades),
+        # Audit additions
+        "decision_context":     decision_context,
+        "trade_range":          trade_range_info,
+        "applied_successfully": applied_ok,
+        "llm_raw_output":       output,   # literal string the LLM returned (pre-parse)
+    }
+
+    if not applied_ok:
+        console.print(f"[yellow]Could not apply '{changed_var}' -- key not found. Recording attempt + falling back.[/yellow]")
+        base_hypothesis["error_reason"] = "key_not_found"
+        _append_hypothesis(p["hypotheses"], base_hypothesis)
+        _update_memory(p["memory"], base_hypothesis, asset_slug)
         run_fallback(state_dir)
         return
 
     strategy["version"] = new_version
     _save_yaml(p["strategy"], strategy)
 
-    hypothesis = {
-        "ts":               datetime.now(timezone.utc).isoformat(),
-        "mode":             "hermes",
-        "version_from":     old_version,
-        "version_to":       new_version,
-        "changed_variable": changed_var,
-        "old_value":        old_val,
-        "new_value":        new_val,
-        "reasoning":        hypothesis_data.get("reasoning", ""),
-        "confidence":       hypothesis_data.get("confidence"),
-        "trades_evaluated": len(trades),
-    }
-    _append_hypothesis(p["hypotheses"], hypothesis)
-    _update_memory(p["memory"], hypothesis, asset_slug)
+    _append_hypothesis(p["hypotheses"], base_hypothesis)
+    _update_memory(p["memory"], base_hypothesis, asset_slug)
 
     console.print(f"[green]Hermes: v{old_version} -> v{new_version}: {changed_var} {old_val} -> {new_val}[/green]")
 

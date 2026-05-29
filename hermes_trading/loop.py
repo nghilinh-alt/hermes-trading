@@ -68,6 +68,49 @@ def _snapshot_indicators(price_data: dict) -> dict:
     return {k: price_data.get(k) for k in _INDICATOR_SNAPSHOT_KEYS}
 
 
+def _entry_gates_snapshot(strategy: dict) -> dict:
+    """
+    Snapshot of all entry-time gates from strategy.yaml at the moment of decision.
+    Embedded in trade records so audits show what limits were in force when
+    the bot decided to take the trade.
+    """
+    entry = strategy.get("entry", {}) or {}
+    return {
+        "min_confidence":   float(entry.get("min_confidence", 0.0)),
+        "min_indicators":   int(entry.get("min_indicators", 1)),
+        "direction_config": entry.get("direction", "long"),
+        "max_sl_pct":       float(strategy.get("max_sl_pct", 5.0)),
+        "min_tp_pct":       float(strategy.get("min_tp_pct", 3.0)),
+        "min_rr_ratio":     float(strategy.get("min_rr_ratio", 2.0)),
+        "min_profit_usd":   float(strategy.get("min_profit_usd", 5.0)),
+        "risk_per_trade":   float(strategy.get("risk_per_trade", 0.10)),
+        "default_leverage": int(strategy.get("default_leverage", 5) or 5),
+        "sl_buffer_pct":    float(strategy.get("sl_buffer_pct", 0.3)),
+        "strategy_version": str(strategy.get("version", "01")),
+    }
+
+
+def _infer_close_reason(exit_price, tp_price, sl_price, tolerance_pct: float = 0.5) -> str:
+    """
+    Best-effort attribution of why a trade closed.
+
+    Compares the realised exit price against the originally-set TP and SL levels.
+    Tolerance is a percentage of the level (default 0.5%) to account for slippage.
+    Returns: 'TP_hit' | 'SL_hit' | 'manual_or_other' | 'unknown'.
+    """
+    if exit_price is None:
+        return "unknown"
+    tol = tolerance_pct / 100
+    try:
+        if tp_price is not None and abs(float(exit_price) - float(tp_price)) / float(tp_price) <= tol:
+            return "TP_hit"
+        if sl_price is not None and abs(float(exit_price) - float(sl_price)) / float(sl_price) <= tol:
+            return "SL_hit"
+    except (TypeError, ValueError, ZeroDivisionError):
+        return "unknown"
+    return "manual_or_other"
+
+
 async def _fetch_with_retry(adapter, asset: str, name: str) -> dict | None:
     """Fetch from an adapter with exponential backoff. Returns None on total failure."""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
@@ -111,102 +154,117 @@ def _log_trade(state_dir: Path, trade: dict) -> None:
         f.write(json.dumps(trade) + "\n")
 
 
-def _check_indicator(name: str, params: dict, direction: str, price_data: dict) -> bool | None:
+def _check_indicator(name: str, params: dict, direction: str, price_data: dict) -> dict:
     """
     Evaluate a single named indicator against price_data.
-    Returns True (signal fires), False (signal does not fire), or None (data unavailable).
+
+    Returns a dict for audit-quality logging:
+      result      (bool | None) — True (signal fires), False (no fire), None (no data)
+      value       (any)         — what was observed (e.g. RSI=33, price=70200)
+      threshold   (any)         — what was compared against
+      comparator  (str)         — short text of the test (e.g. "rsi<30")
+
+    Callers wanting only the bool can read result.
     """
     price = price_data.get("price", 0)
 
+    def _d(result, value, threshold, comparator):
+        return {"result": result, "value": value, "threshold": threshold, "comparator": comparator}
+
     if name == "rsi":
         rsi = price_data.get("rsi_14")
-        if rsi is None:
-            return None
         threshold = float(params.get("threshold", 30))
+        if rsi is None:
+            return _d(None, None, threshold, f"rsi<{threshold}" if direction == "long" else f"rsi>{threshold}")
         if direction == "long":
-            return rsi < threshold
-        return rsi > threshold
+            return _d(rsi < threshold, rsi, threshold, f"rsi<{threshold}")
+        return _d(rsi > threshold, rsi, threshold, f"rsi>{threshold}")
 
     if name == "ema_trend":
         period = int(params.get("period", 50))
         ema = price_data.get(f"ema_{period}")
         if ema is None:
-            return None
+            return _d(None, None, period, f"price vs ema_{period}")
         if direction == "long":
-            return price > ema
-        return price < ema
+            return _d(price > ema, price, ema, f"price>ema_{period}")
+        return _d(price < ema, price, ema, f"price<ema_{period}")
 
     if name == "macd":
         macd_line   = price_data.get("macd_line")
         macd_signal = price_data.get("macd_signal")
         if macd_line is None or macd_signal is None:
-            return None
+            return _d(None, None, None, "macd_line vs macd_signal")
         if direction == "long":
-            return macd_line > macd_signal   # bullish crossover territory
-        return macd_line < macd_signal
+            return _d(macd_line > macd_signal, macd_line, macd_signal, "macd_line>macd_signal")
+        return _d(macd_line < macd_signal, macd_line, macd_signal, "macd_line<macd_signal")
 
     if name == "vwap":
         vwap = price_data.get("vwap")
         if vwap is None:
-            return None
+            return _d(None, None, None, "price vs vwap")
         if direction == "long":
-            return price < vwap   # price below VWAP — mean-reversion long
-        return price > vwap
+            return _d(price < vwap, price, vwap, "price<vwap (mean-revert long)")
+        return _d(price > vwap, price, vwap, "price>vwap (mean-revert short)")
 
     if name == "volume_spike":
-        ratio     = price_data.get("volume_ratio")
-        if ratio is None:
-            return None
+        ratio = price_data.get("volume_ratio")
         min_ratio = float(params.get("min_ratio", 1.5))
-        return ratio >= min_ratio
+        if ratio is None:
+            return _d(None, None, min_ratio, f"volume_ratio>={min_ratio}")
+        return _d(ratio >= min_ratio, ratio, min_ratio, f"volume_ratio>={min_ratio}")
 
     if name == "bb_squeeze":
         bb_lower = price_data.get("bb_lower")
         bb_upper = price_data.get("bb_upper")
         if bb_lower is None or bb_upper is None:
-            return None
+            return _d(None, None, None, "price vs bb_lower/upper")
         if direction == "long":
-            return price <= bb_lower
-        return price >= bb_upper
+            return _d(price <= bb_lower, price, bb_lower, "price<=bb_lower")
+        return _d(price >= bb_upper, price, bb_upper, "price>=bb_upper")
 
     if name == "fvg":
-        # Price retracing into a Fair Value Gap (1h candles)
         if direction == "long":
-            low  = price_data.get("fvg_bull_low")
-            high = price_data.get("fvg_bull_high")
+            low, high = price_data.get("fvg_bull_low"), price_data.get("fvg_bull_high")
+            zone = "fvg_bull"
         else:
-            low  = price_data.get("fvg_bear_low")
-            high = price_data.get("fvg_bear_high")
+            low, high = price_data.get("fvg_bear_low"), price_data.get("fvg_bear_high")
+            zone = "fvg_bear"
         if low is None or high is None:
-            return None
-        return low <= price <= high
+            return _d(None, None, None, f"price within {zone}")
+        return _d(low <= price <= high, price, [low, high], f"price within {zone}[{low},{high}]")
 
     if name == "order_block":
-        # Price touching a bullish/bearish Order Block zone (1h candles)
         tolerance = float(params.get("tolerance_pct", 0.5)) / 100
         if direction == "long":
-            low  = price_data.get("ob_bull_low")
-            high = price_data.get("ob_bull_high")
+            low, high = price_data.get("ob_bull_low"), price_data.get("ob_bull_high")
+            zone = "ob_bull"
         else:
-            low  = price_data.get("ob_bear_low")
-            high = price_data.get("ob_bear_high")
+            low, high = price_data.get("ob_bear_low"), price_data.get("ob_bear_high")
+            zone = "ob_bear"
         if low is None or high is None:
-            return None
-        # Allow a small tolerance above/below the zone
-        return low * (1 - tolerance) <= price <= high * (1 + tolerance)
+            return _d(None, None, None, f"price within {zone}")
+        return _d(
+            low * (1 - tolerance) <= price <= high * (1 + tolerance),
+            price, [low, high],
+            f"price within {zone}[{low},{high}] (+/-{tolerance*100:.1f}%)",
+        )
 
     if name == "sr_zone":
-        # Price near a support (long) or resistance (short) level from 1h/4h swing points
         tolerance = float(params.get("tolerance_pct", 1.0)) / 100
         if direction == "long":
             level = price_data.get("support_1h4h")
+            level_name = "support_1h4h"
         else:
             level = price_data.get("resistance_1h4h")
+            level_name = "resistance_1h4h"
         if level is None:
-            return None
-        return abs(price - level) / level <= tolerance
+            return _d(None, None, None, f"price near {level_name}")
+        return _d(
+            abs(price - level) / level <= tolerance, price, level,
+            f"|price-{level_name}|/{level_name}<={tolerance*100:.1f}%",
+        )
 
-    return None  # unknown indicator — treat as unavailable
+    return _d(None, None, None, f"unknown indicator: {name}")
 
 
 def _evaluate_entry(
@@ -243,13 +301,16 @@ def _evaluate_entry(
     min_conf   = float(entry.get("min_confidence", 0.0))
     min_ind    = int(entry.get("min_indicators", 1))
     indicators_fired: dict[str, bool | None] = {}
+    confidence_breakdown: dict[str, dict] = {}
 
-    def _result(fires: bool, confidence: float = 0.0) -> dict:
+    def _result(fires: bool, confidence: float = 0.0, summary: str = "") -> dict:
         return {
-            "fires":            fires,
-            "confidence":       round(confidence, 4),
-            "indicators_fired": indicators_fired,
-            "direction":        direction,
+            "fires":                fires,
+            "confidence":           round(confidence, 4),
+            "indicators_fired":     indicators_fired,
+            "direction":            direction,
+            "confidence_breakdown": confidence_breakdown,
+            "evaluation_summary":   summary,
         }
 
     # Fallback: if no indicator registry defined, use simple RSI check
@@ -258,11 +319,20 @@ def _evaluate_entry(
         threshold = float(entry.get("threshold", 30))
         fired     = rsi < threshold if direction == "long" else rsi > threshold
         indicators_fired["rsi"] = fired
-        return _result(fired, 1.0 if fired else 0.0)
+        confidence_breakdown["rsi"] = {
+            "fired":              fired,
+            "required":           True,
+            "weight":             1.0,
+            "weight_contributed": 1.0 if fired else 0.0,
+            "value":              rsi,
+            "threshold":          threshold,
+            "comparator":         f"rsi<{threshold}" if direction == "long" else f"rsi>{threshold}",
+        }
+        summary = f"{direction.upper()} fallback: RSI={rsi:.2f} vs threshold {threshold} -> {'FIRE' if fired else 'NO-FIRE'}"
+        return _result(fired, 1.0 if fired else 0.0, summary)
 
     optional_total  = sum(float(i.get("weight", 1.0)) for i in indicators if not i.get("required", False))
     optional_passed = 0.0
-    fired_count     = 0   # count of indicators that returned True
     fires           = True
 
     for ind in indicators:
@@ -271,26 +341,36 @@ def _evaluate_entry(
         required = ind.get("required", False)
         weight   = float(ind.get("weight", 1.0))
 
-        result = _check_indicator(name, params, direction, price_data)
+        detail = _check_indicator(name, params, direction, price_data)
+        result = detail["result"]
         indicators_fired[name] = result   # True / False / None (no data)
 
-        if result is None:
-            continue   # data unavailable — skip gracefully
+        weight_contributed = 0.0
+        if result is True and not required:
+            optional_passed += weight
+            weight_contributed = weight
 
-        if required and not result:
+        confidence_breakdown[name] = {
+            "fired":              result,
+            "required":           required,
+            "weight":             weight,
+            "weight_contributed": weight_contributed,
+            "value":              detail.get("value"),
+            "threshold":          detail.get("threshold"),
+            "comparator":         detail.get("comparator", ""),
+        }
+
+        if required and result is False:
             fires = False   # hard gate failed — keep evaluating to log all indicators
-
-        if result:
-            fired_count += weight if not required else 0
-            if not required:
-                optional_passed += weight
 
     # Weighted confidence from optional indicators
     confidence = optional_passed / optional_total if optional_total > 0 else 1.0
 
     # Gate 1: minimum confidence threshold
+    skip_reasons = []
     if fires and optional_total > 0 and min_conf > 0 and confidence < min_conf:
         fires = False
+        skip_reasons.append(f"confidence {confidence:.2%} < min {min_conf:.2%}")
 
     # Gate 2: minimum indicator count (count of optional indicators that fired)
     fired_optional_count = sum(
@@ -299,8 +379,22 @@ def _evaluate_entry(
     )
     if fires and fired_optional_count < min_ind:
         fires = False
+        skip_reasons.append(f"fired {fired_optional_count} < min_indicators {min_ind}")
 
-    return _result(fires, confidence)
+    # Build a human-readable evaluation summary
+    fired_names   = [n for n, r in indicators_fired.items() if r is True]
+    nofire_names  = [n for n, r in indicators_fired.items() if r is False]
+    nodata_names  = [n for n, r in indicators_fired.items() if r is None]
+    parts = [direction.upper()]
+    if fired_names:   parts.append(f"fired={fired_names}")
+    if nofire_names:  parts.append(f"no-fire={nofire_names}")
+    if nodata_names:  parts.append(f"no-data={nodata_names}")
+    parts.append(f"conf={confidence:.2%}")
+    if skip_reasons:  parts.append("SKIP: " + "; ".join(skip_reasons))
+    else:             parts.append("FIRE" if fires else "NO-FIRE")
+    summary = " | ".join(parts)
+
+    return _result(fires, confidence, summary)
 
 
 def _execute_trade(strategy: dict, price_data: dict, entry_detail: dict) -> dict | None:
@@ -370,9 +464,15 @@ def _simulate_paper_trade(strategy: dict, price_data: dict, entry_detail: dict) 
         "rr_ratio":         rr_ratio,
         "strategy_version": strategy.get("version", "01"),
         # Full indicator snapshot at entry — used by reflect.py for richer learning
-        "indicators_snapshot": _snapshot_indicators(price_data),
-        "indicators_fired":    entry_detail.get("indicators_fired", {}),
-        "confidence_at_entry": entry_detail.get("confidence"),
+        "indicators_snapshot":  _snapshot_indicators(price_data),
+        "indicators_fired":     entry_detail.get("indicators_fired", {}),
+        "confidence_at_entry":  entry_detail.get("confidence"),
+        # Audit additions (session 6, 2026-05-28): WHY the trade was opened
+        "confidence_breakdown": entry_detail.get("confidence_breakdown", {}),
+        "evaluation_summary":   entry_detail.get("evaluation_summary", ""),
+        "entry_gates":          _entry_gates_snapshot(strategy),
+        # Paper trades resolve immediately — close reason inferred from sim outcome
+        "close_reason":         _infer_close_reason(round(exit_price, 4), tp_price, sl_price),
     }
 
 
@@ -415,9 +515,10 @@ def _reconcile_open_trades(asset: str, state_dir: Path) -> None:
         # Always abandon all open trades EXCEPT the most recent one
         stale_indices = open_indices[:-1]
         for idx in stale_indices:
-            trades[idx]["pnl_pct"]    = 0.0
-            trades[idx]["exit_price"] = trades[idx].get("entry_price")
-            trades[idx]["abandoned"]  = True
+            trades[idx]["pnl_pct"]      = 0.0
+            trades[idx]["exit_price"]   = trades[idx].get("entry_price")
+            trades[idx]["abandoned"]    = True
+            trades[idx]["close_reason"] = "abandoned_stale"
 
         if has_position:
             # Live position matches the most recent open trade — leave it open
@@ -430,15 +531,21 @@ def _reconcile_open_trades(asset: str, state_dir: Path) -> None:
                 trades[most_recent_idx]["exit_price"]      = closed["exit_price"]
                 trades[most_recent_idx]["pnl_pct"]         = closed["pnl_pct"]
                 trades[most_recent_idx]["closed_pnl_usdt"] = closed.get("closed_pnl_usdt")
+                trades[most_recent_idx]["close_reason"]    = _infer_close_reason(
+                    closed.get("exit_price"),
+                    trades[most_recent_idx].get("tp_price"),
+                    trades[most_recent_idx].get("sl_price"),
+                )
                 console.print(
                     f"[cyan][{asset}] Reconciled: exit={closed['exit_price']} "
-                    f"pnl={closed['pnl_pct']:+.4%}[/cyan]"
+                    f"pnl={closed['pnl_pct']:+.4%} reason={trades[most_recent_idx]['close_reason']}[/cyan]"
                 )
             else:
                 # No closed PnL available — mark as abandoned with zero PnL
-                trades[most_recent_idx]["pnl_pct"]    = 0.0
-                trades[most_recent_idx]["exit_price"] = trades[most_recent_idx].get("entry_price")
-                trades[most_recent_idx]["abandoned"]  = True
+                trades[most_recent_idx]["pnl_pct"]      = 0.0
+                trades[most_recent_idx]["exit_price"]   = trades[most_recent_idx].get("entry_price")
+                trades[most_recent_idx]["abandoned"]    = True
+                trades[most_recent_idx]["close_reason"] = "abandoned_no_pnl"
 
         if stale_indices:
             console.print(f"[cyan][{asset}] Abandoned {len(stale_indices)} stale open record(s)[/cyan]")
