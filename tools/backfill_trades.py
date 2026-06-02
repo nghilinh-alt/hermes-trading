@@ -1,4 +1,4 @@
-"""
+﻿"""
 backfill_trades.py — One-shot Bybit closed-trade backfill.
 
 Why this exists (Phase 2.4, 2026-05-28):
@@ -12,7 +12,7 @@ Why this exists (Phase 2.4, 2026-05-28):
 What it does:
   For each asset, calls Bybit's private_get_v5_position_closed_pnl, loads
   the existing trades.jsonl, and appends any closed-trade entries not
-  already present (dedup by order_id). Synthetic records are flagged
+  already present (dedup by order_id and exit/qty fingerprint). Synthetic records are flagged
   "backfilled": true and use strategy_version "backfilled" so reflection
   can recognize them.
 
@@ -21,7 +21,7 @@ What it does:
   This sidesteps the still-broken (exit-entry)/entry formula in
   execution.fetch_last_closed_pnl — Phase 2.5 will fix that separately.
 
-Idempotent: running twice is a no-op (dedup by order_id).
+Idempotent: running twice is a no-op (dedup by order_id + exit/qty fingerprint).
 
 Usage (on VPS):
   cd /opt/trading/hermes_trading
@@ -99,11 +99,26 @@ def _slug_to_bybit_symbol(slug: str) -> str:
 # ── trades.jsonl I/O ──────────────────────────────────────────────────────────
 
 
-def _load_existing_order_ids(trades_path: Path) -> set[str]:
-    """Return set of order_ids already present in trades.jsonl."""
+def _exit_qty_fp(exit_price, qty):
+    """Secondary fingerprint (exit@2dp, qty@4dp) — catches native vs backfill dedup."""
+    try:
+        if exit_price is None or qty is None:
+            return None
+        return (round(float(exit_price), 2), round(float(qty), 4))
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_existing_keys(trades_path: Path) -> tuple[set[str], set[tuple]]:
+    """Return (order_id_set, exit_qty_fingerprint_set) from existing trades.jsonl.
+
+    Two-key dedup: order_id catches same-source duplicates; (exit,qty) catches
+    native-vs-backfill pairs where the opening order_id != closing order_id.
+    """
     if not trades_path.exists():
-        return set()
+        return set(), set()
     ids: set[str] = set()
+    fps: set[tuple] = set()
     for line in trades_path.read_text().splitlines():
         line = line.strip()
         if not line:
@@ -115,7 +130,10 @@ def _load_existing_order_ids(trades_path: Path) -> set[str]:
         oid = rec.get("order_id")
         if oid:
             ids.add(str(oid))
-    return ids
+        fp = _exit_qty_fp(rec.get("exit_price"), rec.get("qty"))
+        if fp is not None:
+            fps.add(fp)
+    return ids, fps
 
 
 def _append_trades(trades_path: Path, records: list[dict]) -> None:
@@ -248,7 +266,7 @@ def backfill_asset(
     symbol       = _slug_to_bybit_symbol(slug)
     trades_path  = state_root / slug / "trades.jsonl"
 
-    existing_ids = _load_existing_order_ids(trades_path)
+    existing_ids, existing_fps = _load_existing_keys(trades_path)
 
     try:
         items = _fetch_closed_pnl_paginated(exchange, symbol, since_ms)
@@ -263,11 +281,20 @@ def backfill_asset(
         if rec is None:
             skipped_bad += 1
             continue
+        # Primary dedup: order_id (same-source)
         if rec["order_id"] in existing_ids:
             skipped_dupe += 1
             continue
+        # Secondary dedup: (exit@2dp, qty@4dp) catches native vs backfill pairs
+        # where opening order_id != closing order_id on Bybit
+        fp = _exit_qty_fp(rec.get("exit_price"), rec.get("qty"))
+        if fp is not None and fp in existing_fps:
+            skipped_dupe += 1
+            continue
         new_records.append(rec)
-        existing_ids.add(rec["order_id"])  # dedup within this run too
+        existing_ids.add(rec["order_id"])
+        if fp is not None:
+            existing_fps.add(fp)
 
     if new_records and not dry_run:
         _append_trades(trades_path, new_records)
