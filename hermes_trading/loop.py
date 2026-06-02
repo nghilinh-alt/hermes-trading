@@ -1,4 +1,4 @@
-"""
+﻿"""
 loop.py — the 24/7 async trading loop.
 
 Every minute:
@@ -573,6 +573,66 @@ def _maybe_trigger_reflection(goal: dict, trade_count: int, state_dir: Path) -> 
             console.print(f"[red]Reflection failed: {e}[/red]")
 
 
+def _maybe_update_trailing_stops(asset: str, price_data: dict, strategy: dict) -> None:
+    """Check open positions and advance the SL if the trailing condition is met.
+
+    Activation: price must have moved >= 1R in favour (i.e. unrealised PnL >= SL distance).
+    Trail distance: 2 * ATR_14 behind current mark price.
+    SL only ever moves in the favourable direction (never against the position).
+    Skipped silently in paper mode.
+    """
+    if os.getenv("HERMES_TRADING_MODE", "paper") != "live":
+        return
+
+    atr = float(price_data.get("atr_14") or 0)
+    if atr <= 0:
+        return
+
+    trail_mult = float(strategy.get("trail_atr_mult", 2.0))
+    trail_dist = atr * trail_mult
+
+    from hermes_trading.adapters import execution as execution_adapter
+    try:
+        positions = execution_adapter.fetch_open_positions_with_marks(asset)
+    except RuntimeError as e:
+        console.print(f"[yellow]Trail SL fetch failed ({asset}): {e}[/yellow]")
+        return
+
+    for pos in positions:
+        entry      = pos["entry_price"]
+        mark       = pos["mark_price"]
+        current_sl = pos["sl_price"]
+        direction  = pos["direction"]
+
+        if entry <= 0 or mark <= 0 or current_sl is None:
+            continue
+
+        sl_dist = abs(entry - current_sl)
+        if sl_dist <= 0:
+            continue
+
+        if direction == "long":
+            unrealised_r = (mark - entry) / sl_dist
+            new_sl       = round(mark - trail_dist, 4)
+            # Activate only after 1R profit; never move SL below current SL
+            if unrealised_r < 1.0 or new_sl <= current_sl:
+                continue
+        else:  # short
+            unrealised_r = (entry - mark) / sl_dist
+            new_sl       = round(mark + trail_dist, 4)
+            if unrealised_r < 1.0 or new_sl >= current_sl:
+                continue
+
+        try:
+            execution_adapter.update_trailing_stop(asset, direction, new_sl)
+            console.print(
+                f"[cyan]Trail SL {asset} {direction}: "
+                f"{current_sl} → {new_sl} "
+                f"(mark={mark}, ATR={atr:.3f}, R={unrealised_r:.2f})[/cyan]"
+            )
+        except RuntimeError as e:
+            console.print(f"[yellow]Trail SL update failed ({asset}): {e}[/yellow]")
+
 async def run(asset: str, goal: dict | None = None, state_dir: Path | None = None) -> None:
     """Main async loop — runs forever.
 
@@ -604,6 +664,10 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
 
             if price_data is None:
                 raise RuntimeError("price adapter returned None — cannot evaluate strategy")
+
+            # Trailing stop: advance SL on open positions before evaluating new entry
+            if os.getenv("HERMES_TRADING_MODE", "paper") == "live":
+                _maybe_update_trailing_stops(asset, price_data, strategy)
 
             ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
 

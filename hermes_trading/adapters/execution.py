@@ -1,4 +1,4 @@
-"""
+﻿"""
 execution.py — Live order execution adapter for Bybit via ccxt.
 
 Places market entry orders with stop-loss + take-profit set at creation.
@@ -382,3 +382,61 @@ def fetch_last_closed_pnl(asset: str) -> dict | None:
         }
     except Exception:
         return None
+
+
+# ── Trailing stop ─────────────────────────────────────────────────────────────
+
+
+def fetch_open_positions_with_marks(asset: str) -> list[dict]:
+    """Return open positions for asset with current mark price.
+
+    Each item: {symbol, direction, entry_price, mark_price, sl_price, tp_price, qty, contracts}
+    Returns [] if no open position or on error.
+    """
+    exchange = _get_exchange()
+    symbol   = _to_perp_symbol(asset)
+    try:
+        positions = exchange.fetch_positions([symbol])
+    except Exception as e:
+        raise RuntimeError(f"fetch_open_positions_with_marks failed for {asset}: {e}")
+
+    result = []
+    for pos in positions:
+        contracts = abs(float(pos.get("contracts", 0) or 0))
+        if contracts == 0:
+            continue
+        side      = (pos.get("side") or "").lower()
+        direction = "long" if side == "long" else "short"
+        info      = pos.get("info", {})
+        result.append({
+            "symbol":      symbol,
+            "direction":   direction,
+            "entry_price": float(pos.get("entryPrice") or info.get("avgPrice") or 0),
+            "mark_price":  float(pos.get("markPrice")  or info.get("markPrice") or 0),
+            "sl_price":    float(info.get("stopLoss")   or 0) or None,
+            "tp_price":    float(info.get("takeProfit") or 0) or None,
+            "qty":         float(pos.get("contracts")   or 0),
+        })
+    return result
+
+
+def update_trailing_stop(asset: str, direction: str, new_sl: float) -> bool:
+    """Move the stop-loss on an open position to new_sl via Bybit trading-stop API.
+
+    Only call this after confirming new_sl improves on the current SL
+    (higher for longs, lower for shorts). Returns True on success.
+    """
+    exchange     = _get_exchange()
+    symbol       = _to_perp_symbol(asset)
+    symbol_clean = symbol.replace("/", "").replace(":USDT", "")
+    try:
+        exchange.private_post_v5_position_trading_stop({
+            "category":      "linear",
+            "symbol":        symbol_clean,
+            "stopLoss":      str(round(new_sl, 4)),
+            "tpslMode":      "Full",
+            "slTriggerBy":   "MarkPrice",
+        })
+        return True
+    except Exception as e:
+        raise RuntimeError(f"update_trailing_stop failed for {asset}: {e}")
