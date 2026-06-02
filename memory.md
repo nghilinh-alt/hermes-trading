@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-06-01 (session 7 — emergency restart after 3-day downtime; wave-4 reflect.py was on disk but bot had been pkilled; partial-deploy detection lesson)
+2026-06-02 (session 7 — emergency restart after 3-day downtime; wave-4 reflect.py was on disk but bot had been pkilled; 7-day backfill + 4h cron installed; partial-deploy detection lesson)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -63,8 +63,8 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-05-28 (s6) | $5 hard profit floor: new `_guard_min_profit_usd` in execution.py + `min_profit_usd: 5.0` in all 4 yamls | Linh directive "aim to win at least $5 per trade." Hard skip in `place_live_trade` after qty is computed (qty × \|tp − entry\| < $5 → ValueError). Co-located with Phase 2.1 guards as Guard 4. |
 | 2026-05-28 (s6) | reflect.py truncated from 702 → 572 lines (IndentationError fix) | Duplicated `run_hermes` + `main` bodies at lines 572+ from prior Edit-tool corruption. Fixed via Python heredoc; py_compile + ast.parse OK. |
 | 2026-05-28 (s6) | `tools/backfill_trades.py` (NEW) — direction-correct pnl_pct via closedPnl/cumEntryValue | Sidesteps the still-broken `(exit-entry)/entry` formula in `fetch_last_closed_pnl` (Phase 2.5 will fix that). Idempotent dedup by order_id. 6 unit tests pass. |
-| 2026-06-01 (s7) | Emergency restart after 3-day downtime; no code changes | reflect.py None-safety fix was already on disk (Linh manually cp'd during a partial wave-4 deploy attempt) but agent was pkilled and never relaunched. Restart-only recovery; 8-step deploy block per doctrine #5 worked clean. |
-| 2026-06-01 (s7) | Add post-deploy `diff -r hyphen underscore` as standard final check | Doctrine #14 — wave 4 partial cp was invisible for 6 h until reflection needed the missing file. A directory-level diff would have caught it pre-launch. |
+| 2026-06-02 (s7) | Emergency restart after 3-day downtime; no code changes | reflect.py None-safety fix was already on disk (Linh manually cp'd during a partial wave-4 deploy attempt) but agent was pkilled and never relaunched. Restart-only recovery; 8-step deploy block per doctrine #5 worked clean. |
+| 2026-06-02 (s7) | Add post-deploy `diff -r hyphen underscore` as standard final check | Doctrine #14 — wave 4 partial cp was invisible for 6 h until reflection needed the missing file. A directory-level diff would have caught it pre-launch. |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -119,7 +119,7 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 
 ## Session Log
 
-### 2026-06-01 (session 7) — Emergency restart after 3-day downtime
+### 2026-06-02 (session 7) — Emergency restart after 3-day downtime + 7-day backfill + 4h cron
 **Symptom**: Cowork open, asked for `next-session-prompt.md` review. Diagnostic SSH probe revealed bot process gone, all 4 heartbeats stale at `2026-05-29T06:30:04 UTC` — **3 days down**. No process, no auto-reflection had fired, VPS uptime 69 days (no reboot), no OOM, disk fine.
 
 **Root cause (chronology reconstructed)**:
@@ -155,7 +155,20 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - Intermediate trades during downtime gap (reconcile caught only the most recent close per asset) — `tools/backfill_trades.py` should pull the full 7-day window to recover any missing records.
 - cumRealisedPnl on Bybit balance now `-18,251` (was `-18,272` at session-6 end) — tiny improvement from exchange-side TP fills during downtime.
 
-**Files touched this session**: `session-7-restart.md` (NEW, the full diagnostic + deploy block); `memory.md` (this entry).
+**Files touched this session**:
+- `session-7-restart.md` (NEW) — full diagnostic + deploy block
+- `memory.md` — session 7 entry + doctrine #14, #15, #16 (and #16 fix verified twice live)
+- `next-session-prompt.md` — updated current state + reordered backlog
+- `README.md` — full rewrite for current state (live trading, SMC, Hermes, audit fields, dashboard, doctrine)
+- `tools/cron_backfill.sh` (NEW) — wrapper for 4-hour cron-driven Bybit closed-trade sync
+- `archive/` (NEW dir) — moved `diagnosis-session-5.md`, `strategy-review-session-5.md`, `session-6-phase-2.4.md`
+- 7 May-22 setup docs deleted (DEPLOY-GUIDE, FINAL-VPS-COMMANDS, FIX-VPS-SHAPOT, PUSH-TO-GITHUB, VPS-COPY-INSTuctions, VPS-RUN-commands, VPS-SETUP-COMMANDS)
+
+**Cron installed on VPS** (root's crontab):
+- `0 14 * * * /opt/trading/hermes_trading/snapshot.sh ...` (pre-existing daily snapshot)
+- `0 */4 * * * /opt/trading/hermes_trading/tools/cron_backfill.sh` (NEW: every 4h closed-trade backfill)
+
+**Backfill outcome (one-time 7-day catch-up)**: +38 trades landed across all 4 assets (BTC +4, ETH +6, SOL +3, TAO +25). Dashboard now sees Bybit truth.
 
 **Handoff**:
 - **To**: Linh (monitor + decide whether to run backfill / start Phase 2.8 / wait for stability before Phase 2.2)
