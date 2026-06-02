@@ -1,4 +1,4 @@
-"""
+﻿"""
 reflect.py — strategy reflection module.
 
 Two modes:
@@ -493,6 +493,36 @@ def run_hermes(state_dir: Path) -> None:
                 result[k] = round(sum(vals) / len(vals), 4)
         return result
 
+    def _indicator_fire_table(winning: list[dict], losing: list[dict]) -> list[dict]:
+        """Pre-compute per-indicator fire rates on wins vs losses.
+
+        Gives the LLM a ground-truth table so it cannot hallucinate fire-rate
+        statistics. Each row: {indicator, win_fire_rate, loss_fire_rate, delta}.
+        delta > 0 means the indicator fires more on wins (healthy signal).
+        delta < 0 means it fires more on losses (noisy — consider raising threshold).
+        Only includes indicators that fired in at least one trade.
+        """
+        all_keys: set[str] = set()
+        for t in winning + losing:
+            all_keys.update((t.get("indicators_fired") or {}).keys())
+        rows = []
+        for k in sorted(all_keys):
+            w_fired = sum(1 for t in winning if (t.get("indicators_fired") or {}).get(k))
+            l_fired = sum(1 for t in losing  if (t.get("indicators_fired") or {}).get(k))
+            w_rate  = round(w_fired / len(winning), 3) if winning else 0.0
+            l_rate  = round(l_fired / len(losing),  3) if losing  else 0.0
+            if w_fired + l_fired == 0:
+                continue
+            rows.append({
+                "indicator":      k,
+                "win_fire_rate":  w_rate,
+                "loss_fire_rate": l_rate,
+                "delta":          round(w_rate - l_rate, 3),
+            })
+        # Sort by abs(delta) descending so the most actionable signals appear first
+        rows.sort(key=lambda r: abs(r["delta"]), reverse=True)
+        return rows
+
     # Compact per-trade summary so the prompt fits Ollama's 4K context window.
     # Full audit data (indicators_snapshot, confidence_breakdown, entry_gates) stays
     # in trades.jsonl; we only send what the LLM needs for hypothesis generation.
@@ -524,14 +554,18 @@ def run_hermes(state_dir: Path) -> None:
             "total_pnl":       round(sum(float(t["pnl_pct"]) for t in closed), 6),
             "avg_indicators_on_wins":   _avg_indicators(winning),
             "avg_indicators_on_losses": _avg_indicators(losing),
+            "indicator_fire_table":     _indicator_fire_table(winning, losing),
         },
         "memory":           memory_context[-1500:] if memory_context else "",
         "instruction": (
             "Review the recent trades, current strategy, performance summary, "
             "and memory of past decisions. "
-            "The performance_summary shows average indicator values at entry for "
-            "winning vs losing trades — use this to identify which indicators "
-            "correlate with better outcomes. "
+            "The performance_summary.indicator_fire_table shows — for each indicator — "
+            "the exact fraction of winning and losing trades where it fired. "
+            "delta = win_fire_rate - loss_fire_rate: "
+            "positive means the indicator fires more on wins (healthy); "
+            "negative means it fires more on losses (noisy — consider raising its threshold or reducing its weight). "
+            "Base your reasoning on these ground-truth numbers, not estimates. "
             "Generate the single highest-confidence hypothesis that changes "
             "exactly ONE variable to improve win rate or PnL. "
             "\n\n"
@@ -561,13 +595,14 @@ def run_hermes(state_dir: Path) -> None:
             "  - Do NOT use dot notation like 'indicators.params.X' — always use 'indicators[name].field'.\n"
             "  - Do NOT change the 'required' field on any indicator.\n"
             "  - Do NOT repeat a change that memory shows was tried recently without improvement.\n"
+            "  - Your reasoning MUST cite specific numbers from indicator_fire_table, not estimates.\n"
             "\n"
             "OUTPUT FORMAT — raw JSON only, no markdown, no code fences, no explanation.\n"
             "Example output:\n"
-            '{"changed_variable": "indicators[volume_spike].params.min_ratio", '
-            '"old_value": 1.5, "new_value": 2.0, '
-            '"reasoning": "Volume spike fired on 80% of losing trades at ratio 1.5; '
-            'raising threshold to filter noise.", "confidence": 0.75}\n'
+            '{"changed_variable": "indicators[ema_trend].weight", '
+            '"old_value": 0.3, "new_value": 0.4, '
+            '"reasoning": "ema_trend win_fire_rate=0.72 vs loss_fire_rate=0.41 (delta=+0.31); '
+            'highest positive delta in fire table — increasing weight to reward this signal.", "confidence": 0.8}\n'
             "\n"
             "Your output must follow that exact structure with these five keys: "
             "changed_variable, old_value, new_value, reasoning, confidence."
