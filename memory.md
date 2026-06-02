@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-05-29 (session 6 wave 4 — pnl_pct/drawdown bugs fixed, CSV import, purge, Hermes succeeds with v02→v03)
+2026-06-01 (session 7 — emergency restart after 3-day downtime; wave-4 reflect.py was on disk but bot had been pkilled; partial-deploy detection lesson)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -63,6 +63,8 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-05-28 (s6) | $5 hard profit floor: new `_guard_min_profit_usd` in execution.py + `min_profit_usd: 5.0` in all 4 yamls | Linh directive "aim to win at least $5 per trade." Hard skip in `place_live_trade` after qty is computed (qty × \|tp − entry\| < $5 → ValueError). Co-located with Phase 2.1 guards as Guard 4. |
 | 2026-05-28 (s6) | reflect.py truncated from 702 → 572 lines (IndentationError fix) | Duplicated `run_hermes` + `main` bodies at lines 572+ from prior Edit-tool corruption. Fixed via Python heredoc; py_compile + ast.parse OK. |
 | 2026-05-28 (s6) | `tools/backfill_trades.py` (NEW) — direction-correct pnl_pct via closedPnl/cumEntryValue | Sidesteps the still-broken `(exit-entry)/entry` formula in `fetch_last_closed_pnl` (Phase 2.5 will fix that). Idempotent dedup by order_id. 6 unit tests pass. |
+| 2026-06-01 (s7) | Emergency restart after 3-day downtime; no code changes | reflect.py None-safety fix was already on disk (Linh manually cp'd during a partial wave-4 deploy attempt) but agent was pkilled and never relaunched. Restart-only recovery; 8-step deploy block per doctrine #5 worked clean. |
+| 2026-06-01 (s7) | Add post-deploy `diff -r hyphen underscore` as standard final check | Doctrine #14 — wave 4 partial cp was invisible for 6 h until reflection needed the missing file. A directory-level diff would have caught it pre-launch. |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -116,6 +118,50 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **Tripwire to remember**: the pre-existing `hermes-dashboard` key entry in authorized_keys had no trailing newline. `echo >> file` concatenated the appended line onto the same line, corrupting both entries. Always rebuild authorized_keys via heredoc (`cat > file <<'EOF' ... EOF`) and verify with `wc -l` afterward.
 
 ## Session Log
+
+### 2026-06-01 (session 7) — Emergency restart after 3-day downtime
+**Symptom**: Cowork open, asked for `next-session-prompt.md` review. Diagnostic SSH probe revealed bot process gone, all 4 heartbeats stale at `2026-05-29T06:30:04 UTC` — **3 days down**. No process, no auto-reflection had fired, VPS uptime 69 days (no reboot), no OOM, disk fine.
+
+**Root cause (chronology reconstructed)**:
+1. Session 6 wave 4 prepared the audit-fields + None-safety patch (commit `ee0dea2`) touching loop.py + execution.py + reflect.py.
+2. Deploy block on 2026-05-29 was run partially — loop.py and execution.py made it to underscore clone, **reflect.py did not** initially.
+3. Bot restarted with NEW loop/execution + OLD reflect.py.
+4. Bot ran ~6h. TAO Trade #25 triggered `--hermes` reflection at 04:00 UTC → crashed at reflect.py:434 with `TypeError: float(None)` (the exact bug wave-4 None-safety was meant to fix).
+5. Reflection subprocess error swallowed by loop.py; bot kept ticking until 06:30 UTC.
+6. At some point between crash and 06:30: Linh manually `cp`'d the fixed reflect.py (hyphen → underscore) and `pkill`'d to restart — but never re-launched. **Bot dark for 3 days.**
+
+**Restart this session (8 steps, one block per action per doctrine #5)**:
+1. `git push origin master` from PowerShell → "Everything up-to-date" (all fixes already on GitHub).
+2. `git pull` on hyphen clone → only memory.md updated (reflect.py fix was already pulled previously).
+3. `diff` hyphen vs underscore reflect.py → empty (already in sync — confirming Linh did the catch-up cp).
+4-5. Skipped — files identical.
+6. Verification block: None-safety filter ×5 ✓, audit fields ×12 ✓, wealth-curve marker ×6 ✓, line 434 = `options.num_ctx` (not crash line) ✓, py_compile OK ✓.
+7. Restart: `pkill -f hermes_trading.run; set -a; source .env; set +a; nohup .venv/bin/python -m hermes_trading.run >> bot.log 2>&1 & disown`. PID 1525537, cwd `/opt/trading/hermes_trading`, all 4 workers booted.
+8. Verify: 4 workers in log, first tick at 10:21 UTC processed reconciles cleanly.
+
+**Reconcile during restart (positions managed exchange-side via SL/TP-on-order during downtime)**:
+- ETH: closed by TP / exchange-side at +1.87% (reason `manual_or_other` — meaning closed without bot knowing tp/sl source)
+- SOL: closed at +1.75% (same)
+- TAO: closed by SL_hit at -0.65% (**first trade post v03 Hermes mutation `volume_spike.min_ratio 1.5→2.0`** — one-sample warning, see watchlist)
+- BTC: no position (still blocked by `min_tp_pct: 3.0`)
+
+**Doctrine added this session**:
+14. **A partial deploy is invisible until something needs the missing piece.** Wave 4 cp landed 2 of 3 files; bot ran fine for 6 h until reflection demanded the third. **Defense**: after any multi-file deploy, run a `diff -r` between hyphen-clone and underscore-clone for the package dir as a final check. Treat any non-empty diff as deploy-incomplete.
+15. **Heartbeat staleness is a higher-signal alarm than process-exists.** Process-down is obvious; heartbeat-stale-but-process-up would catch hangs too. Worth a passive cron on VPS: every 30 min, alert if any heartbeat is >20 min old.
+16. **PowerShell here-string → ssh bash carries CR-LF — the LAST argument of the LAST command gets `\r` appended.** Tools that compare arguments to a known set (argparse `--dry-run`, file open, exec lookup) fail: `--dry-run\r` ≠ `--dry-run`; `tail bot.log\r` looks for a literal `bot.log\r` file. **Mandatory workaround for every PowerShell `@'...'@ | ssh bash` block: end the body with a trailing throwaway line like `echo DONE` so the `\r` corruption lands on something tolerant.** Confirmed twice in session 7: `tail bot.log` and `--dry-run` both failed without the throwaway, both worked with it.
+
+**Open watchlist post-restart**:
+- TAO v03 SL_hit on first post-mutation trade (1 sample, irrelevant alone — but Phase 2.8 sanity-check is worth landing before the next 5-trade boundary fires Hermes again).
+- Intermediate trades during downtime gap (reconcile caught only the most recent close per asset) — `tools/backfill_trades.py` should pull the full 7-day window to recover any missing records.
+- cumRealisedPnl on Bybit balance now `-18,251` (was `-18,272` at session-6 end) — tiny improvement from exchange-side TP fills during downtime.
+
+**Files touched this session**: `session-7-restart.md` (NEW, the full diagnostic + deploy block); `memory.md` (this entry).
+
+**Handoff**:
+- **To**: Linh (monitor + decide whether to run backfill / start Phase 2.8 / wait for stability before Phase 2.2)
+- **Read first next session**: `next-session-prompt.md` (update after this session), then this memory.md entry, then `session-7-restart.md` if context is needed
+- **Phase 2.2 (ATR trailing stop) remains pending** — paused until bot is verified stable ≥24 h
+
 ### 2026-05-28 (session 6) — Phase 2.4 reflection rebuild + $5 hard guard
 - **reflect.py was corrupted** with duplicated `run_hermes` + `main` bodies at lines 572-701 (prior Edit-tool corruption). Final 5 lines had `console.print` truncated to bare `print` at module-level indent → `IndentationError` on line 572. Reflection subprocess had been failing on every invocation since.
 - **Fix:** truncated cleanly at the first occurrence of `if __name__ == "__main__":\n    main()\n`. File 702 → 572 lines. Validated with `python -m py_compile` and `ast.parse`. Written atomically via Python heredoc + `.tmp` → `replace()` (never trust Edit/Write on the Windows mount; lesson re-confirmed).

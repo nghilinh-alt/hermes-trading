@@ -1,291 +1,149 @@
-# HerMES-Trading - Complete Self-Improving Trading Agent
+# Hermes-Trading
 
-## 🚀 Overview
+A self-improving live crypto trading agent for Bybit USDT-perp markets, with multi-indicator confidence scoring, structural SL/TP from market microstructure, and an LLM-driven reflection loop that mutates its own strategy.
 
-A **self-improving autonomous trading agent** that leverages market data, macroeconomic indicators, news sentiment, and on-chain analytics to execute intelligent trading strategies with continuous reflection and learning.
-
----
-
-## ✨ Key Features
-
-- **Autonomous Trading Loop**: Self-optimizing agent that learns from execution results
-- **Multi-Source Data Integration**: 
-  - 📊 Market data via CCXT (crypto exchanges)
-  - 🌐 Macroeconomic indicators
-  - 📰 News sentiment analysis
-  - 🔗 On-chain blockchain analytics
-- **Reflection & Self-Improvement**: Built-in reflection mechanism for continuous optimization
-- **Performance Scoring**: Real-time evaluation and adaptive strategy adjustment
-- **Docker Native**: Easy deployment with `docker-compose`
+Built as a Rogue Night consulting project. Currently runs live on BTC/USDT, ETH/USDT, SOL/USDT, TAO/USDT — 15-minute timeframe, exchange-side SL/TP, risk-based position sizing.
 
 ---
 
-## 🏗️ Tech Stack
+## Architecture
 
-| Category | Technology |
-|----------|-----------|
-| Core | Python 3.10+ |
-| Trading API | CCXT (crypto exchanges) |
-| Data Analysis | pandas, numpy |
-| HTTP/Async | httpx, aiofiles |
-| Documentation | rich console renderer |
-| Deployment | Docker, uv package manager |
+```
+            ┌─────────────────────────────────────────┐
+            │  run.py — async multi-worker bootstrap  │
+            └────────────────┬────────────────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+   ┌────▼────┐         ┌────▼────┐         ┌────▼────┐    ... per asset
+   │BTC/USDT │         │ETH/USDT │         │SOL/USDT │    (4 workers)
+   └────┬────┘         └─────────┘         └─────────┘
+        │
+        │  every 15-min candle:
+        │
+        ├─▶ adapters/price.py      → OHLCV + 22 indicators (RSI, EMA, BB,
+        │                            MACD, ATR, VWAP, FVG, OB, S/R 1h+4h)
+        │
+        ├─▶ loop._evaluate_entry   → multi-indicator confidence score,
+        │                            direction=long|short|both, gate checks
+        │
+        ├─▶ adapters/execution.py  → Bybit live order (HMAC auth) with
+        │                            structural SL/TP, risk-based qty,
+        │                            min_profit_usd $5 floor
+        │
+        ├─▶ loop._reconcile_open   → match local trades.jsonl to Bybit
+        │                            positions; close + record pnl on fill
+        │
+        └─▶ reflect.py (every 5 closed trades)
+            ├─ fallback: rule-based mutation (drawdown/return targets)
+            └─ hermes:   Ollama qwen2.5:3b proposes ONE variable change
+                         (writes hypothesis with decision_context +
+                          trade_range + llm_raw_output for full audit)
+```
+
+State is per-asset under `state/<slug>/`: `strategy.yaml` (mutated by reflection), `trades.jsonl`, `hypotheses.jsonl`, `heartbeat.json`, `history/v<NN>.yaml` (version archive).
 
 ---
 
-## 📁 Project Structure
+## Key features
+
+- **Live trading on Bybit** via ccxt (HMAC). Paper mode supported via `HERMES_TRADING_MODE=paper`.
+- **Structural SL/TP**: SL at swing low/high ± `sl_buffer_pct`, TP at nearest structural resistance/support. Falls back to fixed % only if S/R unavailable.
+- **Risk-based sizing**: `qty = (balance × risk_per_trade) / sl_dist_pct`, capped at `MAX_POSITION_USD`.
+- **Four structural guards** before every order:
+  - `max_sl_pct` — skip if SL too far from entry (default 5%)
+  - `min_tp_pct` — skip if structural TP too thin (default 3%, Option B target-return filter)
+  - `min_rr_ratio` — soft: extend TP if R:R below threshold (default 2.0)
+  - `min_profit_usd` — hard: skip if expected TP profit < $5
+- **Hermes reflection loop**: every 5 closed trades, the bot calls a local Ollama model (qwen2.5:3b, CPU) which reads recent trade history + `decision_context` and proposes one variable to mutate. Every hypothesis is logged with the LLM's raw output for audit.
+- **Audit fields on every trade**: `confidence_breakdown` (per-indicator fire/weight), `entry_gates` (snapshot at decision time), `evaluation_summary` (human-readable), `close_reason` (TP_hit / SL_hit / abandoned / manual_or_other).
+- **Local dashboard** at `localhost:8888` with $ and % P&L, per-asset cards, indicator-weight panels, live position R:R.
+
+---
+
+## Project layout
 
 ```
 hermes-trading/
-├── hermes_trading/           # Core Python package
-│   ├── __init__.py
-│   ├── run.py                 # Entry point / main orchestrator
-│   ├── loop.py                # Trading loop logic & decision engine
-│   ├── score.py               # Performance metrics & scoring system
-│   └── reflect.py             # Reflection/self-improvement mechanisms
-│
-├── hermes_trading/adapters/  # Data source adapters
-│   ├── __init__.py
-│   ├── macro.py              # Macroeconomic data ingestion
-│   ├── news.py               # News feeds & sentiment analysis
-│   ├── onchain.py            # On-chain blockchain analytics
-│   └── price.py              # Price/market data (CCXT)
-│
-├── pyproject.toml             # Modern Python packaging config
-├── requirements.txt           # Simple pip dependency list
-├── Dockerfile                 # Container definition
-├── docker-compose.yml         # Orchestration setup
-├── .env                       # Environment variables template
-├── .gitignore                 # Git exclusion rules
-│
-└── state/                     # Runtime state (gitignored)
+├── hermes_trading/
+│   ├── run.py                    # async worker bootstrap, per-asset state init
+│   ├── loop.py                   # 15m tick loop, entry eval, reconcile, reflection cadence
+│   ├── reflect.py                # --fallback (rule-based) | --hermes (Ollama)
+│   └── adapters/
+│       ├── price.py              # OHLCV + 22 indicators (15m, 1h, 4h)
+│       └── execution.py          # Bybit HMAC live orders, structural SL/TP, guards
+├── tools/                        # operational scripts
+│   ├── backfill_trades.py        # Bybit closed-pnl → trades.jsonl (7-day window)
+│   ├── import_bybit_csv.py       # Bybit UI CSV export → trades.jsonl
+│   ├── recompute_pnl_pct.py      # direction-correct pnl_pct repair
+│   └── purge_abandoned.py        # clean entry==exit stub records
+├── state/<slug>/                 # per-asset runtime state (gitignored)
+├── dashboard.py                  # local Windows dashboard, SSH-fetches VPS state
+├── memory.md                     # project memory (single source of truth)
+├── next-session-prompt.md        # handoff prompt for next agent session
+├── strategy.yaml                 # legacy top-level (per-asset under state/<slug>/ is canonical)
+├── pyproject.toml
+└── requirements.txt
 ```
 
 ---
 
-## 🚀 Quick Start
-
-### Option 1: VPS Deployment (Recommended)
+## Quick start (VPS, live mode)
 
 ```bash
-# Clone from GitHub
-git clone https://github.com/nghilinh-alt/hermes-trading.git /opt/trading
-cd /opt/trading/hermes-trading
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
+# On VPS
+cd /opt/trading
+git clone https://github.com/nghilinh-alt/hermes-trading.git
+cd hermes-trading
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 
-# Configure API keys (optional for paper trading)
-cp .env.example .env  # Edit with your secrets or leave blank
+# .env (required for live mode)
+cat > .env <<'EOF'
+HERMES_TRADING_MODE=live
+HERMES_TRADING_I_ACCEPT_RISK=true
+BYBIT_API_KEY=...
+BYBIT_API_SECRET=...
+MAX_POSITION_USD=500
+HERMES_LLM_TIMEOUT=300
+HERMES_LLM_NUM_CTX=8192
+EOF
 
-# Run the agent
-python -m hermes_trading.run
+# Run
+set -a && source .env && set +a
+nohup .venv/bin/python -m hermes_trading.run >> bot.log 2>&1 &
+disown
 ```
 
-### Option 2: Docker Deployment
+For local dashboard:
 
-```bash
-git clone https://github.com/nghilinh-alt/hermes-trading.git /opt/trading
-cd /opt/trading/hermes-trading
-
-# Build and run with docker-compose
-docker-compose up -d --build
-
-# View logs
-docker-compose logs -f trading-agent
+```powershell
+# On Windows
+cd C:\Users\nghil\Projects\Hermes\Hermes-Trading
+python dashboard.py
+# Open http://localhost:8888
 ```
 
-### Option 3: Using uv (Fast & Modern)
-
-```bash
-pip install uv
-cd /opt/trading/hermes-trading
-uv sync
-uv run python -m hermes_trading.run
-```
+SSH key setup for dashboard is documented in `memory.md` (session 5f).
 
 ---
 
-## 🔧 Configuration
+## Operational protocol
 
-Create/edit your `.env` file:
+1. **Read `memory.md` first** — full project history, key decisions, VPS layout, doctrine items.
+2. **Update `memory.md` at end of every session** — Last Updated, Active state, Session Log entry, Key Decisions, Handoffs.
+3. **Deploy is split across two VPS clones**: `hermes-trading/` (hyphen, git pull staging) and `hermes_trading/` (underscore, running). After every `git pull`, `cp` the changed files from hyphen → underscore. One deploy step per code block.
+4. **Never `cp` `strategy.yaml`** between clones — they may carry reflection-evolved values. Use in-place edits.
+5. **After any multi-file deploy: `diff -r hyphen underscore`** for the package dir. A partial cp is invisible until something triggers the missing piece (doctrine #14).
 
-```env
-# Trading Mode
-HERMES_TRADING_MODE=paper        # or 'live'
-
-# Risk Settings
-HERMES_TRADING_I_ACCEPT_RISK=false
-
-# Exchange API (optional - leave blank for free tier)
-EXCHANGE_API_KEY=your_api_key_here
-EXCHANGE_API_SECRET=your_secret_here
-EXCHANGE=binance  # Options: binance, bybit, kucoin, etc.
-TRADING_MODE=spot  # or 'futures'
-
-# Third-party APIs (optional)
-GLASSNODE_API_KEY=  # On-chain analytics
-NEWS_API_KEY=       # News sentiment
-
-# Runtime
-LOG_LEVEL=INFO
-REFLECTION_INTERVAL=3600  # Seconds between reflection cycles
-```
+Full doctrine list (16 items as of 2026-06-01) lives in `memory.md` and `next-session-prompt.md`.
 
 ---
 
-## 📊 Architecture Overview
+## License
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Macro Data │───▶│   Adapter    │───▶│ Agent Core   │
-└─────────────┘     └─────────────┘     └──────┬──────┘
-                                                │
-┌─────────────┐     ┌─────────────┐           │
-│ News Data   │───▶│   Adapter    │────────────┘
-└─────────────┘     └─────────────┘
-    ▲                    │
-    │              ┌─────▼─────┐
-┌─────────────┐  │  Score &   │◀─────── Execution Results
-│On-chain D.  │───▶ Reflect   │       (for learning)
-└─────────────┘  └─────────────┘
-```
+Private — Rogue Night consulting project.
 
-### Core Components
+## Risk disclaimer
 
-1. **Adapters**: Handle data ingestion from various sources (CCXT, macro APIs, news feeds, on-chain analytics)
-2. **Loop**: Core trading logic - makes decisions based on synthesized market intelligence
-3. **Score**: Performance metrics, PnL tracking, risk assessment
-4. **Reflect**: Self-improvement mechanism - learns from past trades and optimizes strategies
-
----
-
-## 🔐 Security Best Practices
-
-### Never commit secrets!
-
-- API keys go in `.env` (gitignored)
-- Use GitHub Secrets for production deployments
-- Consider using a secrets manager (HashiCorp Vault, AWS Secrets Manager)
-
-### Environment Variables by Sensitivity
-
-| Variable | Default | When to set |
-|----------|---------|-------------|
-| `HERMES_TRADING_MODE` | `paper` | Always - use `paper` for testing |
-| `EXCHANGE_API_KEY` | (blank) | Only for live trading |
-| `GLASSNODE_API_KEY` | (blank) | For on-chain analytics |
-
----
-
-## 📈 Monitoring & Logs
-
-### Log Output
-
-The agent outputs rich console logs including:
-- Market data ingestion events
-- Reflection cycles and learnings
-- Trading decisions and executions
-- Performance metrics
-
-### Production Setup
-
-Add logging configuration to `logging.conf`:
-
-```ini
-[loggers]
-keys=root,hermes_trading
-
-[handlers]
-keys=console,file
-
-[formatters]
-key=simple,detailed
-
-[logger_root]
-level=INFO
-handlers=console,file
-
-[logger_hermes_trading]
-level=DEBUG
-handlers=console,file
-```
-
----
-
-## 🔍 Troubleshooting
-
-### "Module not found" errors
-
-```bash
-pip install -e .  # Or: uv sync
-```
-
-### Port already in use
-
-The agent may bind to ports for webhooks. Change in config or kill existing processes:
-
-```bash
-lsof -i :5175 | grep LISTEN
-kill -9 <PID>
-```
-
-### API rate limit errors
-
-Reduce `REFLECTION_INTERVAL` or use premium exchange tiers.
-
----
-
-## 📚 Development Guidelines
-
-### Adding New Data Sources
-
-1. Create adapter in `hermes_trading/adapters/`
-2. Follow existing patterns (e.g., `price.py`)
-3. Update adapters' `__init__.py`
-
-### Writing Unit Tests
-
-```bash
-# Install dev dependencies
-pip install pytest pytest-asyncio
-
-# Run tests
-pytest tests/
-```
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes
-4. Run tests
-5. Submit a pull request
-
----
-
-## 📄 License
-
-MIT License - See `LICENSE` file for details.
-
----
-
-## 🔗 Resources
-
-- **GitHub Repository**: https://github.com/nghilinh-alt/hermes-trading
-- **Documentation**: `README.md` + `DEPLOY-GUIDE.md`
-- **Issues & Bug Reports**: [GitHub Issues](https://github.com/nghilinh-alt/hermes-trading/issues)
-
----
-
-## ⚠️ Risk Disclaimer
-
-Trading involves substantial risk of loss and is not suitable for every investor. The `HERMES_TRADING_I_ACCEPT_RISK=false` setting in the `.env` file indicates that this is a research/training project, not production financial advice.
-
-Always test with paper trading (mock mode) before deploying live capital.
+Live trading. Real capital at risk. The `HERMES_TRADING_I_ACCEPT_RISK=true` flag is required to enable order placement.
