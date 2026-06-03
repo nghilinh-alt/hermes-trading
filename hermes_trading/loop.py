@@ -540,6 +540,8 @@ def _reconcile_open_trades(asset: str, state_dir: Path) -> None:
                     f"[cyan][{asset}] Reconciled: exit={closed['exit_price']} "
                     f"pnl={closed['pnl_pct']:+.4%} reason={trades[most_recent_idx]['close_reason']}[/cyan]"
                 )
+                if trades[most_recent_idx]["close_reason"] == "SL_hit":
+                    _record_sl_hit(state_dir, asset)
             else:
                 # No closed PnL available — mark as abandoned with zero PnL
                 trades[most_recent_idx]["pnl_pct"]      = 0.0
@@ -555,6 +557,61 @@ def _reconcile_open_trades(asset: str, state_dir: Path) -> None:
     except Exception as e:
         console.print(f"[yellow][{asset}] Reconcile error: {e}[/yellow]")
 
+
+def _is_circuit_breaker_active(state_dir: Path) -> bool:
+    """Return True if this asset is in a trading cooldown period."""
+    cb_file = state_dir / "circuit_breaker.json"
+    if not cb_file.exists():
+        return False
+    try:
+        cb = json.loads(cb_file.read_text())
+        cooldown_until = cb.get("cooldown_until")
+        if not cooldown_until:
+            return False
+        until_dt = datetime.fromisoformat(cooldown_until)
+        if datetime.now(timezone.utc) < until_dt:
+            return True
+        # Cooldown expired — leave file in place (history), just return False
+        return False
+    except Exception:
+        return False
+
+
+def _record_sl_hit(state_dir: Path, asset: str) -> None:
+    """Record an SL hit. If 3 hits occur within 4h, trigger an 8h trading cooldown."""
+    cb_file   = state_dir / "circuit_breaker.json"
+    now       = datetime.now(timezone.utc)
+    window_h  = 4    # look-back window hours
+    max_hits  = 3    # hits within window to trigger cooldown
+    cooldown_h = 8   # pause duration hours
+
+    try:
+        cb = json.loads(cb_file.read_text()) if cb_file.exists() else {}
+    except Exception:
+        cb = {}
+
+    hits = cb.get("sl_hits", [])
+    # Append this hit
+    hits.append({"ts": now.isoformat()})
+    # Prune hits older than the look-back window
+    cutoff = now.replace(tzinfo=timezone.utc) if now.tzinfo else now
+    from datetime import timedelta
+    cutoff = now - timedelta(hours=window_h)
+    hits = [h for h in hits if datetime.fromisoformat(h["ts"]) >= cutoff]
+
+    cb["sl_hits"] = hits
+
+    if len(hits) >= max_hits:
+        cooldown_until = now + timedelta(hours=cooldown_h)
+        cb["cooldown_until"] = cooldown_until.isoformat()
+        cb["triggered_at"]   = now.isoformat()
+        console.print(
+            f"[bold red][{asset}] CIRCUIT BREAKER TRIGGERED: "
+            f"{max_hits} SL hits in {window_h}h. "
+            f"Trading paused until {cooldown_until.strftime('%Y-%m-%d %H:%M UTC')}[/bold red]"
+        )
+
+    cb_file.write_text(json.dumps(cb, indent=2))
 
 def _maybe_trigger_reflection(goal: dict, trade_count: int, state_dir: Path) -> None:
     """Run reflect when the cadence threshold is crossed."""
@@ -664,6 +721,21 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
 
             if price_data is None:
                 raise RuntimeError("price adapter returned None — cannot evaluate strategy")
+
+            # Circuit breaker: skip entry evaluation if asset is in cooldown
+            if _is_circuit_breaker_active(state_dir):
+                until_str = ""
+                try:
+                    cb = json.loads((state_dir / "circuit_breaker.json").read_text())
+                    until_str = f" until {cb.get('cooldown_until','?')[:16]} UTC"
+                except Exception:
+                    pass
+                console.print(f"[yellow]{ts} {tag} Circuit breaker active — trading paused{until_str}[/yellow]")
+                _write_heartbeat(state_dir, "circuit_breaker", 0)
+                elapsed      = time.monotonic() - tick_start
+                tick_seconds = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
+                await asyncio.sleep(max(0, tick_seconds - elapsed))
+                continue
 
             # Trailing stop: advance SL on open positions before evaluating new entry
             if os.getenv("HERMES_TRADING_MODE", "paper") == "live":
