@@ -109,16 +109,22 @@ def _exit_qty_fp(exit_price, qty):
         return None
 
 
-def _load_existing_keys(trades_path: Path) -> tuple[set[str], set[tuple]]:
-    """Return (order_id_set, exit_qty_fingerprint_set) from existing trades.jsonl.
+def _load_existing_keys(trades_path: Path) -> tuple[set[str], set[tuple], set[float]]:
+    """Return (order_id_set, exit_qty_fingerprint_set, open_qty_set).
 
-    Two-key dedup: order_id catches same-source duplicates; (exit,qty) catches
-    native-vs-backfill pairs where the opening order_id != closing order_id.
+    Three-key dedup:
+      - order_id: catches same-source duplicates
+      - (exit@2dp, qty@4dp): catches native-vs-backfill for already-reconciled trades
+      - open_qty@4dp: catches native-vs-backfill for trades that are STILL OPEN locally
+        (exit_price=None) but already closed on Bybit. The bot can only have one open
+        position per asset, so any backfill record whose qty matches an open native
+        record is the same trade and should be skipped.
     """
     if not trades_path.exists():
-        return set(), set()
+        return set(), set(), set()
     ids: set[str] = set()
     fps: set[tuple] = set()
+    open_qtys: set[float] = set()
     for line in trades_path.read_text().splitlines():
         line = line.strip()
         if not line:
@@ -130,10 +136,18 @@ def _load_existing_keys(trades_path: Path) -> tuple[set[str], set[tuple]]:
         oid = rec.get("order_id")
         if oid:
             ids.add(str(oid))
-        fp = _exit_qty_fp(rec.get("exit_price"), rec.get("qty"))
-        if fp is not None:
-            fps.add(fp)
-    return ids, fps
+        if rec.get("exit_price") is None:
+            # Open trade — track qty so backfill won't add a duplicate while it's unreconciled
+            try:
+                q = round(float(rec["qty"]), 4)
+                open_qtys.add(q)
+            except (KeyError, TypeError, ValueError):
+                pass
+        else:
+            fp = _exit_qty_fp(rec.get("exit_price"), rec.get("qty"))
+            if fp is not None:
+                fps.add(fp)
+    return ids, fps, open_qtys
 
 
 def _append_trades(trades_path: Path, records: list[dict]) -> None:
@@ -266,7 +280,7 @@ def backfill_asset(
     symbol       = _slug_to_bybit_symbol(slug)
     trades_path  = state_root / slug / "trades.jsonl"
 
-    existing_ids, existing_fps = _load_existing_keys(trades_path)
+    existing_ids, existing_fps, existing_open_qtys = _load_existing_keys(trades_path)
 
     try:
         items = _fetch_closed_pnl_paginated(exchange, symbol, since_ms)
@@ -291,10 +305,21 @@ def backfill_asset(
         if fp is not None and fp in existing_fps:
             skipped_dupe += 1
             continue
+        # Tertiary dedup: if a native open record (exit=None) has the same qty,
+        # this backfill record is the same trade — skip until bot reconciles it
+        try:
+            rec_qty = round(float(rec.get("qty", 0)), 4)
+        except (TypeError, ValueError):
+            rec_qty = None
+        if rec_qty is not None and rec_qty in existing_open_qtys:
+            skipped_dupe += 1
+            continue
         new_records.append(rec)
         existing_ids.add(rec["order_id"])
         if fp is not None:
             existing_fps.add(fp)
+        if rec_qty is not None:
+            existing_open_qtys.discard(rec_qty)  # consumed once trade is reconciled
 
     if new_records and not dry_run:
         _append_trades(trades_path, new_records)
