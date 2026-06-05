@@ -16,10 +16,12 @@ Read these files in order. Do not skip:
 
 Per CLAUDE.md: at start of every session read team memory; at end of every session update it.
 
-## Current live state (as of 2026-06-01 end of session 7)
+## Current live state (as of 2026-06-05 end of session 8)
 
-- **Bot status**: running on VPS as PID 1525537 (or whatever rotated to since). All 4 workers boot in live mode. Four structural guards active: `max_sl_pct: 5.0`, `min_tp_pct: 3.0`, `min_rr_ratio: 2.0`, **`min_profit_usd: 5.0`** added in session 6, plus `sl_buffer_pct: 0.3`. **Session 7 recovered from a 3-day downtime caused by a partial wave-4 deploy** (loop.py + execution.py copied; reflect.py not initially — bot crashed on next Hermes reflection, was pkilled, never restarted). See `session-7-restart.md` and memory.md session 7 entry for the full diagnosis.
-- **Master at commit `004d742` or later** on GitHub. Local + VPS in sync.
+- **Bot status**: running on VPS as PID 1606955 (or rotated). All 4 workers live. Four structural guards active: `max_sl_pct: 5.0`, `min_tp_pct: 3.0`, `min_rr_ratio: 2.0`, `min_profit_usd: 5.0`, plus `sl_buffer_pct: 0.3`. **Session 8 fixed reflection subprocess timeout** (loop.py `timeout=120` → `360`; was silently killing all Hermes calls for 3+ days). Also fixed daemonization: use `setsid` not `disown` for non-interactive SSH restarts (doctrine #17).
+- **All 4 assets currently have open positions** — held through the 8h downtime via exchange-side SL/TP.
+- **Reflections now unblocked**: TAO at 40 trades, next trigger at 45. BTC/ETH/SOL also overdue. First successful post-fix reflection pending.
+- **Master at commit pending Linh push** (`loop.py timeout=360` + `memory.md` + `next-session-prompt.md`).
 - **Dashboard works** at `localhost:8888` with $ figures alongside %, real P&L visible. Restart locally if not already running: `cd C:\Users\nghil\Projects\Hermes\Hermes-Trading; python dashboard.py`.
 - **Bot is +$44 net** across 45 closed trades (per Bybit CSV import done in session 6). ~50% win rate.
 - **TAO strategy** has Hermes mutation applied: `indicators[volume_spike].params.min_ratio = 2.0` (was 1.5). Reasoning preserved in `state/tao_usdt/hypotheses.jsonl` with full `decision_context`, `trade_range`, `llm_raw_output`, `applied_successfully: true`.
@@ -29,7 +31,8 @@ Per CLAUDE.md: at start of every session read team memory; at end of every sessi
 
 Open backlog (in rough priority order):
 
-- **Stability watch (24 h)** — bot was just restarted 2026-06-01 10:21 UTC. Confirm heartbeats refresh on every 15 m tick, no fresh tracebacks in `bot.log`, no rapid abandons. Pause Phase 2.2 until stable.
+- **Verify first post-fix reflection** — TAO hits 45 trades next; tail bot.log and confirm a Hermes reflection completes without timeout. Check `state/tao_usdt/hypotheses.jsonl` for a new entry. BTC/ETH/SOL are also overdue.
+- **Stability watch** — bot restarted 2026-06-05 23:40 UTC. Confirm heartbeats refresh every 15m, no new timeouts in log.
 - **Backfill intermediate downtime trades** — `tools/backfill_trades.py` to pull the 7-day Bybit closed-pnl window and recover any positions that closed during 2026-05-29 06:30 → 2026-06-01 10:21 (the reconcile only captured the most recent close per asset). One asset at a time, `--dry-run` first.
 - **Phase 2.8 (raised priority post-s7)** — TAO closed by SL_hit on its first trade under the v03 Hermes mutation. One sample is irrelevant, but the LLM's "80% of losers fired volume_spike" claim was already suspect (decision_context showed wins had HIGHER volume). Worth adding the sanity-check before the next 5-trade boundary triggers another Hermes call.
 - **Phase 2.7 — Confirm auto-reflection cadence is firing.** TAO will cross the next 5-trade boundary in the ~24h after session 6 end; verify Hermes is invoked automatically (not just manually) and produces sensible mutations. Check `state/<slug>/hypotheses.jsonl` tail counts grow.
@@ -76,6 +79,16 @@ Natural sequence: 2.7 (passive monitor) → 2.8 (Hermes reasoning quality) → 2
 12. **`.env` not auto-loaded by python scripts**. For any `tools/` or `reflect` invocation: `set -a && source .env && set +a` before running.
 
 13. **One deploy step per code block.** Never combine `diff + cp` or `pull + cp` in the same block — Linh may run only one part. Session 6 hit this twice (ModuleNotFoundError downstream).
+
+14. **`disown` doesn't work in non-interactive SSH one-liners.** Use `setsid .venv/bin/python -m hermes_trading.run >> bot.log 2>&1 &` for daemonizing via `ssh host "command"`. `nohup ... & disown` only works in interactive sessions.
+
+15. **The LLM call timeout and the subprocess timeout are independent.** `HERMES_LLM_TIMEOUT` in `.env` controls the HTTP request inside `reflect.py`. `subprocess.run(..., timeout=N)` in `loop.py` is a separate ceiling. Subprocess timeout must be > LLM timeout + startup overhead. Current: LLM=300s, subprocess=360s.
+
+## Operational state (post-session 7)
+
+- **Cron on VPS**: `0 */4 * * * /opt/trading/hermes_trading/tools/cron_backfill.sh` — every 4h, syncs Bybit closed trades into local `trades.jsonl` (1-day lookback per run, idempotent dedup by order_id). Logs to `/var/log/hermes-backfill.log`.
+- **Doctrine #16 (CRLF fix)**: every PowerShell `@'...'@ | ssh bash` block MUST end with a trailing `echo DONE` (or similar throwaway line) so the `\r` corruption lands on something tolerant. Confirmed twice live in s7.
+- **`state/<slug>/trades.jsonl` is currently tracked in git** — both local dashboard (via SSH fetch + cron backfill) and VPS (live trading writes) mutate it. Future merge-conflict source. Decision needed: add `state/*/trades.jsonl` to `.gitignore`, or accept the noise. **Recommend gitignore** — the VPS file is authoritative for live data, the cron keeps it fresh, local doesn't need git-tracked copies.
 
 ## Open issues for the watchlist (don't fix yet)
 

@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-06-02 (session 7 — emergency restart after 3-day downtime; wave-4 reflect.py was on disk but bot had been pkilled; 7-day backfill + 4h cron installed; partial-deploy detection lesson)
+2026-06-05 (session 8 — diagnosed all reflections failing since s7 restart: loop.py subprocess timeout=120 was killing reflect.py before Ollama could respond; fixed to 360; bot also needed setsid restart after failed pkill recovery)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -65,6 +65,7 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-05-28 (s6) | `tools/backfill_trades.py` (NEW) — direction-correct pnl_pct via closedPnl/cumEntryValue | Sidesteps the still-broken `(exit-entry)/entry` formula in `fetch_last_closed_pnl` (Phase 2.5 will fix that). Idempotent dedup by order_id. 6 unit tests pass. |
 | 2026-06-02 (s7) | Emergency restart after 3-day downtime; no code changes | reflect.py None-safety fix was already on disk (Linh manually cp'd during a partial wave-4 deploy attempt) but agent was pkilled and never relaunched. Restart-only recovery; 8-step deploy block per doctrine #5 worked clean. |
 | 2026-06-02 (s7) | Add post-deploy `diff -r hyphen underscore` as standard final check | Doctrine #14 — wave 4 partial cp was invisible for 6 h until reflection needed the missing file. A directory-level diff would have caught it pre-launch. |
+| 2026-06-05 (s8) | Raise reflection subprocess timeout 120s → 360s in loop.py | loop.py was killing the reflect.py subprocess before Ollama (configured at 300s) could respond. All reflections silently failed for 3+ days across all 4 assets. |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -118,6 +119,25 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **Tripwire to remember**: the pre-existing `hermes-dashboard` key entry in authorized_keys had no trailing newline. `echo >> file` concatenated the appended line onto the same line, corrupting both entries. Always rebuild authorized_keys via heredoc (`cat > file <<'EOF' ... EOF`) and verify with `wc -l` afterward.
 
 ## Session Log
+
+### 2026-06-05 (session 8) — Reflection subprocess timeout fix + bot restart
+**Symptom**: All reflections silently failing since session 7 restart. TAO had 4 hypotheses (last from 2026-05-29), BTC/ETH/SOL had 0 despite 16/20/22 trades respectively. Log showed `Reflection failed: ... timed out after 119.99... seconds` on every trigger.
+
+**Root cause**: `loop.py` line 627 had `subprocess.run(..., timeout=120)`. The `HERMES_LLM_TIMEOUT=300` fix from session 6 only raised the HTTP timeout inside `reflect.py` — the outer subprocess was still killed at 120s. Ollama IS healthy and responding; inference just takes >120s with 8K context.
+
+**Fix**: `sed -i 's/timeout=120,/timeout=360,/'` on VPS, same edit applied locally, commit pending push.
+
+**Secondary incident**: After patching, bot was restarted with `disown` via non-interactive SSH — `disown` doesn't work in non-interactive shells. Process appeared to start then vanished. Bot was down ~8 hours (23:30 Jun 4 → 23:40 Jun 5 UTC). All 4 positions were open during downtime, managed by exchange-side SL/TP only. Fixed by using `setsid` instead of `disown` for background daemonization via SSH.
+
+**State at end of session**:
+- Bot running as PID 1606955, all 4 workers live
+- All 4 assets have open positions (all ticking "position already open, skipping")
+- TAO at 40 trades — next reflection fires at 45; should now complete with 360s timeout
+- Commit `loop.py timeout=360` pending Linh push from PowerShell
+
+**Doctrine added**:
+17. **`disown` does not work in non-interactive SSH one-liners.** Use `setsid .venv/bin/python ... &` instead for daemonizing via `ssh host "command"`. `nohup ... & disown` only works in interactive sessions.
+18. **The LLM call timeout and the subprocess timeout are independent.** `HERMES_LLM_TIMEOUT` in `.env` controls the HTTP request inside `reflect.py`. `subprocess.run(..., timeout=N)` in `loop.py` is a separate ceiling. Both must be set consistently: subprocess timeout should be > LLM timeout + startup overhead (current: LLM=300, subprocess=360).
 
 ### 2026-06-02 (session 7) — Emergency restart after 3-day downtime + 7-day backfill + 4h cron
 **Symptom**: Cowork open, asked for `next-session-prompt.md` review. Diagnostic SSH probe revealed bot process gone, all 4 heartbeats stale at `2026-05-29T06:30:04 UTC` — **3 days down**. No process, no auto-reflection had fired, VPS uptime 69 days (no reboot), no OOM, disk fine.
