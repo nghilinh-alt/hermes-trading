@@ -16,7 +16,7 @@ Read these files in order. Do not skip:
 
 Per CLAUDE.md: at start of every session read team memory; at end of every session update it.
 
-## Current live state (as of 2026-06-05 end of session 8)
+## Current live state (as of 2026-06-06 session 8)
 
 - **Bot status**: running on VPS as PID 1606955 (or rotated). All 4 workers live. Four structural guards active: `max_sl_pct: 5.0`, `min_tp_pct: 3.0`, `min_rr_ratio: 2.0`, `min_profit_usd: 5.0`, plus `sl_buffer_pct: 0.3`. **Session 8 fixed reflection subprocess timeout** (loop.py `timeout=120` → `360`; was silently killing all Hermes calls for 3+ days). Also fixed daemonization: use `setsid` not `disown` for non-interactive SSH restarts (doctrine #17).
 - **All 4 assets currently have open positions** — held through the 8h downtime via exchange-side SL/TP.
@@ -31,8 +31,11 @@ Per CLAUDE.md: at start of every session read team memory; at end of every sessi
 
 Open backlog (in rough priority order):
 
-- **Verify first post-fix reflection** — TAO hits 45 trades next; tail bot.log and confirm a Hermes reflection completes without timeout. Check `state/tao_usdt/hypotheses.jsonl` for a new entry. BTC/ETH/SOL are also overdue.
-- **Stability watch** — bot restarted 2026-06-05 23:40 UTC. Confirm heartbeats refresh every 15m, no new timeouts in log.
+- **Run Phase 2.9 audit** — `cd /opt/trading/hermes_trading && set -a && source .env && set +a && python -m tools.audit_historical_pnl --weeks 52 --csv` to diagnose the -$18k cumRealisedPnl. Share output with Linh.
+- **BTC 0 reflections** — check `wc -l state/btc_usdt/trades.jsonl` on VPS. If < 5 closed trades, BTC just hasn't crossed the cadence threshold yet.
+- **ETH stability** — min_confidence raised to 0.4 this session. Monitor next ETH entries to confirm weaker signals are blocked.
+- **Trailing stop first trigger** — watch for `Trail SL` lines in bot.log when any open position hits 1R profit.
+- **Stability watch** — bot restarted 2026-06-06 22:02 UTC (PID 1640612). Use `nohup ... &` for restarts (not `setsid` — didn't work on this VPS).
 - **Backfill intermediate downtime trades** — `tools/backfill_trades.py` to pull the 7-day Bybit closed-pnl window and recover any positions that closed during 2026-05-29 06:30 → 2026-06-01 10:21 (the reconcile only captured the most recent close per asset). One asset at a time, `--dry-run` first.
 - **Phase 2.8 (raised priority post-s7)** — TAO closed by SL_hit on its first trade under the v03 Hermes mutation. One sample is irrelevant, but the LLM's "80% of losers fired volume_spike" claim was already suspect (decision_context showed wins had HIGHER volume). Worth adding the sanity-check before the next 5-trade boundary triggers another Hermes call.
 - **Phase 2.7 — Confirm auto-reflection cadence is firing.** TAO will cross the next 5-trade boundary in the ~24h after session 6 end; verify Hermes is invoked automatically (not just manually) and produces sensible mutations. Check `state/<slug>/hypotheses.jsonl` tail counts grow.

@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-06-05 (session 8 — diagnosed all reflections failing since s7 restart: loop.py subprocess timeout=120 was killing reflect.py before Ollama could respond; fixed to 360; bot also needed setsid restart after failed pkill recovery)
+2026-06-06 (session 8 continued — Phase 2.3/2.8/2.9/2.10 shipped; ETH min_confidence raised; trailing stops confirmed active; 3 new reflections post-timeout fix; TAO v04 Hermes mutation)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -66,6 +66,12 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-06-02 (s7) | Emergency restart after 3-day downtime; no code changes | reflect.py None-safety fix was already on disk (Linh manually cp'd during a partial wave-4 deploy attempt) but agent was pkilled and never relaunched. Restart-only recovery; 8-step deploy block per doctrine #5 worked clean. |
 | 2026-06-02 (s7) | Add post-deploy `diff -r hyphen underscore` as standard final check | Doctrine #14 — wave 4 partial cp was invisible for 6 h until reflection needed the missing file. A directory-level diff would have caught it pre-launch. |
 | 2026-06-05 (s8) | Raise reflection subprocess timeout 120s → 360s in loop.py | loop.py was killing the reflect.py subprocess before Ollama (configured at 300s) could respond. All reflections silently failed for 3+ days across all 4 assets. |
+| 2026-06-06 (s8) | ETH min_confidence raised 0.3 → 0.4 | ETH was entering counter-trend longs at bare-minimum 33% confidence (only RSI + VWAP firing). Indicator fire table showed both RSI and VWAP fire more on losing trades for ETH. |
+| 2026-06-06 (s8) | Phase 2.8: old_value sanity check in reflect.py | Before applying LLM mutation, verify stated old_value matches actual current value. TAO v04 Hermes mutation showed LLM misread delta sign but got correct direction by accident. Mismatch flagged as `old_value_mismatch: true` in hypothesis record. |
+| 2026-06-06 (s8) | Phase 2.9: tools/audit_historical_pnl.py | Paginated Bybit closed-PnL audit tool. Run on VPS to diagnose -$18k cumRealisedPnl. Supports --weeks, --assets, --csv. |
+| 2026-06-06 (s8) | Phase 2.10: version fields added to all 4 strategy.yamls | ETH v03, SOL v01, TAO v04 (matching VPS), BTC v02 already had it. |
+| 2026-06-06 (s8) | Phase 2.3: fetch_recent_closed_trades in execution.py | New function for dashboard to pull recent Bybit closed trades directly rather than relying solely on cron backfill. |
+| 2026-06-06 (s8) | trail_atr_mult: 2.0 added to all 4 strategy.yamls | Makes the ATR trail multiplier Hermes-tunable. Trail logic was already live in loop.py/execution.py. |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -119,6 +125,25 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **Tripwire to remember**: the pre-existing `hermes-dashboard` key entry in authorized_keys had no trailing newline. `echo >> file` concatenated the appended line onto the same line, corrupting both entries. Always rebuild authorized_keys via heredoc (`cat > file <<'EOF' ... EOF`) and verify with `wc -l` afterward.
 
 ## Session Log
+
+### 2026-06-06 (session 8 continued) — Phase 2.3/2.8/2.9/2.10 + ETH signal quality
+
+**Reflections confirmed working** after timeout fix: ETH (1 hypothesis, fallback), SOL (1), TAO (5, incl. new Hermes v03→v04). BTC still at 0 — likely insufficient closed trades.
+
+**TAO v04 Hermes mutation** (20:45 UTC Jun 5): `indicators[bb_squeeze].weight 1.0 → 1.25`. LLM reasoning was partially garbled (misread delta sign — said "negative delta" when delta was +0.154). Change direction was coincidentally correct (bb_squeeze fires on wins, not losses). `old_value_mismatch` guard now catches this going forward.
+
+**ETH analysis**: entering counter-trend longs at 33% confidence (RSI + VWAP only) with `support_1h4h: null` — using fallback SL. ETH fallback reflection tightened `stop_loss_pct 2.0 → 1.8` (triggered by 6.74% drawdown vs 5% goal). ETH NOT on circuit breaker (only 1 SL hit from Jun 3, outside 4h window).
+
+**Changes shipped this sub-session** (commit `1e6a981`):
+- `state/eth_usdt/strategy.yaml`: `min_confidence: 0.3 → 0.4` (blocks RSI+VWAP-only entries)
+- `hermes_trading/reflect.py`: old_value sanity check before `_set_nested`; `trail_atr_mult` added to tunable variable list
+- `hermes_trading/adapters/execution.py`: `fetch_recent_closed_trades(asset, limit=50)` (Phase 2.3)
+- `tools/audit_historical_pnl.py` (NEW): paginated Bybit PnL audit tool
+- All 4 `strategy.yaml`: `trail_atr_mult: 2.0` + version fields
+
+**Bot restarted** at 22:02 UTC Jun 6 (PID 1640612). All 4 workers live. Guards firing correctly.
+
+**Doctrine note**: `nohup ... &` (without `disown`) works for VPS restart via `ssh host "command"` on this VPS. `setsid` did NOT work. Use `nohup` going forward.
 
 ### 2026-06-05 (session 8) — Reflection subprocess timeout fix + bot restart
 **Symptom**: All reflections silently failing since session 7 restart. TAO had 4 hypotheses (last from 2026-05-29), BTC/ETH/SOL had 0 despite 16/20/22 trades respectively. Log showed `Reflection failed: ... timed out after 119.99... seconds` on every trigger.
