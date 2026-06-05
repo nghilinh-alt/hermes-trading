@@ -639,6 +639,23 @@ def run_hermes(state_dir: Path) -> None:
     decision_context = prompt_data.get("performance_summary", {})
     trade_range_info = _trade_range(trades)
 
+    # Phase 2.8 sanity check: verify LLM's stated old_value matches actual current value.
+    # Flags hallucinated values without blocking the mutation (the LLM's new_value may
+    # still be directionally correct even when its old_value is wrong).
+    actual_old = _get_nested(strategy, changed_var)
+    old_value_mismatch = False
+    if actual_old is not None and old_val is not None:
+        try:
+            if abs(float(actual_old) - float(old_val)) > 0.01:
+                old_value_mismatch = True
+                console.print(
+                    f"[yellow]Sanity: LLM stated old_value={old_val} but actual={actual_old} "
+                    f"for '{changed_var}'. Applying new_value anyway — flagging mismatch.[/yellow]"
+                )
+        except (TypeError, ValueError):
+            if str(actual_old) != str(old_val):
+                old_value_mismatch = True
+
     applied_ok = _set_nested(strategy, changed_var, new_val)
 
     # Build hypothesis upfront — recorded whether application succeeded or not,
@@ -658,6 +675,7 @@ def run_hermes(state_dir: Path) -> None:
         "decision_context":     decision_context,
         "trade_range":          trade_range_info,
         "applied_successfully": applied_ok,
+        "old_value_mismatch":   old_value_mismatch,
         "llm_raw_output":       output,   # literal string the LLM returned (pre-parse)
     }
 

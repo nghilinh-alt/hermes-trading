@@ -1,3 +1,4 @@
+version: '04'
 asset: TAO/USDT
 position_size_r: 0.8
 risk_per_trade: 0.1

@@ -384,6 +384,67 @@ def fetch_last_closed_pnl(asset: str) -> dict | None:
         return None
 
 
+# ── Recent closed trades (Phase 2.3) ─────────────────────────────────────────
+
+
+def fetch_recent_closed_trades(asset: str, limit: int = 50) -> list[dict]:
+    """
+    Fetch the most recent closed positions from Bybit and return as trade-like dicts.
+
+    Used by dashboard.py to merge live Bybit data with local trades.jsonl so the
+    history table is always complete even when the cron backfill hasn't run yet.
+
+    Each returned dict has:
+      order_id, asset, direction, entry_price, exit_price, pnl_pct,
+      closed_pnl_usdt, qty, ts (close time ISO string), strategy_version='bybit_live'.
+    Returns [] on error.
+    """
+    exchange     = _get_exchange()
+    symbol_clean = _to_perp_symbol(asset).replace("/", "").replace(":USDT", "")
+    try:
+        result = exchange.private_get_v5_position_closed_pnl({
+            "category": "linear",
+            "symbol":   symbol_clean,
+            "limit":    min(limit, 100),
+        })
+        items = result.get("result", {}).get("list", [])
+    except Exception:
+        return []
+
+    trades = []
+    for item in items:
+        closed_pnl  = float(item.get("closedPnl",     0) or 0)
+        cum_entry   = float(item.get("cumEntryValue",  0) or 0)
+        exit_price  = float(item.get("avgExitPrice",   0) or 0)
+        entry_price = float(item.get("avgEntryPrice",  0) or 0)
+        qty         = float(item.get("qty",            0) or 0)
+        side        = (item.get("side") or "").lower()
+        direction   = "long" if side == "buy" else ("short" if side == "sell" else None)
+        created_ms  = int(item.get("createdTime", 0) or 0)
+        ts = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc).isoformat() if created_ms else None
+
+        if cum_entry > 0:
+            pnl_pct = round(closed_pnl / cum_entry, 6)
+        elif entry_price > 0 and exit_price > 0 and direction:
+            move = (exit_price - entry_price) / entry_price
+            pnl_pct = round(move if direction == "long" else -move, 6)
+        else:
+            pnl_pct = 0.0
+
+        trades.append({
+            "order_id":         item.get("orderId"),
+            "asset":            asset,
+            "direction":        direction,
+            "entry_price":      round(entry_price, 4),
+            "exit_price":       round(exit_price,  4),
+            "pnl_pct":          pnl_pct,
+            "closed_pnl_usdt":  round(closed_pnl,  4),
+            "qty":              qty,
+            "ts":               ts,
+            "strategy_version": "bybit_live",
+        })
+    return trades
+
 # ── Trailing stop ─────────────────────────────────────────────────────────────
 
 

@@ -1,3 +1,4 @@
+version: '03'
 asset: ETH/USDT
 position_size_r: 0.8
 risk_per_trade: 0.1
@@ -14,7 +15,7 @@ max_trades_per_day: 10
 entry:
   direction: both
   min_indicators: 2
-  min_confidence: 0.3
+  min_confidence: 0.4
 indicators:
 - name: rsi
   required: false
