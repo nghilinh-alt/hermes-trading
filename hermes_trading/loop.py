@@ -624,7 +624,7 @@ def _maybe_trigger_reflection(goal: dict, trade_count: int, state_dir: Path) -> 
             subprocess.run(
                 [sys.executable, "-m", "hermes_trading.reflect", reflect_mode, "--state-dir", str(state_dir)],
                 check=True,
-                timeout=120,
+                timeout=360,
             )
         except Exception as e:
             console.print(f"[red]Reflection failed: {e}[/red]")
