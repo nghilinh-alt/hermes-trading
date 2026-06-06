@@ -84,7 +84,8 @@ def _entry_gates_snapshot(strategy: dict) -> dict:
         "min_rr_ratio":     float(strategy.get("min_rr_ratio", 2.0)),
         "min_profit_usd":   float(strategy.get("min_profit_usd", 5.0)),
         "risk_per_trade":   float(strategy.get("risk_per_trade", 0.10)),
-        "default_leverage": int(strategy.get("default_leverage", 5) or 5),
+        "min_leverage":     int(strategy.get("min_leverage", 3) or 3),
+        "max_leverage":     int(strategy.get("max_leverage", 10) or 10),
         "sl_buffer_pct":    float(strategy.get("sl_buffer_pct", 0.3)),
         "strategy_version": str(strategy.get("version", "01")),
     }

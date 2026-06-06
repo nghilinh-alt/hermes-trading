@@ -6,7 +6,6 @@ stop_loss_pct: 2.0
 max_sl_pct: 5.0
 take_profit_pct: 5.0
 trailing_stop_r: 0.5
-max_leverage: 5
 use_fbb: false
 risk_adjustment: fixed
 rsi_entry_overbought: 70
@@ -59,7 +58,8 @@ indicators:
   params:
     tolerance_pct: 1.0
 sl_buffer_pct: 0.3
-default_leverage: 5
+min_leverage: 3
+max_leverage: 10
 min_tp_pct: 3.0
 min_rr_ratio: 2.0
 min_profit_usd: 5.0

@@ -7,7 +7,7 @@ Only active when HERMES_TRADING_MODE=live AND HERMES_TRADING_I_ACCEPT_RISK=true.
 Safety constraints:
   - One position per asset at a time (checked via fetch_positions)
   - Position size = risk-based: (balance × risk_per_trade) / sl_dist_pct, capped at MAX_POSITION_USD
-  - Leverage = fixed default_leverage (strategy.default_leverage, default 5x)
+  - Leverage = confidence-scaled between min_leverage (3x) and max_leverage (10x)
   - SL = structural support/resistance ± sl_buffer_pct; fallback to fixed stop_loss_pct
   - TP = nearest structural resistance/support; fallback to 2:1 RR from SL
   - SL/TP always attached to every order
@@ -252,7 +252,7 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
     - SL/TP: structural swing levels with max_sl_pct / min_tp_pct / min_rr_ratio guards.
     - Position size: risk-based, capped at MAX_POSITION_USD.
     - $-floor: skipped if expected profit at TP < min_profit_usd (default $5).
-    - Leverage: fixed default_leverage. Idempotent against Bybit retCode 110043.
+    - Leverage: confidence-scaled between strategy.min_leverage and max_leverage. Idempotent against Bybit retCode 110043.
     - entry_detail: dict from loop._evaluate_entry with indicators_fired + confidence + direction.
 
     Returns a trade record dict matching loop.py schema.
@@ -275,9 +275,12 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
 
     sl_price, tp_price = _structural_sl_tp(price_data, direction, strategy)
 
-    leverage_val = strategy.get("default_leverage")
-    leverage = int(leverage_val or 5)
-    if exchange.id != "bybit" or leverage_val:
+    min_lev  = int(strategy.get("min_leverage") or 3)
+    max_lev  = int(strategy.get("max_leverage") or 10)
+    confidence = float(ed.get("confidence") or 0.0)
+    leverage = int(round(min_lev + (max_lev - min_lev) * confidence))
+    leverage = max(min_lev, min(max_lev, leverage))
+    if exchange.id == "bybit":
         try:
             exchange.set_leverage(leverage, symbol)
         except ccxt.AuthenticationError:
