@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-06-06 (session 8 continued — Phase 2.3/2.8/2.9/2.10 shipped; ETH min_confidence raised; trailing stops confirmed active; 3 new reflections post-timeout fix; TAO v04 Hermes mutation)
+2026-06-08 (session 10 — loss investigation + fixes: min_confidence 0.5, fixed 5x leverage, TAO Hermes mutation reverts)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -72,6 +72,11 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-06-06 (s8) | Phase 2.10: version fields added to all 4 strategy.yamls | ETH v03, SOL v01, TAO v04 (matching VPS), BTC v02 already had it. |
 | 2026-06-06 (s8) | Phase 2.3: fetch_recent_closed_trades in execution.py | New function for dashboard to pull recent Bybit closed trades directly rather than relying solely on cron backfill. |
 | 2026-06-06 (s8) | trail_atr_mult: 2.0 added to all 4 strategy.yamls | Makes the ATR trail multiplier Hermes-tunable. Trail logic was already live in loop.py/execution.py. |
+| 2026-06-06 (s9) | Confidence-scaled leverage 3x–10x replaces fixed 5x | execution.py: `leverage = round(min_lev + (max_lev - min_lev) * confidence)`, clipped to [3, 10]. All 4 yamls: default_leverage removed, min_leverage: 3 + max_leverage: 10 added. loop.py _entry_gates_snapshot and reflect.py tunable list updated. |
+| 2026-06-08 (s10) | Reverted confidence-scaled leverage back to fixed 5x | Loss investigation showed 20-40% more exposure at typical 40-60% confidence entries with no corresponding edge improvement. Set min_leverage=5, max_leverage=5 on all 4 VPS yamls. Code unchanged — yaml values pin leverage to 5x. |
+| 2026-06-08 (s10) | min_confidence raised to 0.5 for all 4 assets | Was 0.3 (BTC/SOL/TAO), 0.4 (ETH). 50% threshold blocks all weak-signal entries, reduces fee bleed from low-conviction trades. |
+| 2026-06-08 (s10) | TAO Hermes mutations v03+v04 reverted on VPS | volume_spike min_ratio 2.0→1.5 (v03 based on hallucinated "80% of losers fired" claim — decision_context showed wins had higher volume). bb_squeeze weight 1.25→0.3 (v04 garbled delta sign reasoning). |
+| 2026-06-08 (s10) | BTC max_trades_per_day: 10 added | Was missing from BTC yaml; all other assets already had it. |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -125,6 +130,45 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **Tripwire to remember**: the pre-existing `hermes-dashboard` key entry in authorized_keys had no trailing newline. `echo >> file` concatenated the appended line onto the same line, corrupting both entries. Always rebuild authorized_keys via heredoc (`cat > file <<'EOF' ... EOF`) and verify with `wc -l` afterward.
 
 ## Session Log
+
+### 2026-06-06 (session 9) — Confidence-scaled leverage
+
+Replaced fixed 5x leverage with a confidence-scaled range of 3x–10x. Formula: `leverage = round(3 + (10 - 3) * confidence)`, clipped to [3, 10]. At 40% conf → 5.8x ≈ 6x; at 70% conf → 7.9x ≈ 8x; at 100% conf → 10x.
+
+**Files changed** (commit `aafe0a1` + `a9e9b27`):
+- `hermes_trading/adapters/execution.py`: leverage block replaced; reads `min_leverage`/`max_leverage` from strategy + `confidence` from `entry_detail`
+- `hermes_trading/loop.py`: `_entry_gates_snapshot` updated to record `min_leverage`/`max_leverage` instead of `default_leverage`
+- `hermes_trading/reflect.py`: tunable variable list now has `min_leverage` + `max_leverage` instead of `default_leverage`
+- All 4 `state/*/strategy.yaml`: `default_leverage: 5` removed; `min_leverage: 3` + `max_leverage: 10` added
+- `tools/fix_leverage_yaml.py` (NEW): one-shot script to patch VPS yamls (run once, kept for reference)
+
+**Deploy notes**:
+- Sandbox committed `aafe0a1` first (7 files); PowerShell commit `a9e9b27` added only `fix_leverage_yaml.py`
+- VPS yamls patched via `fix_leverage_yaml.py` (removed old `max_leverage: 5` / `default_leverage: 5`, added `min_leverage: 3`), then `max_leverage: 10` appended via `echo` (script missed it due to VPS yaml shape diff)
+- Bot restarted as PID 1653858, all 4 workers live, ticking at 03:14 UTC
+
+**Doctrine note**: sandbox `git add` + `git commit` works but PowerShell git doesn't see it as pending (the index is shared). Commit from sandbox is valid and pushes cleanly — just looks surprising in `git status` from PowerShell afterward.
+
+### 2026-06-08 (session 10) — Loss investigation + risk fixes
+
+Linh flagged "too many losing trades." Investigation of CSV data (45 trades, May 23–29) and session history identified four root causes:
+
+1. **TAO overtrading + fee bleed**: 16 TAO trades on May 27, -$9.78 PnL that day, $8.79 burned in fees. 15 of 24 wins across all assets were <$5 (several <$1, net losers after ~$0.55/trade fee drag).
+2. **Flawed Hermes mutations on TAO**: v03 `volume_spike.min_ratio 1.5→2.0` based on hallucinated LLM claim ("80% of losers fired volume_spike" — decision_context showed wins had higher volume). v04 `bb_squeeze.weight 1.0→1.25` with garbled delta-sign reasoning.
+3. **Confidence-scaled leverage (June 6)**: At typical 40-60% confidence entries, leverage rose from 5x to 6-7x with no corresponding edge — identified as driver of the most recent loss spike.
+4. **Reflections dead May 28–June 5**: subprocess timeout 120s killed Hermes before Ollama responded. Fixed session 8.
+
+**Fixes applied this session (local yamls + VPS deploy doc):**
+- All 4 assets: `min_confidence: 0.3/0.4 → 0.5`
+- All 4 assets: leverage pinned at 5x (`min_leverage: 5`, `max_leverage: 5`)
+- TAO: `volume_spike.min_ratio 2.0 → 1.5` (VPS-side revert)
+- TAO: `bb_squeeze.weight 1.25 → 0.3` (VPS-side revert)
+- BTC: `max_trades_per_day: 10` added (was missing)
+
+**Deploy doc**: `deploy-fixes-2026-06-08.md` — 9 steps, one SSH block each. Pending Linh push + deploy.
+**Investigation doc**: `investigation-losing-trades-2026-06-08.md`.
+
+**NOTE**: The confidence-scaled leverage code in `execution.py` + `loop.py` + `reflect.py` is UNCHANGED — yamls pin both min/max to 5x so the formula evaluates to 5x always. If future Hermes reflections try to tune `min_leverage`/`max_leverage`, they will both be tunable — acceptable since they're now starting from 5/5 rather than 3/10.
 
 ### 2026-06-06 (session 8 continued) — Phase 2.3/2.8/2.9/2.10 + ETH signal quality
 

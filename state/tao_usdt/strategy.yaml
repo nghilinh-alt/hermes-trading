@@ -14,7 +14,7 @@ max_trades_per_day: 10
 entry:
   direction: both
   min_indicators: 2
-  min_confidence: 0.3
+  min_confidence: 0.5
 indicators:
 - name: rsi
   required: false
@@ -58,8 +58,8 @@ indicators:
   params:
     tolerance_pct: 1.0
 sl_buffer_pct: 0.3
-min_leverage: 3
-max_leverage: 10
+min_leverage: 5
+max_leverage: 5
 min_tp_pct: 3.0
 min_rr_ratio: 2.0
 min_profit_usd: 5.0
