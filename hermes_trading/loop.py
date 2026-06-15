@@ -142,6 +142,25 @@ def _count_closed_trades(state_dir: Path) -> int:
     return sum(1 for line in trades_file.read_text().splitlines() if line.strip())
 
 
+def _count_todays_trades(state_dir: Path) -> int:
+    """Count non-abandoned trades entered today (UTC) from trades.jsonl."""
+    trades_file = state_dir / "trades.jsonl"
+    if not trades_file.exists():
+        return 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    count = 0
+    for line in trades_file.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            t = json.loads(line)
+            if t.get("ts", "").startswith(today) and not t.get("abandoned"):
+                count += 1
+        except Exception:
+            pass
+    return count
+
+
 def _write_heartbeat(state_dir: Path, status: str, consecutive_failures: int) -> None:
     (state_dir / "heartbeat.json").write_text(json.dumps({
         "status": status,
@@ -769,6 +788,22 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
                 entry_result = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {})
 
             if entry_result["fires"]:
+                # Daily trade limit — enforce max_trades_per_day from strategy.yaml
+                max_daily = int(strategy.get("max_trades_per_day", 0))
+                if max_daily > 0:
+                    todays_count = _count_todays_trades(state_dir)
+                    if todays_count >= max_daily:
+                        console.print(
+                            f"[dim]{ts} {tag} Daily limit reached "
+                            f"({todays_count}/{max_daily}) — skipping entry[/dim]"
+                        )
+                        _write_heartbeat(state_dir, "ok", 0)
+                        consecutive_failures = 0
+                        elapsed      = time.monotonic() - tick_start
+                        tick_seconds = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
+                        await asyncio.sleep(max(0, tick_seconds - elapsed))
+                        continue
+
                 # Live mode: skip if already in a position for this asset
                 if os.getenv("HERMES_TRADING_MODE", "paper") == "live":
                     from hermes_trading.adapters import execution as execution_adapter

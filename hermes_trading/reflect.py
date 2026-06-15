@@ -285,7 +285,44 @@ def run_fallback(state_dir: Path) -> None:
     changed_var = old_val = new_val = None
     reasoning   = ""
 
-    if drawdown > max_dd_goal:
+    # Priority 0: directional triage — disable the losing direction before tweaking weights
+    closed = [t for t in trades if t.get("pnl_pct") is not None]
+    long_trades  = [t for t in closed if t.get("direction") == "long"]
+    short_trades = [t for t in closed if t.get("direction") == "short"]
+    if len(long_trades) >= 5 and len(short_trades) >= 5:
+        long_wr  = _win_rate(long_trades)
+        short_wr = _win_rate(short_trades)
+        current_dir = strategy.get("entry", {}).get("direction", "both")
+        if short_wr < 0.30 and long_wr > 0.45 and current_dir != "long":
+            old_val     = current_dir
+            new_val     = "long"
+            _set_nested(strategy, "entry.direction", new_val)
+            changed_var = "entry.direction"
+            reasoning   = (
+                f"Short win rate {short_wr:.0%} < 30% vs long win rate {long_wr:.0%} > 45% "
+                f"over last {len(closed)} closed trades. Disabling shorts until regime improves."
+            )
+        elif long_wr < 0.30 and short_wr > 0.45 and current_dir != "short":
+            old_val     = current_dir
+            new_val     = "short"
+            _set_nested(strategy, "entry.direction", new_val)
+            changed_var = "entry.direction"
+            reasoning   = (
+                f"Long win rate {long_wr:.0%} < 30% vs short win rate {short_wr:.0%} > 45% "
+                f"over last {len(closed)} closed trades. Disabling longs until regime improves."
+            )
+        elif current_dir in ("long", "short") and long_wr > 0.45 and short_wr > 0.45:
+            # Both directions recovered — re-enable both
+            old_val     = current_dir
+            new_val     = "both"
+            _set_nested(strategy, "entry.direction", new_val)
+            changed_var = "entry.direction"
+            reasoning   = (
+                f"Both directions recovering (long {long_wr:.0%}, short {short_wr:.0%}). "
+                f"Re-enabling direction:both."
+            )
+
+    if changed_var is None and drawdown > max_dd_goal:
         # Priority 1: tighten stop-loss to reduce tail exposure
         old_val = float(strategy.get("stop_loss_pct", 2.0))
         new_val = round(max(0.5, old_val - 0.2), 2)
@@ -295,7 +332,7 @@ def run_fallback(state_dir: Path) -> None:
             f"Drawdown {drawdown:.2%} exceeded goal {max_dd_goal:.2%}. "
             f"Tightening stop_loss_pct {old_val} → {new_val} to reduce tail exposure."
         )
-    elif realised < target_ret and win_r < 0.4:
+    elif changed_var is None and realised < target_ret and win_r < 0.4:
         # Priority 2: win rate too low — loosen RSI entry threshold
         old_val = (
             _get_nested(strategy, "indicators[rsi].params.threshold")
@@ -310,7 +347,7 @@ def run_fallback(state_dir: Path) -> None:
             f"Win rate {win_r:.0%} < 40% and return {realised:.2%} below target. "
             f"Loosening RSI threshold {old_val} → {new_val} to capture more entries."
         )
-    elif realised < target_ret:
+    elif changed_var is None and realised < target_ret:
         # Priority 3: return low but win rate ok — increase position size
         old_val = float(strategy.get("position_size_r", 0.5))
         new_val = round(min(1.0, old_val + 0.05), 2)
@@ -320,7 +357,7 @@ def run_fallback(state_dir: Path) -> None:
             f"Return {realised:.2%} below target {target_ret:.2%}, win rate ok ({win_r:.0%}). "
             f"Nudging position_size_r {old_val} → {new_val} to increase exposure."
         )
-    else:
+    elif changed_var is None:
         # On track — compound by nudging position size up, or boost MACD weight if maxed
         old_pos = float(strategy.get("position_size_r", 0.5))
         if old_pos < 1.0:
