@@ -287,8 +287,13 @@ def run_fallback(state_dir: Path) -> None:
 
     # Priority 0: directional triage — disable the losing direction before tweaking weights
     closed = [t for t in trades if t.get("pnl_pct") is not None]
-    long_trades  = [t for t in closed if t.get("direction") == "long"]
-    short_trades = [t for t in closed if t.get("direction") == "short"]
+    # Exclude backfilled trades: their direction labels were inverted at the source
+    # (Bybit closed-pnl returns the closing order side, not the opening side) and
+    # even after the backfill_trades.py fix, historical records already in the file
+    # carry the wrong label. Including them would corrupt per-direction win rates.
+    triage_trades = [t for t in closed if not t.get("backfilled")]
+    long_trades  = [t for t in triage_trades if t.get("direction") == "long"]
+    short_trades = [t for t in triage_trades if t.get("direction") == "short"]
     if len(long_trades) >= 5 and len(short_trades) >= 5:
         long_wr  = _win_rate(long_trades)
         short_wr = _win_rate(short_trades)

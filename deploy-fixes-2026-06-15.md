@@ -2,9 +2,10 @@
 _Rogue Night / Hermes-Trading. **Flagged for Linh's review before running.**_
 
 Changes being deployed:
-1. `reflect.py` — **Priority 0 directional triage**: if one direction has <30% win rate vs >45% on the other, `entry.direction` flips to the winning side. Re-enables `both` when both directions recover to >45%. All existing priorities (1–4) now guard on `changed_var is None` so they don't fire when triage already acted.
+1. `reflect.py` — **Priority 0 directional triage**: if one direction has <30% win rate vs >45% on the other, `entry.direction` flips to the winning side. Re-enables `both` when both directions recover to >45%. All existing priorities (1–4) now guard on `changed_var is None` so they don't fire when triage already acted. Backfilled trades excluded from triage win-rate computation.
 2. `loop.py` — **`max_trades_per_day` now enforced**: new `_count_todays_trades()` helper counts non-abandoned today-UTC trades and gates `_execute_trade` when the limit is reached. Previously the field existed in YAML but was ignored.
 3. `state/*/strategy.yaml` — **`min_indicators` raised 2 → 3** on all four assets.
+4. `tools/backfill_trades.py` — **Direction mapping fix**: Bybit's `closed-pnl` endpoint returns the closing order side, not the opening side. `buy` → `short`, `sell` → `long` (inverted from previous). All previously backfilled records in `trades.jsonl` carry the wrong direction label — they are excluded from triage in reflect.py so they cannot corrupt per-direction win rates.
 
 **One block per step. Do not combine.**
 **All SSH commands use `@'...'@ | ssh ... bash` to avoid PowerShell expanding `$(...)`.**
@@ -16,6 +17,7 @@ Changes being deployed:
 ```powershell
 cd C:\Users\nghil\Projects\Hermes\Hermes-Trading
 git add hermes_trading/reflect.py hermes_trading/loop.py
+git add tools/backfill_trades.py
 git add state/btc_usdt/strategy.yaml state/eth_usdt/strategy.yaml state/sol_usdt/strategy.yaml state/tao_usdt/strategy.yaml
 git add deploy-fixes-2026-06-15.md
 git status
@@ -44,14 +46,16 @@ Expected: fast-forward showing `hermes_trading/reflect.py`, `hermes_trading/loop
 @'
 cp /opt/trading/hermes-trading/hermes_trading/reflect.py /opt/trading/hermes_trading/hermes_trading/reflect.py
 cp /opt/trading/hermes-trading/hermes_trading/loop.py /opt/trading/hermes_trading/hermes_trading/loop.py
+cp /opt/trading/hermes-trading/tools/backfill_trades.py /opt/trading/hermes_trading/tools/backfill_trades.py
 cd /opt/trading/hermes_trading
 .venv/bin/python -m py_compile hermes_trading/reflect.py && echo "reflect.py OK"
 .venv/bin/python -m py_compile hermes_trading/loop.py && echo "loop.py OK"
+.venv/bin/python -m py_compile tools/backfill_trades.py && echo "backfill_trades.py OK"
 echo DONE
 '@ | ssh root@187.127.108.173 bash
 ```
 
-Expected: `reflect.py OK` then `loop.py OK`. If either errors, stop — do not proceed.
+Expected: three `OK` lines. If any errors, stop — do not proceed.
 
 ---
 

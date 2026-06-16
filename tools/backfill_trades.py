@@ -171,8 +171,12 @@ def _bybit_item_to_trade(item: dict, asset: str) -> dict | None:
     if not order_id:
         return None
 
+    # Bybit's closed-pnl endpoint returns the CLOSING order's side, not the opening side.
+    # A short position is closed by a buy-to-close  → side="Buy"  → position was short.
+    # A long position is closed by a sell-to-close  → side="Sell" → position was long.
+    # So the mapping is intentionally inverted vs what you'd expect.
     side = (item.get("side") or "").lower()
-    direction = "long" if side == "buy" else ("short" if side == "sell" else None)
+    direction = "short" if side == "buy" else ("long" if side == "sell" else None)
     if direction is None:
         return None
 
