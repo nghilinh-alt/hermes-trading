@@ -59,6 +59,15 @@ indicators:
   weight: 0.3
   params:
     tolerance_pct: 1.0
+- name: candle_pattern
+  required: false
+  weight: 0.5
+  params: {}
+- name: trend_line
+  required: false
+  weight: 0.4
+  params:
+    tolerance_pct: 1.0
 sl_buffer_pct: 0.3
 min_leverage: 3
 max_leverage: 8

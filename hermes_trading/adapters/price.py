@@ -68,6 +68,11 @@ async def fetch(asset: str = "BTC/USDT") -> dict:
     closes_4h  = [c[4] for c in ohlcv_4h]
     ema50_4h   = _ema(closes_4h, period=50)
 
+    # ── Candle patterns + trend lines (session 12, 2026-06-18) ───────────────
+    patterns = _candlestick_patterns(ohlcv)
+    flags    = _flag_pattern(ohlcv)
+    tl       = _trend_lines(ohlcv_1h, current_price)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "asset": asset,
@@ -104,6 +109,17 @@ async def fetch(asset: str = "BTC/USDT") -> dict:
         # Daily + 4h trend EMAs (session 11)
         "ema20_daily": ema20_daily,
         "ema50_4h":    ema50_4h,
+        # Candlestick patterns (primary timeframe)
+        "candle_bull": patterns["bull"],
+        "candle_bear": patterns["bear"],
+        # Flag patterns (primary timeframe)
+        "bull_flag":   flags["bull_flag"],
+        "bear_flag":   flags["bear_flag"],
+        # Trend lines (1h swing projection)
+        "tl_support":    tl["tl_support"],
+        "tl_resistance": tl["tl_resistance"],
+        "tl_bull":       tl["tl_bull"],
+        "tl_bear":       tl["tl_bear"],
     }
 
 
@@ -265,3 +281,118 @@ def _support_resistance(ohlcv_1h: list, ohlcv_4h: list, current_price: float, lo
     resistance = min((h for h in swing_highs if h > current_price), default=None)
     return (round(support, 4) if support else None,
             round(resistance, 4) if resistance else None)
+
+
+def _candlestick_patterns(ohlcv: list) -> dict:
+    """
+    Detect reversal patterns on the last 3 candles of the primary timeframe.
+    Priority: morning/evening star > engulfing > hammer/shooting_star.
+    Returns {"bull": name|None, "bear": name|None}.
+    """
+    if len(ohlcv) < 3:
+        return {"bull": None, "bear": None}
+
+    c1, c2, c3 = ohlcv[-3], ohlcv[-2], ohlcv[-1]
+
+    def body(c):       return abs(c[4] - c[1])
+    def upper_wick(c): return c[2] - max(c[1], c[4])
+    def lower_wick(c): return min(c[1], c[4]) - c[3]
+    def rng(c):        return c[2] - c[3]
+    def is_bull(c):    return c[4] > c[1]
+    def is_bear(c):    return c[4] < c[1]
+
+    bull = bear = None
+
+    # 3-candle: morning / evening star
+    c1_mid = (c1[1] + c1[4]) / 2
+    if is_bear(c1) and body(c2) < 0.35 * body(c1) and is_bull(c3) and c3[4] > c1_mid:
+        bull = "morning_star"
+    if is_bull(c1) and body(c2) < 0.35 * body(c1) and is_bear(c3) and c3[4] < c1_mid:
+        bear = "evening_star"
+
+    # 2-candle: engulfing
+    if bull is None and is_bear(c2) and is_bull(c3) and c3[1] <= c2[4] and c3[4] >= c2[1]:
+        bull = "bullish_engulfing"
+    if bear is None and is_bull(c2) and is_bear(c3) and c3[1] >= c2[4] and c3[4] <= c2[1]:
+        bear = "bearish_engulfing"
+
+    # 1-candle: hammer / shooting star
+    r3, b3, lw3, uw3 = rng(c3), body(c3), lower_wick(c3), upper_wick(c3)
+    if r3 > 0:
+        if bull is None and lw3 >= 2 * b3 and uw3 <= 0.3 * r3:
+            bull = "hammer"
+        if bear is None and uw3 >= 2 * b3 and lw3 <= 0.3 * r3:
+            bear = "shooting_star"
+
+    return {"bull": bull, "bear": bear}
+
+
+def _flag_pattern(ohlcv: list, pole_min_pct: float = 0.025, flag_max_pct: float = 0.015) -> dict:
+    """
+    Bull/bear flag: strong directional move over candles -15..-5 (pole),
+    followed by tight consolidation in candles -4..-1 (flag, range < 1.5%).
+    Returns {"bull_flag": bool, "bear_flag": bool}.
+    """
+    if len(ohlcv) < 20:
+        return {"bull_flag": False, "bear_flag": False}
+
+    flag_candles = ohlcv[-4:]
+    pole_candles = ohlcv[-15:-4]
+
+    flag_high  = max(c[2] for c in flag_candles)
+    flag_low   = min(c[3] for c in flag_candles)
+    flag_range = (flag_high - flag_low) / flag_low if flag_low > 0 else 1.0
+
+    if flag_range > flag_max_pct:
+        return {"bull_flag": False, "bear_flag": False}
+
+    pole_open  = pole_candles[0][1]
+    pole_close = pole_candles[-1][4]
+    pole_move  = (pole_close - pole_open) / pole_open if pole_open > 0 else 0.0
+
+    return {
+        "bull_flag": pole_move >= pole_min_pct,
+        "bear_flag": pole_move <= -pole_min_pct,
+    }
+
+
+def _trend_lines(ohlcv_1h: list, current_price: float, lookback: int = 3) -> dict:
+    """
+    Project trend lines through the last two swing highs and last two swing lows on 1h.
+    Fires (tl_bull/tl_bear) when price is within 1% of the projected level.
+    Returns tl_support, tl_resistance (float|None) and tl_bull, tl_bear (bool).
+    """
+    lk = lookback
+    if len(ohlcv_1h) < lk * 2 + 5:
+        return {"tl_support": None, "tl_resistance": None, "tl_bull": False, "tl_bear": False}
+
+    swing_lows  = []
+    swing_highs = []
+    for i in range(lk, len(ohlcv_1h) - lk):
+        lo = ohlcv_1h[i][3]
+        hi = ohlcv_1h[i][2]
+        if all(ohlcv_1h[j][3] >= lo for j in range(i - lk, i + lk + 1) if j != i):
+            swing_lows.append((i, lo))
+        if all(ohlcv_1h[j][2] <= hi for j in range(i - lk, i + lk + 1) if j != i):
+            swing_highs.append((i, hi))
+
+    n = len(ohlcv_1h)
+
+    def project(points):
+        if len(points) < 2:
+            return None
+        (i1, p1), (i2, p2) = points[-2], points[-1]
+        if i2 == i1:
+            return None
+        return round(p2 + (p2 - p1) / (i2 - i1) * (n - 1 - i2), 4)
+
+    tl_sup = project(swing_lows)
+    tl_res = project(swing_highs)
+    tol    = 0.01
+
+    return {
+        "tl_support":    tl_sup,
+        "tl_resistance": tl_res,
+        "tl_bull": tl_sup is not None and abs(current_price - tl_sup) / tl_sup <= tol,
+        "tl_bear": tl_res is not None and abs(current_price - tl_res) / tl_res <= tol,
+    }

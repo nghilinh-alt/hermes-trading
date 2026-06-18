@@ -289,6 +289,32 @@ def _check_indicator(name: str, params: dict, direction: str, price_data: dict) 
             f"|price-{level_name}|/{level_name}<={tolerance*100:.1f}%",
         )
 
+    if name == "candle_pattern":
+        if "candle_bull" not in price_data:
+            return _d(None, None, None, "candle_pattern (no data)")
+        if direction == "long":
+            pattern = price_data.get("candle_bull")
+            is_flag = price_data.get("bull_flag", False)
+        else:
+            pattern = price_data.get("candle_bear")
+            is_flag = price_data.get("bear_flag", False)
+        fires = pattern is not None or bool(is_flag)
+        value = pattern if pattern else ("bull_flag" if direction == "long" and is_flag else "bear_flag" if is_flag else None)
+        return _d(fires, value, None, f"candle_pattern={value}")
+
+    if name == "trend_line":
+        tolerance = float(params.get("tolerance_pct", 1.0)) / 100
+        if direction == "long":
+            level = price_data.get("tl_support")
+            label = "tl_support"
+        else:
+            level = price_data.get("tl_resistance")
+            label = "tl_resistance"
+        if level is None:
+            return _d(None, None, None, f"trend_line ({direction})")
+        fires = abs(price - level) / level <= tolerance
+        return _d(fires, price, level, f"|price-{label}|/{label}<={tolerance*100:.1f}%")
+
     return _d(None, None, None, f"unknown indicator: {name}")
 
 
