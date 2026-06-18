@@ -1,7 +1,7 @@
 version: '01'
 asset: XRP/USDT
 # Session 11 (2026-06-18): XRP replaces TAO. Paper mode for first 10 trades.
-trading_mode: paper
+trading_mode: live
 position_size_r: 0.8
 # 2% risk, 10% position, dynamic leverage
 risk_per_trade: 0.02
