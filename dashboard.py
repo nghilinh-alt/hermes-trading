@@ -23,12 +23,12 @@ AEST = ZoneInfo("Australia/Sydney")
 
 VPS        = "root@187.127.108.173"
 VPS_BASE   = "/opt/trading/hermes_trading"
-ASSETS     = ["btc_usdt", "eth_usdt", "sol_usdt", "tao_usdt"]
+ASSETS     = ["btc_usdt", "eth_usdt", "sol_usdt", "xrp_usdt"]
 ASSET_LABELS = {
     "btc_usdt": "BTC/USDT",
     "eth_usdt": "ETH/USDT",
     "sol_usdt": "SOL/USDT",
-    "tao_usdt": "TAO/USDT",
+    "xrp_usdt": "XRP/USDT",
 }
 LOCAL_STATE = Path("state")
 PORT        = 8888
@@ -178,6 +178,12 @@ def _fetch_data(last_known: dict | None = None) -> dict:
         )
         total_pnl = sum(float(t["pnl_pct"]) for t in closed) * 100 if closed else None
 
+        # Direction stats: long/short win rate from closed trades
+        long_closed  = [t for t in closed if t.get("direction") == "long"]
+        short_closed = [t for t in closed if t.get("direction") == "short"]
+        long_win_rate  = (sum(1 for t in long_closed  if float(t["pnl_pct"]) > 0) / len(long_closed))  if long_closed  else None
+        short_win_rate = (sum(1 for t in short_closed if float(t["pnl_pct"]) > 0) / len(short_closed)) if short_closed else None
+
         indicators = [
             {
                 "name":     i.get("name", ""),
@@ -188,22 +194,40 @@ def _fetch_data(last_known: dict | None = None) -> dict:
             for i in strategy.get("indicators", [])
         ]
 
+        # Today's USD PnL for this asset (for portfolio daily loss display)
+        today = datetime.now(AEST).strftime("%Y-%m-%d")
+        today_pnl_usd = sum(
+            float(t.get("closed_pnl_usdt", 0) or 0)
+            for t in all_trades
+            if t.get("ts", "")[:10] >= today and t.get("closed_pnl_usdt") is not None
+        )
+
         data["assets"][slug] = {
-            "label":        ASSET_LABELS[slug],
-            "trade_count":  len(all_trades),
-            "last_trade":   all_trades[-1] if all_trades else {},
-            "trades":       all_trades,
-            "strategy_ver": str(strategy.get("version", "—")),
-            "indicators":   indicators,
-            "stop_loss":    strategy.get("stop_loss_pct", "—"),
-            "pos_size":     strategy.get("position_size_r", "—"),
-            "min_conf":     strategy.get("entry", {}).get("min_confidence", "—"),
-            "hb_status":    heartbeat.get("status", "unknown"),
-            "hb_failures":  int(heartbeat.get("consecutive_failures", 0)),
-            "last_tick":    heartbeat.get("last_tick", "—"),
-            "hypotheses":   hypotheses,
-            "win_rate":     win_rate,
-            "total_pnl":    total_pnl,
+            "label":           ASSET_LABELS[slug],
+            "trade_count":     len(all_trades),
+            "last_trade":      all_trades[-1] if all_trades else {},
+            "trades":          all_trades,
+            "strategy_ver":    str(strategy.get("version", "—")),
+            "indicators":      indicators,
+            "stop_loss":       strategy.get("stop_loss_pct", "—"),
+            "pos_size":        strategy.get("position_size_r", "—"),
+            "position_pct":    float(strategy.get("position_pct", 0.10)),
+            "risk_per_trade":  float(strategy.get("risk_per_trade", 0.02)),
+            "min_conf":        strategy.get("entry", {}).get("min_confidence", "—"),
+            "hb_status":       heartbeat.get("status", "unknown"),
+            "hb_failures":     int(heartbeat.get("consecutive_failures", 0)),
+            "last_tick":       heartbeat.get("last_tick", "—"),
+            "hypotheses":      hypotheses,
+            "win_rate":        win_rate,
+            "total_pnl":       total_pnl,
+            "long_win_rate":   long_win_rate,
+            "short_win_rate":  short_win_rate,
+            "today_pnl_usd":   today_pnl_usd,
+            # Trend filter config
+            "trend_filter_enabled": bool((strategy.get("trend_filter") or {}).get("enabled", False)),
+            # XRP/paper mode
+            "trading_mode":    strategy.get("trading_mode", "live"),
+            "trading_enabled": strategy.get("trading_enabled", True),
         }
 
     # ── Log ───────────────────────────────────────────────────────────────────
@@ -271,6 +295,8 @@ def _render_html(d: dict) -> str:
             col = "color:#E24B4A"
         elif "reflect" in line.lower() or "Reflection" in line:
             col = "color:#EF9F27"
+        elif "Trend filter" in line or "Session filter" in line or "Portfolio daily" in line:
+            col = "color:#888"
         safe = line.replace("<", "&lt;").replace(">", "&gt;")
         return f"<div style='font-size:11px;line-height:1.9;{col}'>{safe}</div>"
 
@@ -365,6 +391,13 @@ def _render_html(d: dict) -> str:
         sign = "+" if v >= 0 else "-"
         return f"<span style='color:{col};font-size:13px;font-weight:500'>{sign}${abs(v):,.2f}</span>"
 
+    # Portfolio daily loss across all assets
+    portfolio_daily_usd = sum(
+        assets.get(s, {}).get("today_pnl_usd", 0.0) for s in ASSETS
+    )
+    portfolio_daily_col = _pnl_col(portfolio_daily_usd)
+    portfolio_daily_str = f"{'+' if portfolio_daily_usd >= 0 else '-'}${abs(portfolio_daily_usd):,.2f}"
+
     pnl_summary = f"""
 <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1.5rem">
   <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
@@ -383,17 +416,19 @@ def _render_html(d: dict) -> str:
     <div style="margin-top:2px">{_usd_chip(agg_usd["month"])}</div>
   </div>
   <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">all-time P&L</div>
-    <div style="font-size:20px;font-weight:500">{_pnl_chip(agg["all"])}</div>
-    <div style="margin-top:2px">{_usd_chip(agg_usd["all"])}</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">portfolio today</div>
+    <div style="font-size:20px;font-weight:500;color:{portfolio_daily_col}">{portfolio_daily_str}</div>
+    <div style="font-size:10px;color:var(--muted);margin-top:3px">cap: -$40 · all-time {_usd_chip(agg_usd["all"])}</div>
   </div>
 </div>"""
 
     # asset cards
-    def _status_dot(status: str, failures: int) -> str:
+    def _status_dot(status: str, failures: int, trading_enabled: bool = True) -> str:
+        if not trading_enabled:
+            return "<span style='color:#888' title='trading disabled'>&#9679;</span>"
         if failures >= 3:
             return "<span style='color:#E24B4A' title='circuit breaker tripped'>&#9679;</span>"
-        cols = {"ok": "#1D9E75", "error": "#E24B4A"}
+        cols = {"ok": "#1D9E75", "error": "#E24B4A", "disabled": "#888"}
         col = cols.get(status, "#888")
         return f"<span style='color:{col}'>&#9679;</span>"
 
@@ -445,11 +480,20 @@ def _render_html(d: dict) -> str:
         win_r  = a.get("win_rate")
         tot    = a.get("total_pnl")
         cur    = a.get("current_price")
+        lwr    = a.get("long_win_rate")
+        swr    = a.get("short_win_rate")
+        tf_on  = a.get("trend_filter_enabled", False)
+        t_mode = a.get("trading_mode", "live")
+        t_en   = a.get("trading_enabled", True)
+        pos_pct = a.get("position_pct", 0.10)
+        risk_pt = a.get("risk_per_trade", 0.02)
 
         cur_str  = f"${float(cur):,.2f}" if cur else "—"
         win_str  = f"{win_r * 100:.0f}%" if win_r is not None else "—"
         tot_col  = _pnl_col(tot) if tot is not None else "inherit"
         tot_str  = (f"{'+' if tot >= 0 else ''}{tot:.2f}%") if tot is not None else "—"
+        lwr_str  = f"{lwr*100:.0f}%" if lwr is not None else "—"
+        swr_str  = f"{swr*100:.0f}%" if swr is not None else "—"
 
         last_pnl = t.get("pnl_pct")
         if last_pnl is not None:
@@ -469,13 +513,23 @@ def _render_html(d: dict) -> str:
 
         ind_bars = _indicator_bars(a.get("indicators", []))
 
+        # Mode / status badges
+        badges = ""
+        if not t_en:
+            badges += "<span style='font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(136,136,136,0.15);color:#888;margin-left:4px'>PAUSED</span>"
+        elif t_mode == "paper":
+            badges += "<span style='font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(239,159,39,0.15);color:#EF9F27;margin-left:4px'>PAPER</span>"
+        if tf_on:
+            badges += "<span style='font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(29,158,117,0.12);color:#1D9E75;margin-left:4px' title='Daily + 4h trend filter active'>TF ✓</span>"
+
         asset_cards += f"""
         <div style="background:var(--bg);border:0.5px solid var(--border);border-radius:12px;padding:1rem">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-            <div style="display:flex;align-items:center;gap:6px">
-              {_status_dot(status, fails)}
+            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
+              {_status_dot(status, fails, t_en)}
               <span style="font-size:13px;font-weight:500">{a.get("label", slug)}</span>
               {_position_badge(t, cur)}
+              {badges}
             </div>
             <span style="font-size:11px;color:var(--muted)">v{ver}</span>
           </div>
@@ -486,8 +540,12 @@ def _render_html(d: dict) -> str:
             <span style="font-size:12px;font-weight:500;text-align:right">{count}</span>
             <span style="font-size:11px;color:var(--muted)">win rate</span>
             <span style="font-size:12px;font-weight:500;text-align:right">{win_str}</span>
+            <span style="font-size:11px;color:var(--muted)">long / short</span>
+            <span style="font-size:12px;font-weight:500;text-align:right">{lwr_str} / {swr_str}</span>
             <span style="font-size:11px;color:var(--muted)">total P&L</span>
             <span style="font-size:12px;font-weight:500;text-align:right;color:{tot_col}">{tot_str}</span>
+            <span style="font-size:11px;color:var(--muted)">sizing</span>
+            <span style="font-size:12px;font-weight:500;text-align:right">{int(pos_pct*100)}% bal · {int(risk_pt*100)}% risk</span>
             <span style="font-size:11px;color:var(--muted)">last entry</span>
             <span style="font-size:12px;text-align:right">{ep_str}</span>
             <span style="font-size:11px;color:var(--muted)">last P&L</span>
@@ -602,6 +660,8 @@ def _render_html(d: dict) -> str:
         ("vwap",          "VWAP"),
         ("volume_ratio",  "VolR"),
         ("ema_50",        "EMA50"),
+        ("ema20_daily",   "EMA20d"),
+        ("ema50_4h",      "EMA50_4h"),
         ("bb_upper",      "BB↑"),
         ("bb_lower",      "BB↓"),
         ("atr_14",        "ATR"),
@@ -788,8 +848,9 @@ def _render_html(d: dict) -> str:
     # Filter log to only meaningful events — skip constant "No entry" noise
     _KEEP_PATTERNS = ("Trade #", "reflect", "Reflection", "error", "Error",
                       "circuit breaker", "Reconcil", "Abandoned", "Booting",
-                      "ParserError", "Traceback", "Exception", "CRITICAL")
-    _SKIP_PATTERNS = ("No entry",)
+                      "ParserError", "Traceback", "Exception", "CRITICAL",
+                      "Portfolio daily loss", "Trend filter", "Session filter")
+    _SKIP_PATTERNS = ("No entry", "Trend filter: ambiguous", "Session filter: 0")
 
     def _is_meaningful(line: str) -> bool:
         if any(p in line for p in _SKIP_PATTERNS):
@@ -856,7 +917,7 @@ def _render_html(d: dict) -> str:
 <h2>Live Positions <span style="font-weight:400">({len(open_trades)} open)</span></h2>
 {positions_html}
 
-<h2>Running P&L</h2>
+<h2>Running P&L <span style="font-weight:400;font-size:11px;color:var(--muted)">· portfolio daily cap: -$40</span></h2>
 {pnl_summary}
 
 <h2>Trade history <span style="font-weight:400">(last 50 · newest first · abandoned excluded)</span></h2>

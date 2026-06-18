@@ -1,7 +1,9 @@
-version: '03'
+version: '04'
 asset: ETH/USDT
 position_size_r: 0.8
-risk_per_trade: 0.1
+# Session 11 (2026-06-18): 2% risk, 10% position, dynamic leverage
+risk_per_trade: 0.02
+position_pct: 0.10
 stop_loss_pct: 2.0
 max_sl_pct: 5.0
 take_profit_pct: 5.0
@@ -64,6 +66,16 @@ min_tp_pct: 3.0
 min_rr_ratio: 2.0
 min_profit_usd: 5.0
 trail_atr_mult: 2.0
+# Session 11: daily + 4h trend filter
+trend_filter:
+  enabled: true
+  daily_ema_period: 20
+  ema_4h_period: 50
+  ambiguous_band_pct: 0.3
+# Session 11: session filter (skip Asian low-volume session)
+session_blocked_end_utc: 7
+# Session 11: portfolio daily loss cap (USD)
+max_portfolio_daily_loss_usd: 40.0
 leverage_curve:
 - - 0.5
   - 4

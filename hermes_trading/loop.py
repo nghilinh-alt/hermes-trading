@@ -1,4 +1,4 @@
-﻿"""
+"""
 loop.py — the 24/7 async trading loop.
 
 Every minute:
@@ -60,6 +60,7 @@ _INDICATOR_SNAPSHOT_KEYS: list[str] = [
     "ob_bull_low",  "ob_bull_high",
     "ob_bear_low",  "ob_bear_high",
     "support_1h4h", "resistance_1h4h",
+    "ema20_daily", "ema50_4h",
 ]
 
 
@@ -75,6 +76,7 @@ def _entry_gates_snapshot(strategy: dict) -> dict:
     the bot decided to take the trade.
     """
     entry = strategy.get("entry", {}) or {}
+    tf    = strategy.get("trend_filter", {}) or {}
     return {
         "min_confidence":   float(entry.get("min_confidence", 0.0)),
         "min_indicators":   int(entry.get("min_indicators", 1)),
@@ -83,11 +85,14 @@ def _entry_gates_snapshot(strategy: dict) -> dict:
         "min_tp_pct":       float(strategy.get("min_tp_pct", 3.0)),
         "min_rr_ratio":     float(strategy.get("min_rr_ratio", 2.0)),
         "min_profit_usd":   float(strategy.get("min_profit_usd", 5.0)),
-        "risk_per_trade":   float(strategy.get("risk_per_trade", 0.10)),
+        "risk_per_trade":   float(strategy.get("risk_per_trade", 0.02)),
+        "position_pct":     float(strategy.get("position_pct", 0.10)),
         "min_leverage":     int(strategy.get("min_leverage", 3) or 3),
-        "max_leverage":     int(strategy.get("max_leverage", 10) or 10),
+        "max_leverage":     int(strategy.get("max_leverage", 8) or 8),
         "sl_buffer_pct":    float(strategy.get("sl_buffer_pct", 0.3)),
         "strategy_version": str(strategy.get("version", "01")),
+        "trend_filter_enabled": bool(tf.get("enabled", False)),
+        "session_blocked_end_utc": int(strategy.get("session_blocked_end_utc", 7)),
     }
 
 
@@ -287,6 +292,73 @@ def _check_indicator(name: str, params: dict, direction: str, price_data: dict) 
     return _d(None, None, None, f"unknown indicator: {name}")
 
 
+def _get_trend_direction(price_data: dict, strategy: dict) -> str | None:
+    """
+    Determine which trade direction is allowed based on daily + 4h trend alignment.
+
+    Returns:
+      'long'  — daily EMA(20) bullish AND 4h EMA(50) bullish
+      'short' — daily EMA(20) bearish AND 4h EMA(50) bearish
+      None    — daily/4h disagree or price in ambiguous band → skip entry this tick
+      'any'   — trend_filter.enabled is False → no restriction, all directions allowed
+
+    Config (strategy.trend_filter):
+      enabled:            bool  (default False)
+      ambiguous_band_pct: float (default 0.3 — price within 0.3% of daily EMA = ambiguous)
+    """
+    tf = strategy.get("trend_filter", {}) or {}
+    if not tf.get("enabled", False):
+        return "any"
+
+    price       = float(price_data.get("price", 0))
+    ema20_daily = price_data.get("ema20_daily")
+    ema50_4h    = price_data.get("ema50_4h")
+    band        = float(tf.get("ambiguous_band_pct", 0.3)) / 100
+
+    if not ema20_daily or price <= 0:
+        return "any"   # no daily data yet — allow entries
+
+    # Daily bias
+    if price > ema20_daily * (1 + band):
+        daily_bias = "long"
+    elif price < ema20_daily * (1 - band):
+        daily_bias = "short"
+    else:
+        return None   # price too close to daily EMA — ambiguous
+
+    # 4h confirmation (if available)
+    if ema50_4h is None:
+        return daily_bias   # no 4h data — use daily alone
+
+    if daily_bias == "long" and price > ema50_4h:
+        return "long"
+    elif daily_bias == "short" and price < ema50_4h:
+        return "short"
+    else:
+        return None   # daily and 4h disagree — skip
+
+
+def _portfolio_daily_loss_usd(base_dir: Path) -> float:
+    """
+    Sum closed_pnl_usdt across all asset state dirs for the current UTC day.
+    Returns a negative number if net loss, zero or positive if net gain.
+    Used to enforce the portfolio daily loss cap.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total = 0.0
+    for trades_file in base_dir.glob("*/trades.jsonl"):
+        try:
+            for line in trades_file.read_text().splitlines():
+                if not line.strip():
+                    continue
+                t = json.loads(line)
+                if t.get("ts", "").startswith(today) and t.get("closed_pnl_usdt") is not None:
+                    total += float(t["closed_pnl_usdt"])
+        except Exception:
+            pass
+    return total
+
+
 def _evaluate_entry(
     strategy: dict,
     price_data: dict,
@@ -447,7 +519,7 @@ def _simulate_paper_trade(strategy: dict, price_data: dict, entry_detail: dict) 
 
     entry_price     = float(price_data.get("price", 0))
     position_size_r = float(strategy.get("position_size_r", 0.5))
-    risk_per_trade  = float(strategy.get("risk_per_trade", 0.10))
+    risk_per_trade  = float(strategy.get("risk_per_trade", 0.02))
     # Prefer the resolved direction from evaluation (supports direction:both)
     direction = entry_detail.get("direction") or strategy.get("entry", {}).get("direction", "long")
 
@@ -730,6 +802,15 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
             resolved_goal = goal if goal is not None else _load_yaml(_BASE_STATE_DIR / "goal.yaml")
             strategy = _load_yaml(strategy_file)
 
+            # Skip entirely if this asset has trading disabled
+            if not strategy.get("trading_enabled", True):
+                console.print(f"[dim]{tag} trading_enabled=false — skipping[/dim]")
+                _write_heartbeat(state_dir, "disabled", 0)
+                elapsed      = time.monotonic() - tick_start
+                tick_seconds = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
+                await asyncio.sleep(max(0, tick_seconds - elapsed))
+                continue
+
             results = await asyncio.gather(
                 _fetch_with_retry(price_adapter, asset, "price"),
                 _fetch_with_retry(onchain_adapter, asset, "onchain"),
@@ -763,9 +844,64 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
 
             ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-            # Evaluate entry — support direction:both (long and short simultaneously)
+            # ── SESSION FILTER: skip 00:00–07:00 UTC (Asian low-volume session) ──────
+            hour_utc = datetime.now(timezone.utc).hour
+            session_blocked_end = int(strategy.get("session_blocked_end_utc", 7))
+            if hour_utc < session_blocked_end:
+                console.print(
+                    f"[dim]{ts} {tag} Session filter: {hour_utc:02d}:xx UTC < "
+                    f"{session_blocked_end:02d}:00 — skipping[/dim]"
+                )
+                _write_heartbeat(state_dir, "ok", 0)
+                consecutive_failures = 0
+                elapsed      = time.monotonic() - tick_start
+                tick_seconds = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
+                await asyncio.sleep(max(0, tick_seconds - elapsed))
+                continue
+
+            # ── PORTFOLIO DAILY LOSS CAP ─────────────────────────────────────────────
+            max_portfolio_loss = float(strategy.get("max_portfolio_daily_loss_usd", 40.0))
+            if max_portfolio_loss > 0:
+                portfolio_loss_today = _portfolio_daily_loss_usd(state_dir.parent)
+                if portfolio_loss_today < -max_portfolio_loss:
+                    console.print(
+                        f"[bold yellow]{ts} {tag} Portfolio daily loss cap hit "
+                        f"(${portfolio_loss_today:.2f} < -${max_portfolio_loss:.0f}) "
+                        f"— halting new entries for today[/bold yellow]"
+                    )
+                    _write_heartbeat(state_dir, "ok", 0)
+                    consecutive_failures = 0
+                    elapsed      = time.monotonic() - tick_start
+                    tick_seconds = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
+                    await asyncio.sleep(max(0, tick_seconds - elapsed))
+                    continue
+
+            # ── TREND FILTER: daily EMA(20) + 4h EMA(50) direction gate ─────────────
+            trend_allowed = _get_trend_direction(price_data, strategy)
+            if trend_allowed is None:
+                ema20 = price_data.get("ema20_daily", "?")
+                ema4h = price_data.get("ema50_4h", "?")
+                console.print(
+                    f"[dim]{ts} {tag} Trend filter: ambiguous or daily/4h mismatch "
+                    f"(price={price_data.get('price')}, ema20d={ema20}, ema50_4h={ema4h}) — skipping[/dim]"
+                )
+                _write_heartbeat(state_dir, "ok", 0)
+                consecutive_failures = 0
+                elapsed      = time.monotonic() - tick_start
+                tick_seconds = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
+                await asyncio.sleep(max(0, tick_seconds - elapsed))
+                continue
+
+            # Evaluate entry — direction constrained by trend filter when active
             strategy_direction = strategy.get("entry", {}).get("direction", "long")
-            if strategy_direction == "both":
+
+            if trend_allowed != "any":
+                # Trend filter active: evaluate only the allowed direction
+                entry_result = _evaluate_entry(
+                    strategy, price_data, macro_data or {}, news_data or {},
+                    force_direction=trend_allowed,
+                )
+            elif strategy_direction == "both":
                 long_result  = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}, force_direction="long")
                 short_result = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}, force_direction="short")
                 if long_result["fires"] and short_result["fires"]:
@@ -866,4 +1002,3 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
         tick_seconds   = _timeframe_to_seconds(os.getenv("HERMES_TIMEFRAME", "15m"))
         sleep_for      = max(0, tick_seconds - elapsed)
         await asyncio.sleep(sleep_for)
-               

@@ -29,10 +29,11 @@ async def fetch(asset: str = "BTC/USDT") -> dict:
 
     try:
         timeframe = os.getenv("HERMES_TIMEFRAME", "5m")
-        ohlcv, ohlcv_1h, ohlcv_4h, ticker = await asyncio.gather(
+        ohlcv, ohlcv_1h, ohlcv_4h, ohlcv_daily, ticker = await asyncio.gather(
             exchange.fetch_ohlcv(asset, timeframe=timeframe, limit=100),
             exchange.fetch_ohlcv(asset, timeframe="1h", limit=100),
             exchange.fetch_ohlcv(asset, timeframe="4h", limit=100),
+            exchange.fetch_ohlcv(asset, timeframe="1d", limit=50),
             exchange.fetch_ticker(asset),
         )
     finally:
@@ -59,6 +60,13 @@ async def fetch(asset: str = "BTC/USDT") -> dict:
     fvg_bull, fvg_bear = _fair_value_gaps(ohlcv_1h)
     ob_bull, ob_bear   = _order_blocks(ohlcv_1h)
     support, resistance = _support_resistance(ohlcv_1h, ohlcv_4h, current_price)
+
+    # ── Daily + 4h trend indicators (session 11, 2026-06-18) ─────────────────
+    daily_closes = [c[4] for c in ohlcv_daily]
+    ema20_daily  = _ema(daily_closes, period=20)
+
+    closes_4h  = [c[4] for c in ohlcv_4h]
+    ema50_4h   = _ema(closes_4h, period=50)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -93,6 +101,9 @@ async def fetch(asset: str = "BTC/USDT") -> dict:
         "ob_bear_high":    ob_bear[1] if ob_bear else None,
         "support_1h4h":    support,
         "resistance_1h4h": resistance,
+        # Daily + 4h trend EMAs (session 11)
+        "ema20_daily": ema20_daily,
+        "ema50_4h":    ema50_4h,
     }
 
 

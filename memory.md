@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-06-08 (session 10 — loss investigation + fixes: min_confidence 0.5, fixed 5x leverage, TAO Hermes mutation reverts)
+2026-06-18 (session 11 — full trade analysis on 155-trade dataset May 21–Jun 18; overhaul implemented locally; all 4 Python files + 5 YAMLs + deploy doc written; **pending VPS deploy by Linh**)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -16,7 +16,7 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **Repo**: https://github.com/nghilinh-alt/hermes-trading.git (master branch)
 - **Local path**: `C:\Users\nghil\Projects\Hermes\Hermes-Trading`
 - **Trading mode**: Live on Bybit, HMAC key auth
-- **Assets**: BTC/USDT, ETH/USDT, SOL/USDT, TAO/USDT
+- **Assets**: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT (paper mode) — TAO disabled (trading_enabled: false)
 - **VPS Python**: uses `venv/` — always `source venv/bin/activate`
 
 ## Architecture Summary
@@ -28,14 +28,15 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - `dashboard.py` — local Windows dashboard at localhost:8888, SSH-fetches VPS state
 
 ## Active State
-- Strategy version: v03 (all 4 assets, post-Ollama first reflection)
-- Trading mode: live
+- Strategy version: BTC v03, ETH v04, SOL v02, TAO v05 (disabled), XRP v01 (paper)
+- Trading mode: live (BTC/ETH/SOL), paper (XRP), disabled (TAO)
 - Reflection cadence: every 5 closed trades (--hermes mode for BTC, --fallback for others until trades accumulate)
-- Per-asset state dirs: `state/btc_usdt/`, `state/eth_usdt/`, `state/sol_usdt/`, `state/tao_usdt/`
+- Per-asset state dirs: `state/btc_usdt/`, `state/eth_usdt/`, `state/sol_usdt/`, `state/xrp_usdt/`, `state/tao_usdt/`
 - Each asset dir contains: `strategy.yaml`, `trades.jsonl`, `hypotheses.jsonl`, `heartbeat.json`, `history/`, `memory.md`
 - Ollama running on VPS: `qwen2.5:3b` @ `http://localhost:11434` (CPU-only, ~15-20s inference)
 - VPS running code: `/opt/trading/hermes_trading/hermes_trading/` (nested — package inside package dir)
 - Git repo on VPS: `/opt/trading/hermes-trading/` — pull here, then copy to running location
+- **Session 11 local changes PENDING VPS deploy** — see `deploy-overhaul-2026-06-18.md`
 
 ## Key Decisions
 | Date       | Decision | Rationale |
@@ -73,10 +74,20 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-06-06 (s8) | Phase 2.3: fetch_recent_closed_trades in execution.py | New function for dashboard to pull recent Bybit closed trades directly rather than relying solely on cron backfill. |
 | 2026-06-06 (s8) | trail_atr_mult: 2.0 added to all 4 strategy.yamls | Makes the ATR trail multiplier Hermes-tunable. Trail logic was already live in loop.py/execution.py. |
 | 2026-06-06 (s9) | Confidence-scaled leverage 3x–10x replaces fixed 5x | execution.py: `leverage = round(min_lev + (max_lev - min_lev) * confidence)`, clipped to [3, 10]. All 4 yamls: default_leverage removed, min_leverage: 3 + max_leverage: 10 added. loop.py _entry_gates_snapshot and reflect.py tunable list updated. |
-| 2026-06-08 (s10) | Reverted confidence-scaled leverage back to fixed 5x | Loss investigation showed 20-40% more exposure at typical 40-60% confidence entries with no corresponding edge improvement. Set min_leverage=5, max_leverage=5 on all 4 VPS yamls. Code unchanged — yaml values pin leverage to 5x. |
+| 2026-06-08 (s10) | Leverage piecewise curve: 50%→4x, 60%→5x, 75%→7x, 100%→8x | Replaced linear 3x–10x formula. New `_confidence_to_leverage()` in execution.py uses piecewise linear interpolation over `leverage_curve` breakpoints in strategy yaml. Falls back to min/max linear if no curve. |
+| 2026-06-08 (s10) | max_trades_per_day reduced to 3 for all assets | Was 10 (or missing on BTC). Caps daily churn per token. |
 | 2026-06-08 (s10) | min_confidence raised to 0.5 for all 4 assets | Was 0.3 (BTC/SOL/TAO), 0.4 (ETH). 50% threshold blocks all weak-signal entries, reduces fee bleed from low-conviction trades. |
 | 2026-06-08 (s10) | TAO Hermes mutations v03+v04 reverted on VPS | volume_spike min_ratio 2.0→1.5 (v03 based on hallucinated "80% of losers fired" claim — decision_context showed wins had higher volume). bb_squeeze weight 1.25→0.3 (v04 garbled delta sign reasoning). |
 | 2026-06-08 (s10) | BTC max_trades_per_day: 10 added | Was missing from BTC yaml; all other assets already had it. |
+| 2026-06-18 (s11) | Root cause of June losses: bot traded against daily trend | 155-trade dataset analysis. ETH fell $2117→$1595; bot kept longing. TAO fell $282→$192; bot shorted into +11% bounce. No higher-timeframe filter was in place. |
+| 2026-06-18 (s11) | Daily + 4h trend filter: `_get_trend_direction()` in loop.py | Long only when price > daily EMA(20) AND 4h EMA(50) confirms. Short only when price < daily EMA(20) AND 4h EMA(50) confirms. Ambiguous band ±0.3% = skip. Added `ema20_daily` + `ema50_4h` to price.py fetch. All 4 active yamls: `trend_filter.enabled: true`. |
+| 2026-06-18 (s11) | Session filter: skip 00:00–07:00 UTC | `session_blocked_end_utc: 7` in loop.py tick. Avoids Asian low-volume session. |
+| 2026-06-18 (s11) | Portfolio daily loss cap: -$40 halts all trading for the day | `_portfolio_daily_loss_usd()` sums closed_pnl_usdt across all asset state dirs. June 2 (-$51) and June 7 (-$104) days triggered by 4-asset simultaneous longs into BTC dump. Config: `max_portfolio_daily_loss_usd: 40.0`. |
+| 2026-06-18 (s11) | New position sizing: `_position_based_sizing()` in execution.py | `position_notional = balance × 0.10`, `leverage = clamp(risk_pct / (position_pct × sl_dist), 3, 8)`. Replaces old `(balance × 0.10) / sl_dist` formula that was capped at $500 and gave inconsistent risk. New formula: consistent $16 risk (2% of ~$800 balance) regardless of SL distance. All yamls: `position_pct: 0.10`, `risk_per_trade: 0.02`. |
+| 2026-06-18 (s11) | TAO disabled: `trading_enabled: false` in strategy.yaml | June performance: -$39 total (-41.3% win rate), largest single-day loss contributor. Replacing with XRP. loop.py now checks this flag and skips entire tick. |
+| 2026-06-18 (s11) | XRP added as paper mode replacement for TAO | `state/xrp_usdt/strategy.yaml` created. `trading_mode: paper`. All session 11 config included. After 10+ paper trades with positive win rate → flip to live. |
+| 2026-06-18 (s11) | `trading_enabled: false` flag added to loop.py | New YAML flag checked before any tick processing. Allows disabling an asset without stopping its systemd worker. |
+| 2026-06-18 (s11) | Windows mount corruption: both Edit AND Write corrupt Python files | Confirmed: only bash heredoc (`cat > path << 'PYEOF'`) works reliably for .py files on C:\Users\nghil mount. Always follow with `python3 -m py_compile`. Markdown/YAML files safe with Edit/Write. |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -87,6 +98,34 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - [FIXED session 2] LLM bracket notation: prompt now has explicit newline-delimited variable list + one-shot JSON example; `python` → `sys.executable` in reflection subprocess
 
 ## Handoffs
+
+### Session 11 (2026-06-18) — CODE COMPLETE, VPS DEPLOY PENDING
+- **Status**: All code changes implemented locally. Pending VPS deploy by Linh.
+- **Deploy guide**: `deploy-overhaul-2026-06-18.md` — 9-step guide with exact scp/ssh commands. Run in order.
+- **What changed locally** (all validated with py_compile):
+  - `hermes_trading/adapters/price.py` — added `ema20_daily` + `ema50_4h` to price dict
+  - `hermes_trading/loop.py` — session filter, portfolio daily loss cap, trend filter gate, `trading_enabled` flag
+  - `hermes_trading/adapters/execution.py` — new `_position_based_sizing()` (10% bal, 2% risk, 3–8x leverage)
+  - `dashboard.py` — TAO→XRP, trend filter badge, PAPER/PAUSED badge, long/short win rate, portfolio daily P&L
+  - `state/btc_usdt/strategy.yaml` → v03 (trend_filter, position_pct, risk_per_trade, session filter, loss cap)
+  - `state/eth_usdt/strategy.yaml` → v04 (same as BTC)
+  - `state/sol_usdt/strategy.yaml` → v02 (same as BTC)
+  - `state/tao_usdt/strategy.yaml` → v05 (`trading_enabled: false`)
+  - `state/xrp_usdt/strategy.yaml` → NEW v01 (paper mode, all session 11 config)
+- **Linh's deploy steps** (from deploy-overhaul-2026-06-18.md):
+  1. Stop hermes workers
+  2. Backup VPS code
+  3. scp 4 Python files to VPS
+  4. scp 5 strategy YAMLs to VPS
+  5. Validate syntax on VPS (py_compile)
+  6. Fix dead cron + run 7-day backfill to restore trades.jsonl
+  7. Create hermes-xrp systemd unit + restart BTC/ETH/SOL/XRP (TAO stays stopped)
+  8. Verify heartbeats
+  9. Smoke-check new filter log lines
+- **After first 10 XRP paper trades**: review win rate → if positive, set `trading_mode: live` in `state/xrp_usdt/strategy.yaml` and redeploy that file only.
+- **Next session focus**: review first week of post-overhaul trade data; assess if trend filter is filtering correctly or being too restrictive (target: <40 trades/week, >55% win rate).
+
+
 - **Status (end of session 6, 2026-05-28)**: Phase 2.4 DEPLOYED to VPS. Commit `f0f0893` pushed; running agent restarted (replaced PID 1320187 with fresh process launched from `/opt/trading/hermes_trading`). New `min_tp_pct` guard confirmed firing in live log (BTC skip at 01:29 UTC: "Structural TP too thin: 0.02% < min 3.00%"). No IndentationError on agent restart → reflect.py truncate fix took effect. Backfill ran with `bybit=0` (likely Bybit V5 7-day query window quirk; TAO already has 23 native-logged trades → reflection unblocked anyway).
 - **Deploy mishap logged for doctrine**: 5-step deploy block in `session-6-phase-2.4.md` had Step 2 combining `diff` + `cp` in two code blocks under one heading; Linh ran only the diff and skipped the cp, then hit `ModuleNotFoundError` on backfill. Recovery: one extra ssh cp command. Lesson: every deploy step should be ONE code block, ONE command. Update template before next deploy.
 - **Env var pickup**: backfill needed `set -a; source .env; set +a` prefix because `python -m tools.backfill_trades` doesn't auto-load `.env` (execution.py uses `os.getenv` directly, not python-dotenv). Same prefix is needed for the agent restart command. Add to the runbook.
@@ -131,6 +170,32 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 
 ## Session Log
 
+### 2026-06-18 (session 11) — Deep strategy review + overhaul recommendations
+
+Linh flagged two weeks of dismal results. Full analysis of trade data, session history, current strategy config, and all known issues produced a comprehensive overhaul document.
+
+**Data analysed**: Bybit CSV (155 trades, May 21–Jun 18 — full period), all 4 strategy.yamls (post-session 15 state), full session history.
+
+**Key findings (full 155-trade dataset)**:
+1. **May**: 51 trades, 57% win rate, +$131.37. **June**: 104 trades, 37% win rate, -$105.05. Account is +$26 cumulative — almost wiped out a strong May.
+2. **Long entries are broken across all assets**: TAO 34%, ETH 33%, SOL 37%, BTC 29% win rates on longs. Short entries are much better: TAO 46%, ETH 55%, SOL 54%, BTC 86%.
+3. The bot is systematically buying RSI-oversold lows into ongoing downtrends (no 1h trend filter). June 7 worst example: 5 consecutive TAO shorts into a +11% uptrend = -$85 in one day.
+4. June 2: BTC dumped 4.6%, bot entered longs on all 4 assets simultaneously, all hit SL. Portfolio correlation + no daily loss cap = -$51 in an afternoon.
+5. All 4 trades.jsonl are EMPTY on VPS — cron backfill dead, Hermes reflection offline for unknown duration.
+6. `risk_per_trade: 10%` means each SL hit = ~$10. Magnifies the direction problem 5-10× vs 2% risk.
+7. BTC is the only consistently profitable asset: 57% overall, 86% short win rate. The only one worth keeping at current settings.
+
+**Confirmed decisions (Linh answers locked in):**
+- TAO out → replaced with XRP/USDT (paper mode first, 10+ trades before live)
+- Daily EMA(20) + 4h EMA(50) trend filter: long only above both, short only below both
+- Position sizing: 10% of balance notional, leverage scales dynamically (risk_pct / position_pct / sl_dist), capped [3, 8x], targeting 2% max risk per trade (~$16 at $800 balance)
+- BTC: unchanged, already performing (57% win rate, 86% short win rate)
+- Cron diagnostic: Linh to SSH and check
+
+**No code deployed this session.** Full overhaul doc at `strategy-overhaul-2026-06-18.md`. Next session: (1) cron fix + XRP paper setup, (2) daily/4h trend filter code, (3) new position sizing code, (4) portfolio daily loss cap.
+
+
+
 ### 2026-06-06 (session 9) — Confidence-scaled leverage
 
 Replaced fixed 5x leverage with a confidence-scaled range of 3x–10x. Formula: `leverage = round(3 + (10 - 3) * confidence)`, clipped to [3, 10]. At 40% conf → 5.8x ≈ 6x; at 70% conf → 7.9x ≈ 8x; at 100% conf → 10x.
@@ -168,7 +233,9 @@ Linh flagged "too many losing trades." Investigation of CSV data (45 trades, May
 **Deploy doc**: `deploy-fixes-2026-06-08.md` — 9 steps, one SSH block each. Pending Linh push + deploy.
 **Investigation doc**: `investigation-losing-trades-2026-06-08.md`.
 
-**NOTE**: The confidence-scaled leverage code in `execution.py` + `loop.py` + `reflect.py` is UNCHANGED — yamls pin both min/max to 5x so the formula evaluates to 5x always. If future Hermes reflections try to tune `min_leverage`/`max_leverage`, they will both be tunable — acceptable since they're now starting from 5/5 rather than 3/10.
+**Leverage implementation**: New `_confidence_to_leverage()` in `execution.py` reads `leverage_curve` list from strategy yaml and does piecewise linear interpolation. The `min_leverage`/`max_leverage` fields are now fallback-only (used if no curve present). Hermes reflections can still tune those fallback values; the curve itself is the primary control.
+**max_trades_per_day**: set to 3 for all assets. Enforcement is in loop.py's existing trade-count check (already present).
+**Deploy doc**: `deploy-fixes-2026-06-08.md` — Step 5 is now split into 5a (execution.py cp) and 5b (yaml patch). Resume from Step 3 (backup).
 
 ### 2026-06-06 (session 8 continued) — Phase 2.3/2.8/2.9/2.10 + ETH signal quality
 

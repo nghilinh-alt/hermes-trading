@@ -1,8 +1,24 @@
-version: '03'
+version: '01'
+asset: XRP/USDT
+# Session 11 (2026-06-18): XRP replaces TAO. Paper mode for first 10 trades.
+trading_mode: paper
+position_size_r: 0.8
+# 2% risk, 10% position, dynamic leverage
+risk_per_trade: 0.02
+position_pct: 0.10
+stop_loss_pct: 2.0
+max_sl_pct: 5.0
+take_profit_pct: 5.0
+trailing_stop_r: 0.5
+use_fbb: false
+risk_adjustment: fixed
+rsi_entry_overbought: 70
+rsi_entry_oversold: 30
+max_trades_per_day: 3
 entry:
   direction: both
-  min_confidence: 0.5
   min_indicators: 3
+  min_confidence: 0.5
 indicators:
 - name: rsi
   required: false
@@ -45,12 +61,6 @@ indicators:
   weight: 0.3
   params:
     tolerance_pct: 1.0
-stop_loss_pct: 2.0
-position_size_r: 0.8
-# Session 11 (2026-06-18): 2% risk, 10% position, dynamic leverage
-risk_per_trade: 0.02
-position_pct: 0.10
-max_sl_pct: 5.0
 sl_buffer_pct: 0.3
 min_leverage: 3
 max_leverage: 8
@@ -58,16 +68,15 @@ min_tp_pct: 3.0
 min_rr_ratio: 2.0
 min_profit_usd: 5.0
 trail_atr_mult: 2.0
-max_trades_per_day: 3
-# Session 11: daily + 4h trend filter
+# Daily + 4h trend filter
 trend_filter:
   enabled: true
   daily_ema_period: 20
   ema_4h_period: 50
   ambiguous_band_pct: 0.3
-# Session 11: session filter (skip Asian low-volume session)
+# Session filter (skip Asian low-volume session)
 session_blocked_end_utc: 7
-# Session 11: portfolio daily loss cap (USD)
+# Portfolio daily loss cap (USD)
 max_portfolio_daily_loss_usd: 40.0
 leverage_curve:
 - - 0.5

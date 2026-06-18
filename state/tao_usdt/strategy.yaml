@@ -1,5 +1,7 @@
-version: '04'
+version: '05'
 asset: TAO/USDT
+# Session 11 (2026-06-18): TAO disabled — replacing with XRP
+trading_enabled: false
 position_size_r: 0.8
 risk_per_trade: 0.1
 stop_loss_pct: 2.0

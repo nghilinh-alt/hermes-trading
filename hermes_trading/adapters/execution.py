@@ -1,4 +1,4 @@
-﻿"""
+"""
 execution.py — Live order execution adapter for Bybit via ccxt.
 
 Places market entry orders with stop-loss + take-profit set at creation.
@@ -6,8 +6,12 @@ Only active when HERMES_TRADING_MODE=live AND HERMES_TRADING_I_ACCEPT_RISK=true.
 
 Safety constraints:
   - One position per asset at a time (checked via fetch_positions)
-  - Position size = risk-based: (balance × risk_per_trade) / sl_dist_pct, capped at MAX_POSITION_USD
-  - Leverage = confidence-scaled between min_leverage (3x) and max_leverage (10x)
+  - Position size = 10% of balance (position_pct); leverage set dynamically so
+    SL hit = risk_per_trade × balance (default 2%)
+  - New sizing formula (session 11, 2026-06-18):
+      position_notional = balance × position_pct        (default 0.10)
+      leverage          = clamp(risk_pct / (position_pct × sl_dist), min_lev, max_lev)
+      qty               = position_notional / entry_price
   - SL = structural support/resistance ± sl_buffer_pct; fallback to fixed stop_loss_pct
   - TP = nearest structural resistance/support; fallback to 2:1 RR from SL
   - SL/TP always attached to every order
@@ -170,8 +174,61 @@ def _structural_sl_tp(
     return sl_price, tp_price
 
 
-# ── Risk-based position sizing ────────────────────────────────────────────────
+# ── New position-based sizing (session 11, 2026-06-18) ───────────────────────
 
+
+def _position_based_sizing(
+    exchange: ccxt.Exchange,
+    entry_price: float,
+    sl_price: float,
+    strategy: dict,
+    symbol: str,
+) -> tuple[float, int]:
+    """
+    Size position so position_pct of balance is deployed; leverage set dynamically
+    so that a full SL hit costs exactly risk_per_trade × balance.
+
+    position_notional = balance × position_pct        (default 0.10 = 10%)
+    leverage          = risk_pct / (position_pct × sl_dist_pct)
+    leverage          = clamp(leverage, min_leverage, max_leverage)
+    qty               = position_notional / entry_price
+
+    At $800 balance, 2% risk, 10% position:
+      SL 2.5% → lev 8x → $640 notional → $16 risk ($32 at 2:1 TP)
+      SL 4.0% → lev 5x → $400 notional → $16 risk ($32 at 2:1 TP)
+      SL 5.0% → lev 4x → $320 notional → $16 risk ($32 at 2:1 TP)
+
+    Returns (qty, leverage).
+    Raises RuntimeError if balance is zero.
+    Raises ValueError if SL distance is zero.
+    """
+    position_pct = float(strategy.get("position_pct", 0.10))
+    risk_pct     = float(strategy.get("risk_per_trade", 0.02))
+    min_lev      = int(strategy.get("min_leverage", 3) or 3)
+    max_lev      = int(strategy.get("max_leverage", 8) or 8)
+
+    balance = _fetch_usdt_balance(exchange)
+    if balance <= 0:
+        raise RuntimeError("USDT balance is zero — cannot size position")
+
+    sl_dist_pct = abs(entry_price - sl_price) / entry_price
+    if sl_dist_pct == 0:
+        raise ValueError("SL distance is zero — cannot size position")
+
+    # Dynamic leverage: how much leverage do we need so that
+    # (position_notional × leverage × sl_dist) / leverage == risk_usd?
+    # Simplified: leverage = risk_pct / (position_pct × sl_dist_pct)
+    raw_leverage = risk_pct / (position_pct * sl_dist_pct)
+    leverage     = int(max(min_lev, min(max_lev, round(raw_leverage))))
+
+    # Position notional = 10% of balance (before leverage)
+    position_notional = balance * position_pct
+    qty = exchange.amount_to_precision(symbol, position_notional / entry_price)
+
+    return qty, leverage
+
+
+# ── Legacy risk-based qty (kept for reference; replaced by _position_based_sizing) ──
 
 def _risk_based_qty(
     exchange: ccxt.Exchange,
@@ -181,12 +238,14 @@ def _risk_based_qty(
     symbol: str,
 ) -> float:
     """
-    Size the position so that a full SL hit costs exactly risk_per_trade × balance.
+    DEPRECATED (session 11) — use _position_based_sizing instead.
+    Kept for backward compatibility with paper mode simulator references.
 
+    Size the position so that a full SL hit costs exactly risk_per_trade × balance.
     qty_usd = (balance × risk_per_trade) / sl_dist_pct
     Capped at MAX_POSITION_USD env var (default $500).
     """
-    risk_per_trade = float(strategy.get("risk_per_trade", 0.10))
+    risk_per_trade = float(strategy.get("risk_per_trade", 0.02))
     max_pos_usd    = float(os.getenv("MAX_POSITION_USD", "500"))
 
     balance = _fetch_usdt_balance(exchange)
@@ -225,6 +284,36 @@ def _guard_min_profit_usd(qty, entry_price: float, tp_price: float, strategy: di
         )
 
 
+# ── Leverage curve (kept for legacy / reference) ─────────────────────────────
+
+def _confidence_to_leverage(confidence: float, strategy: dict) -> int:
+    """
+    DEPRECATED (session 11) — leverage is now derived from position sizing formula.
+    Kept for backward compatibility.
+
+    Map confidence score to leverage using piecewise linear interpolation
+    over leverage_curve breakpoints in the strategy yaml.
+    """
+    curve = strategy.get("leverage_curve")
+    if curve:
+        pts = sorted(curve, key=lambda p: p[0])
+        if confidence <= pts[0][0]:
+            return int(pts[0][1])
+        if confidence >= pts[-1][0]:
+            return int(pts[-1][1])
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            x1, y1 = pts[i + 1]
+            if x0 <= confidence <= x1:
+                t = (confidence - x0) / (x1 - x0)
+                return int(round(y0 + t * (y1 - y0)))
+    # Fallback: linear between min_leverage and max_leverage
+    min_lev = int(strategy.get("min_leverage") or 3)
+    max_lev = int(strategy.get("max_leverage") or 8)
+    lev = int(round(min_lev + (max_lev - min_lev) * confidence))
+    return max(min_lev, min(max_lev, lev))
+
+
 # ── Position guard ────────────────────────────────────────────────────────────
 
 
@@ -250,9 +339,9 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
     Place a real market order on Bybit USDT perpetual.
 
     - SL/TP: structural swing levels with max_sl_pct / min_tp_pct / min_rr_ratio guards.
-    - Position size: risk-based, capped at MAX_POSITION_USD.
+    - Position size: 10% of balance (position_pct); leverage dynamic from sl_dist.
     - $-floor: skipped if expected profit at TP < min_profit_usd (default $5).
-    - Leverage: confidence-scaled between strategy.min_leverage and max_leverage. Idempotent against Bybit retCode 110043.
+    - Leverage: derived from risk formula (session 11), NOT from confidence curve.
     - entry_detail: dict from loop._evaluate_entry with indicators_fired + confidence + direction.
 
     Returns a trade record dict matching loop.py schema.
@@ -275,11 +364,9 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
 
     sl_price, tp_price = _structural_sl_tp(price_data, direction, strategy)
 
-    min_lev  = int(strategy.get("min_leverage") or 3)
-    max_lev  = int(strategy.get("max_leverage") or 10)
-    confidence = float(ed.get("confidence") or 0.0)
-    leverage = int(round(min_lev + (max_lev - min_lev) * confidence))
-    leverage = max(min_lev, min(max_lev, leverage))
+    # New sizing: position-based with dynamic leverage (session 11)
+    qty, leverage = _position_based_sizing(exchange, entry_price, sl_price, strategy, symbol)
+
     if exchange.id == "bybit":
         try:
             exchange.set_leverage(leverage, symbol)
@@ -289,8 +376,6 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
             msg = str(e)
             if "110043" not in msg and "not modified" not in msg.lower():
                 raise
-
-    qty = _risk_based_qty(exchange, entry_price, sl_price, strategy, symbol)
 
     # Guard 4 ($-floor): expected TP profit must clear min_profit_usd
     _guard_min_profit_usd(qty, entry_price, tp_price, strategy)
