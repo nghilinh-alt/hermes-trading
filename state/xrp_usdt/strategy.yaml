@@ -6,6 +6,13 @@ position_size_r: 0.8
 # 2% risk, 10% position, dynamic leverage
 risk_per_trade: 0.02
 position_pct: 0.10
+position_pct_curve:
+- - 0.5
+  - 0.10
+- - 0.75
+  - 0.15
+- - 1.0
+  - 0.20
 stop_loss_pct: 2.0
 max_sl_pct: 5.0
 take_profit_pct: 5.0

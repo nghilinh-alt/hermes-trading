@@ -22,8 +22,10 @@ ssh root@187.127.108.173 "cd /opt/trading/hermes-trading && git pull && echo DON
 ## Step 2 — Backup current running loop.py + yamls before overwrite
 
 ```powershell
-ssh root@187.127.108.173 "mkdir -p /tmp/hermes-backup-20260703 && cp /opt/trading/hermes_trading/hermes_trading/loop.py /tmp/hermes-backup-20260703/ && cp /opt/trading/hermes_trading/state/*/strategy.yaml /tmp/hermes-backup-20260703/ && ls /tmp/hermes-backup-20260703 && echo DONE"
+ssh root@187.127.108.173 "cp /opt/trading/hermes_trading/state/btc_usdt/strategy.yaml /tmp/hermes-backup-20260703/btc_usdt-strategy.yaml && cp /opt/trading/hermes_trading/state/eth_usdt/strategy.yaml /tmp/hermes-backup-20260703/eth_usdt-strategy.yaml && cp /opt/trading/hermes_trading/state/sol_usdt/strategy.yaml /tmp/hermes-backup-20260703/sol_usdt-strategy.yaml && cp /opt/trading/hermes_trading/state/xrp_usdt/strategy.yaml /tmp/hermes-backup-20260703/xrp_usdt-strategy.yaml && rm -f /tmp/hermes-backup-20260703/.-strategy.yaml && ls /tmp/hermes-backup-20260703 && echo DONE"
 ```
+
+(No `$` anywhere in this one — PowerShell interpolates `$varname` inside double-quoted strings even with a backslash in front, since backslash isn't its escape character. Explicit paths sidestep the whole problem. The stray `.-strategy.yaml` from the previous attempt gets cleaned up too.)
 
 ## Step 3 — Copy new loop.py to the running (underscore) install
 

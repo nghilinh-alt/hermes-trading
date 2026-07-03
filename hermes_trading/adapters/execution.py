@@ -177,32 +177,78 @@ def _structural_sl_tp(
 # ── New position-based sizing (session 11, 2026-06-18) ───────────────────────
 
 
+def _confidence_to_position_pct(confidence: float, strategy: dict) -> float:
+    """
+    Map confidence score to position_pct (fraction of available margin deployed)
+    via piecewise linear interpolation over position_pct_curve breakpoints —
+    same pattern as _confidence_to_leverage's leverage_curve.
+
+    Session 12 (2026-07-03): position_pct is now a FLOOR, not a fixed value.
+    Stronger signals (higher confidence) deploy a larger fraction of available
+    margin. Result is always clamped to >= strategy['position_pct'] (default
+    0.10) regardless of curve shape, so every trade still deploys at least
+    that fraction — the curve can only scale a trade UP from the floor, never
+    below it. Falls back to the flat position_pct value if no
+    position_pct_curve is configured (pre-session-12 yamls behave exactly as
+    before — always exactly the floor).
+    """
+    base_pct = float(strategy.get("position_pct", 0.10))
+    curve = strategy.get("position_pct_curve")
+    if not curve:
+        return base_pct
+
+    pts = sorted(curve, key=lambda p: p[0])
+    if confidence <= pts[0][0]:
+        pct = float(pts[0][1])
+    elif confidence >= pts[-1][0]:
+        pct = float(pts[-1][1])
+    else:
+        pct = float(pts[-1][1])
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            x1, y1 = pts[i + 1]
+            if x0 <= confidence <= x1:
+                t = (confidence - x0) / (x1 - x0)
+                pct = y0 + t * (y1 - y0)
+                break
+
+    return max(pct, base_pct)   # hard floor — never below base position_pct
+
+
 def _position_based_sizing(
     exchange: ccxt.Exchange,
     entry_price: float,
     sl_price: float,
     strategy: dict,
     symbol: str,
+    confidence: float = 0.0,
 ) -> tuple[float, int]:
     """
     Size position so position_pct of balance is deployed; leverage set dynamically
     so that a full SL hit costs exactly risk_per_trade × balance.
 
-    position_notional = balance × position_pct        (default 0.10 = 10%)
+    position_notional = balance × effective_pct       (effective_pct >= position_pct floor;
+                                                         see _confidence_to_position_pct)
     leverage          = risk_pct / (position_pct × sl_dist_pct)
     leverage          = clamp(leverage, min_leverage, max_leverage)
     qty               = position_notional / entry_price
 
-    At $800 balance, 2% risk, 10% position:
+    At $800 balance, 2% risk, 10% position (no position_pct_curve configured):
       SL 2.5% → lev 8x → $640 notional → $16 risk ($32 at 2:1 TP)
       SL 4.0% → lev 5x → $400 notional → $16 risk ($32 at 2:1 TP)
       SL 5.0% → lev 4x → $320 notional → $16 risk ($32 at 2:1 TP)
+
+    Session 12: with position_pct_curve configured, higher-confidence entries
+    deploy more than the 10% floor (e.g. up to 20% at confidence 1.0) — see
+    _confidence_to_position_pct. Leverage formula is unchanged and still keyed
+    off the base position_pct, not the scaled-up effective_pct.
 
     Returns (qty, leverage).
     Raises RuntimeError if balance is zero.
     Raises ValueError if SL distance is zero.
     """
     position_pct = float(strategy.get("position_pct", 0.10))
+    effective_pct = _confidence_to_position_pct(confidence, strategy)
     risk_pct     = float(strategy.get("risk_per_trade", 0.02))
     min_lev      = int(strategy.get("min_leverage", 3) or 3)
     max_lev      = int(strategy.get("max_leverage", 8) or 8)
@@ -221,8 +267,8 @@ def _position_based_sizing(
     raw_leverage = risk_pct / (position_pct * sl_dist_pct)
     leverage     = int(max(min_lev, min(max_lev, round(raw_leverage))))
 
-    # Position notional = 10% of balance (before leverage)
-    position_notional = balance * position_pct
+    # Position notional = effective_pct of balance (before leverage), floored at position_pct
+    position_notional = balance * effective_pct
     qty = exchange.amount_to_precision(symbol, position_notional / entry_price)
 
     return qty, leverage
@@ -364,8 +410,12 @@ def place_live_trade(strategy: dict, price_data: dict, entry_detail: dict | None
 
     sl_price, tp_price = _structural_sl_tp(price_data, direction, strategy)
 
-    # New sizing: position-based with dynamic leverage (session 11)
-    qty, leverage = _position_based_sizing(exchange, entry_price, sl_price, strategy, symbol)
+    # New sizing: position-based with dynamic leverage (session 11);
+    # position_pct floor scales up with confidence via position_pct_curve (session 12)
+    qty, leverage = _position_based_sizing(
+        exchange, entry_price, sl_price, strategy, symbol,
+        confidence=float(ed.get("confidence", 0.0)),
+    )
 
     if exchange.id == "bybit":
         try:
