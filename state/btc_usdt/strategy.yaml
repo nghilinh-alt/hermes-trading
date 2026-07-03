@@ -74,6 +74,7 @@ trend_filter:
   daily_ema_period: 20
   ema_4h_period: 50
   ambiguous_band_pct: 0.3
+  trend_4h_soft_discount: 0.7
 # Session 11: session filter (skip Asian low-volume session)
 session_blocked_end_utc: 7
 # Session 11: portfolio daily loss cap (USD)

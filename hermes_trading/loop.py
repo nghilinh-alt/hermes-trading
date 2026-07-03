@@ -318,23 +318,35 @@ def _check_indicator(name: str, params: dict, direction: str, price_data: dict) 
     return _d(None, None, None, f"unknown indicator: {name}")
 
 
-def _get_trend_direction(price_data: dict, strategy: dict) -> str | None:
+def _get_trend_direction(price_data: dict, strategy: dict) -> tuple[str | None, bool]:
     """
-    Determine which trade direction is allowed based on daily + 4h trend alignment.
+    Determine which trade direction the daily trend allows, and whether the 4h
+    timeframe confirms it.
 
-    Returns:
-      'long'  — daily EMA(20) bullish AND 4h EMA(50) bullish
-      'short' — daily EMA(20) bearish AND 4h EMA(50) bearish
-      None    — daily/4h disagree or price in ambiguous band → skip entry this tick
-      'any'   — trend_filter.enabled is False → no restriction, all directions allowed
+    Returns (direction, confirmed):
+      direction:
+        'long'  — price above daily EMA(20), beyond the ambiguous band
+        'short' — price below daily EMA(20), beyond the ambiguous band
+        'any'   — trend_filter disabled, or no daily data yet — no restriction
+        None    — price too close to daily EMA(20) — genuinely ambiguous, skip entirely
+      confirmed:
+        True  — 4h EMA(50) agrees with the daily direction (or no 4h data / filter off)
+        False — 4h EMA(50) disagrees — caller applies a soft confidence penalty, not a
+                hard skip. (Session 12, 2026-07-03: hard-blocking here choked BTC/XRP to
+                zero entries for hours at a stretch — daily vs 4h EMA disagreement turned
+                out to be a common multi-hour regime, not a brief crossover. The daily
+                bias is what actually stopped the June countertrend losses; 4h is now a
+                soft check layered on top of it, not an independent hard gate.)
 
     Config (strategy.trend_filter):
-      enabled:            bool  (default False)
-      ambiguous_band_pct: float (default 0.3 — price within 0.3% of daily EMA = ambiguous)
+      enabled:                 bool  (default False)
+      ambiguous_band_pct:      float (default 0.3 — price within 0.3% of daily EMA = ambiguous)
+      trend_4h_soft_discount:  float (default 0.7 — confidence multiplier applied when
+                                4h disagrees with the daily bias; read by the call site)
     """
     tf = strategy.get("trend_filter", {}) or {}
     if not tf.get("enabled", False):
-        return "any"
+        return "any", True
 
     price       = float(price_data.get("price", 0))
     ema20_daily = price_data.get("ema20_daily")
@@ -342,26 +354,27 @@ def _get_trend_direction(price_data: dict, strategy: dict) -> str | None:
     band        = float(tf.get("ambiguous_band_pct", 0.3)) / 100
 
     if not ema20_daily or price <= 0:
-        return "any"   # no daily data yet — allow entries
+        return "any", True   # no daily data yet — allow entries
 
-    # Daily bias
+    # Daily bias — hard gate, unchanged. This is what stopped the June countertrend losses.
     if price > ema20_daily * (1 + band):
         daily_bias = "long"
     elif price < ema20_daily * (1 - band):
         daily_bias = "short"
     else:
-        return None   # price too close to daily EMA — ambiguous
+        return None, False   # price too close to daily EMA — ambiguous, skip entirely
 
-    # 4h confirmation (if available)
+    # 4h confirmation — soft as of session 12. Disagreement no longer hard-skips;
+    # the caller discounts confidence instead of aborting the tick outright.
     if ema50_4h is None:
-        return daily_bias   # no 4h data — use daily alone
+        return daily_bias, True   # no 4h data — treat as confirmed
 
     if daily_bias == "long" and price > ema50_4h:
-        return "long"
+        return daily_bias, True
     elif daily_bias == "short" and price < ema50_4h:
-        return "short"
+        return daily_bias, True
     else:
-        return None   # daily and 4h disagree — skip
+        return daily_bias, False   # daily/4h disagree — soft penalty, not a skip
 
 
 def _portfolio_daily_loss_usd(base_dir: Path) -> float:
@@ -902,14 +915,13 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
                     await asyncio.sleep(max(0, tick_seconds - elapsed))
                     continue
 
-            # ── TREND FILTER: daily EMA(20) + 4h EMA(50) direction gate ─────────────
-            trend_allowed = _get_trend_direction(price_data, strategy)
+            # ── TREND FILTER: daily EMA(20) hard gate + 4h EMA(50) soft confirmation ─
+            trend_allowed, trend_confirmed = _get_trend_direction(price_data, strategy)
             if trend_allowed is None:
                 ema20 = price_data.get("ema20_daily", "?")
-                ema4h = price_data.get("ema50_4h", "?")
                 console.print(
-                    f"[dim]{ts} {tag} Trend filter: ambiguous or daily/4h mismatch "
-                    f"(price={price_data.get('price')}, ema20d={ema20}, ema50_4h={ema4h}) — skipping[/dim]"
+                    f"[dim]{ts} {tag} Trend filter: price within ambiguous band of daily EMA "
+                    f"(price={price_data.get('price')}, ema20d={ema20}) — skipping[/dim]"
                 )
                 _write_heartbeat(state_dir, "ok", 0)
                 consecutive_failures = 0
@@ -922,11 +934,27 @@ async def run(asset: str, goal: dict | None = None, state_dir: Path | None = Non
             strategy_direction = strategy.get("entry", {}).get("direction", "long")
 
             if trend_allowed != "any":
-                # Trend filter active: evaluate only the allowed direction
+                # Trend filter active: evaluate only the daily-bias-allowed direction
                 entry_result = _evaluate_entry(
                     strategy, price_data, macro_data or {}, news_data or {},
                     force_direction=trend_allowed,
                 )
+                if not trend_confirmed and entry_result["fires"]:
+                    # 4h disagrees with the daily bias — soft penalty (session 12),
+                    # not a hard skip. See _get_trend_direction docstring.
+                    tf_cfg          = strategy.get("trend_filter", {}) or {}
+                    discount        = float(tf_cfg.get("trend_4h_soft_discount", 0.7))
+                    min_conf        = float(strategy.get("entry", {}).get("min_confidence", 0.0))
+                    discounted_conf = entry_result["confidence"] * discount
+                    entry_result    = {**entry_result, "confidence": discounted_conf}
+                    if discounted_conf < min_conf:
+                        ema4h = price_data.get("ema50_4h", "?")
+                        console.print(
+                            f"[dim]{ts} {tag} 4h disagrees with daily {trend_allowed} bias "
+                            f"(ema50_4h={ema4h}) — confidence discounted to {discounted_conf:.0%} "
+                            f"(x{discount:.0%}) < min {min_conf:.0%} — skipping[/dim]"
+                        )
+                        entry_result["fires"] = False
             elif strategy_direction == "both":
                 long_result  = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}, force_direction="long")
                 short_result = _evaluate_entry(strategy, price_data, macro_data or {}, news_data or {}, force_direction="short")
