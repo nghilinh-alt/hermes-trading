@@ -224,24 +224,34 @@ def _position_based_sizing(
     confidence: float = 0.0,
 ) -> tuple[float, int]:
     """
-    Size position so position_pct of balance is deployed; leverage set dynamically
-    so that a full SL hit costs exactly risk_per_trade × balance.
+    Size position so effective_pct of balance is committed as MARGIN; leverage
+    set dynamically so a full SL hit costs exactly risk_per_trade × balance;
+    actual exposure (notional) is margin × leverage.
 
-    position_notional = balance × effective_pct       (effective_pct >= position_pct floor;
-                                                         see _confidence_to_position_pct)
+    margin            = balance × effective_pct   (effective_pct >= position_pct
+                                                     floor; see _confidence_to_position_pct)
     leverage          = risk_pct / (position_pct × sl_dist_pct)
     leverage          = clamp(leverage, min_leverage, max_leverage)
+    position_notional = margin × leverage
     qty               = position_notional / entry_price
 
     At $800 balance, 2% risk, 10% position (no position_pct_curve configured):
-      SL 2.5% → lev 8x → $640 notional → $16 risk ($32 at 2:1 TP)
-      SL 4.0% → lev 5x → $400 notional → $16 risk ($32 at 2:1 TP)
-      SL 5.0% → lev 4x → $320 notional → $16 risk ($32 at 2:1 TP)
+      SL 2.5% → margin $80 → lev 8x → $640 notional → $16 risk ($32 at 2:1 TP)
+      SL 4.0% → margin $80 → lev 5x → $400 notional → $16 risk ($32 at 2:1 TP)
+      SL 5.0% → margin $80 → lev 4x → $320 notional → $16 risk ($32 at 2:1 TP)
 
-    Session 12: with position_pct_curve configured, higher-confidence entries
-    deploy more than the 10% floor (e.g. up to 20% at confidence 1.0) — see
-    _confidence_to_position_pct. Leverage formula is unchanged and still keyed
-    off the base position_pct, not the scaled-up effective_pct.
+    Session 12 (2026-07-03) fix: previously `position_notional` was set equal to
+    margin directly, never multiplied by leverage — leverage was passed to
+    exchange.set_leverage() but had no effect on actual exposure or realized
+    risk, contradicting this docstring's own worked examples (which always
+    assumed the $640/$400/$320 figures). Confirmed via the live XRP trade from
+    2026-06-25: qty × entry_price = $70.85 notional at 4x leverage on a ~$708
+    balance — exactly `balance × position_pct`, un-leveraged, when the
+    intended $283.40 notional (margin × leverage) would have been 4x that.
+
+    Session 12 also: with position_pct_curve configured, higher-confidence
+    entries commit more than the 10% margin floor (e.g. up to 20% at
+    confidence 1.0) — see _confidence_to_position_pct.
 
     Returns (qty, leverage).
     Raises RuntimeError if balance is zero.
@@ -262,13 +272,15 @@ def _position_based_sizing(
         raise ValueError("SL distance is zero — cannot size position")
 
     # Dynamic leverage: how much leverage do we need so that
-    # (position_notional × leverage × sl_dist) / leverage == risk_usd?
+    # (margin × leverage × sl_dist) == risk_usd?
     # Simplified: leverage = risk_pct / (position_pct × sl_dist_pct)
     raw_leverage = risk_pct / (position_pct * sl_dist_pct)
     leverage     = int(max(min_lev, min(max_lev, round(raw_leverage))))
 
-    # Position notional = effective_pct of balance (before leverage), floored at position_pct
-    position_notional = balance * effective_pct
+    # Margin committed = effective_pct of balance (floored at position_pct);
+    # actual exposure = margin × leverage (session 12 fix — was margin only)
+    margin = balance * effective_pct
+    position_notional = margin * leverage
     qty = exchange.amount_to_precision(symbol, position_notional / entry_price)
 
     return qty, leverage

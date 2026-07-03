@@ -1,11 +1,24 @@
-# Deploy: Position sizing — 10% floor, scales up with confidence (session 12)
+# Deploy: Position sizing — 10% margin floor, scales up with confidence, leverage now actually applied (session 12)
 _2026-07-03. Run AFTER the trend-filter soft-gate deploy is confirmed working — don't bundle these._
+
+## ⚠ Magnitude of this change
+
+This deploy fixes a real bug (see below), not just adds a feature. **Every trade's actual notional/exposure will be 3–8x bigger than it's been for the past several weeks** (matching leverage, which was being set on the exchange but never actually applied to position size). Dollar risk-per-trade stays at the designed ~2% of balance target regardless — that math is what's being fixed — but the position sizes you see on the exchange will look much larger than what you're used to. Read this whole doc before running it.
 
 ## What changed and why
 
-Linh asked for a minimum trade size of 10% of available margin (e.g. $80 floor at $800 balance), then asked to make it scale up on stronger signals rather than stay fixed.
+Linh asked for a minimum trade size of 10% of available margin, then to scale it up on stronger signals. While implementing, we found the actual last XRP trade (2026-06-25) had `qty=68.3` at `entry=1.0373`, `leverage=4` → notional $70.85 on what backs out to a ~$708 balance — exactly `balance × position_pct` with **no leverage applied at all**. But the sizing docstring's own worked examples (written in session 11) always claimed leverage-scaled numbers like "$640 notional at 8x leverage" on an $80 base. The code never did that multiplication — `leverage` was passed to `exchange.set_leverage()` but had zero effect on `qty`. Real trades have been running at a fraction of the intended risk/exposure since session 11.
 
-Previously `_position_based_sizing()` always used exactly `position_pct` (0.10) — never more, never less. Now `position_pct` is a **floor**: `_confidence_to_position_pct()` interpolates over a new `position_pct_curve` (same piecewise-linear pattern as the existing `leverage_curve`) and clamps the result to never go below the base `position_pct`. Yamls without a `position_pct_curve` behave exactly as before (flat 10%) — this only activates where the curve is present.
+**Fixed formula** (`_position_based_sizing()` in execution.py):
+```
+margin              = balance × effective_pct     (effective_pct >= position_pct floor)
+leverage            = clamp(risk_pct / (position_pct × sl_dist_pct), min_lev, max_lev)
+position_notional    = margin × leverage           ← the fix: this multiplication was missing
+qty                 = position_notional / entry_price
+```
+Verified against the docstring's own $800-balance worked examples — SL 2.5%→8x→$640 notional→$16 risk; SL 4.0%→5x→$400→$16; SL 5.0%→4x→$320→$16. All three now come out exactly right (previously all three would have been $80 regardless of SL distance or leverage).
+
+**Confidence scaling** (the original ask): `position_pct` (10%) is now a floor on the *margin* commitment, not a fixed value. `_confidence_to_position_pct()` interpolates over `position_pct_curve` (same piecewise-linear pattern as the existing `leverage_curve`), clamped to never go below the base `position_pct`. Yamls without a `position_pct_curve` fall back to the flat floor.
 
 Curve added to all 4 active yamls:
 ```
@@ -18,13 +31,11 @@ position_pct_curve:
 - - 1.0
   - 0.20
 ```
-At $800 balance: 50% confidence → $80 notional (floor, unchanged), 60% → $96, 75% → $120, 100% → $160.
+At $800 balance, SL 2.5% (8x leverage): 50% confidence → $80 margin → $640 notional → $16 risk (floor, matches original design). 100% confidence → $160 margin → $1280 notional → $32 risk.
 
-**Files changed** (`py_compile` clean; `_confidence_to_position_pct` unit-checked against 6 cases including the floor clamp and the no-curve fallback):
-- `hermes_trading/adapters/execution.py` — new `_confidence_to_position_pct()`; `_position_based_sizing()` takes a `confidence` param; `place_live_trade()` passes `ed.get("confidence", 0.0)` through
+**Files changed** (`py_compile` clean; verified against 4 cases reproducing the docstring's own worked examples plus the confidence-scaling case — all exact):
+- `hermes_trading/adapters/execution.py` — new `_confidence_to_position_pct()`; `_position_based_sizing()` now multiplies margin by leverage to get notional, takes a `confidence` param; `place_live_trade()` passes `ed.get("confidence", 0.0)` through
 - `state/btc_usdt/strategy.yaml`, `state/eth_usdt/strategy.yaml`, `state/sol_usdt/strategy.yaml`, `state/xrp_usdt/strategy.yaml` — added `position_pct_curve`
-
-**Not changed**: the leverage formula still keys off the base `position_pct` (10%), not the scaled-up effective value — leverage is set for margin efficiency and doesn't affect realized exposure/risk in this code's model (qty is derived straight from notional), so this was left alone deliberately.
 
 ## Step 1 — Backup current running files
 
@@ -67,6 +78,7 @@ ssh root@187.127.108.173 "sleep 20 && for f in /opt/trading/hermes_trading/state
 
 ## Handoff
 
-- **Status**: Code + yaml changes complete locally, validated with `py_compile` and manual tests of `_confidence_to_position_pct`. Not deployed.
+- **Status**: Code + yaml changes complete locally, validated with `py_compile` and against both the docstring's own worked examples and the confidence-scaling case (all exact). Not deployed.
 - **Depends on**: nothing — independent of the trend-filter deploy, but hold off until that one's confirmed stable so any behavior change is attributable to one fix at a time.
-- **Next agent**: read this file, then check the actual per-trade notional against expectation once a trade fires (qty × entry_price in the trade record should be ≥ 10% of whatever the account's free USDT balance was at that moment — see the open question in chat about the $20 XRP trade before assuming $800 is the current balance).
+- **Before running**: re-read the magnitude warning at the top. Position notional will be 3–8x bigger than what's been live for weeks. Consider whether you want to watch the first trade closely after this deploys rather than walking away.
+- **Next agent**: read this file, then check the actual per-trade notional once a trade fires — `qty × entry_price` in the trade record should now equal `(balance × effective_pct) × leverage`, not just `balance × effective_pct`.
