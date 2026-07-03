@@ -2,7 +2,7 @@
 _Rogue Night consulting project. Updated at end of each session._
 
 ## Last Updated
-2026-06-18 (session 11 — full trade analysis on 155-trade dataset May 21–Jun 18; overhaul implemented locally; all 4 Python files + 5 YAMLs + deploy doc written; **pending VPS deploy by Linh**)
+2026-07-03 (session 12 — diagnosed and fixed trade-frequency collapse: daily/4h trend filter AND-gate was hard-skipping BTC/XRP every tick for hours at a stretch; converted 4h check to a soft confidence discount, daily bias stays a hard gate. Implemented + validated locally; **pending VPS deploy by Linh**, see `deploy-trend-filter-soft-gate-2026-07-03.md`)
 
 ## Project Overview
 Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
@@ -88,6 +88,10 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 | 2026-06-18 (s11) | XRP added as paper mode replacement for TAO | `state/xrp_usdt/strategy.yaml` created. `trading_mode: paper`. All session 11 config included. After 10+ paper trades with positive win rate → flip to live. |
 | 2026-06-18 (s11) | `trading_enabled: false` flag added to loop.py | New YAML flag checked before any tick processing. Allows disabling an asset without stopping its systemd worker. |
 | 2026-06-18 (s11) | Windows mount corruption: both Edit AND Write corrupt Python files | Confirmed: only bash heredoc (`cat > path << 'PYEOF'`) works reliably for .py files on C:\Users\nghil mount. Always follow with `python3 -m py_compile`. Markdown/YAML files safe with Edit/Write. |
+| 2026-07-03 (s12) | Confirmed root cause via live diagnostic: daily EMA(20) vs 4h EMA(50) disagreement is a sustained multi-hour regime for BTC/XRP, not a brief crossover | Live log showed 100% skip rate on `Trend filter: ambiguous or daily/4h mismatch` across a full 3-hour sample for both assets, same direction each time. The two EMAs' different lookback windows (20 days vs ~8.3 days) disagree far more often/longer than assumed when session 11 designed the AND-gate. |
+| 2026-07-03 (s12) | 4h EMA(50) check changed from hard AND-gate to soft confidence discount (`trend_4h_soft_discount: 0.7`) | Daily EMA bias stays a hard gate — that's what actually stopped the June countertrend losses. `_get_trend_direction()` in loop.py now returns `(direction, confirmed)`; caller multiplies confidence by 0.7 when 4h disagrees instead of skipping outright, so strong multi-indicator setups can still clear `min_confidence`. Linh's explicit choice over "drop 4h entirely" or "OR logic" options. |
+| 2026-07-03 (s12) | Session 11's "fix empty trades.jsonl + dead cron" action item confirmed still broken | BTC/ETH/SOL `trades.jsonl` are 0 lines on VPS as of this session's diagnostic — 15+ days after being flagged. Hermes reflection has no data for these 3 assets. Needs its own session. |
+| 2026-07-03 (s12) | SOL blocked by a different, unrelated gate (`min_tp_pct: 3.0`) — structural TP too thin at current price structure | Not a trend-filter problem; SOL clears trend/confidence/indicator gates fine. Deferred to a separate review — do not loosen `min_tp_pct` as a side effect of the trend-filter fix. |
 
 ## Known Issues / TODOs
 - VPS running code at `/opt/trading/hermes_trading/hermes_trading/` (nested) — when deploying new code, SCP to this path OR copy from `/opt/trading/hermes-trading/` after git pull
@@ -98,6 +102,15 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - [FIXED session 2] LLM bracket notation: prompt now has explicit newline-delimited variable list + one-shot JSON example; `python` → `sys.executable` in reflection subprocess
 
 ## Handoffs
+
+### Session 12 (2026-07-03) — DIAGNOSED + FIXED LOCALLY, VPS DEPLOY PENDING
+- **Trigger**: Linh reported ~1 trade in the 15 days since session 11.
+- **Diagnosed**: this sandbox has no VPS network access, so Linh ran a read-only SSH diagnostic block (process/heartbeat/trade-counts/skip-reason-grep/live-vs-git-drift). Result: bot healthy (all heartbeats fresh, no crash), but BTC and XRP were hard-skipping on the daily/4h trend filter's AND-gate on literally every tick for a full 3-hour sample — daily EMA(20) and 4h EMA(50) were on opposite sides of price the entire window, a sustained regime, not a brief crossover.
+- **Fixed**: `_get_trend_direction()` in `loop.py` now returns `(direction, confirmed)` instead of `str | None`. Daily EMA bias is still a hard gate (unchanged — stopped the June losses). 4h disagreement now multiplies confidence by `trend_4h_soft_discount` (0.7, new yaml key on all 4 active assets) instead of hard-skipping. Linh chose this over "drop 4h entirely" or "OR logic" alternatives.
+- **Validated**: `py_compile` clean; manually re-ran the new function against the exact BTC/XRP EMA values from the live diagnostic and confirmed it now returns `('short', False)` (soft-discount path) instead of the old hard `None` (skip).
+- **Also found, deliberately NOT touched this session**: BTC/ETH/SOL `trades.jsonl` still empty on VPS (session 11's own "fix dead cron" item, never done); SOL blocked by an unrelated `min_tp_pct` structural guard; ETH absent from the log sample; hyphen git clone on VPS is stale (not dangerous — running code has the correct config, just needs a `git pull` before it's used as a diff baseline again).
+- **Deliverables**: `hermes-trading-improvement-plan-2026-07-03.md` (full diagnosis + Part 3 live results), `deploy-trend-filter-soft-gate-2026-07-03.md` (8-step deploy block).
+- **Handoff to**: Linh, to run the deploy doc, then re-check trade frequency after 3–5 days before considering any further gate change.
 
 ### Session 11 (2026-06-18) — CODE COMPLETE, VPS DEPLOY PENDING
 - **Status**: All code changes implemented locally. Pending VPS deploy by Linh.
@@ -169,6 +182,16 @@ Self-improving live crypto trading agent running on VPS (root@187.127.108.173).
 - **Tripwire to remember**: the pre-existing `hermes-dashboard` key entry in authorized_keys had no trailing newline. `echo >> file` concatenated the appended line onto the same line, corrupting both entries. Always rebuild authorized_keys via heredoc (`cat > file <<'EOF' ... EOF`) and verify with `wc -l` afterward.
 
 ## Session Log
+
+### 2026-07-03 (session 12) — Trade frequency diagnosis + trend filter soft-gate fix
+
+Linh reported ~1 trade across all 4 assets in the 15 days since session 11. Reviewed git log, all 4 strategy yamls, and `loop.py`'s entry-gate logic (`_evaluate_entry`, `_get_trend_direction`) and wrote up an initial gate-stack hypothesis plus a read-only VPS diagnostic block (this sandbox has no VPS network access).
+
+**Linh ran the diagnostic.** Results: bot healthy, all heartbeats fresh, no crash. But BTC and XRP hard-skipped on the daily/4h trend filter's AND-gate on every single tick across a full 3-hour log sample — daily EMA(20) and 4h EMA(50) sat on opposite sides of price the entire window (BTC: price below daily EMA → bearish bias, but above 4h EMA → bullish; same pattern on XRP). That's a sustained regime, not a brief crossover, and it's why frequency collapsed so much further than session 11's own 5–10/week estimate. SOL turned out to have a separate, unrelated problem (`min_tp_pct` structural guard). BTC/ETH/SOL `trades.jsonl` are still empty on VPS — session 11's "fix dead cron" item was never done.
+
+**Fix implemented and validated locally**: `_get_trend_direction()` now returns `(direction, confirmed)`. Daily EMA bias stays a hard gate (unchanged). 4h disagreement now discounts confidence by `trend_4h_soft_discount` (0.7, new key in all 4 active yamls) instead of hard-skipping — Linh's choice over dropping 4h entirely or switching to OR logic. Validated with `py_compile` and by re-running the new function against the exact live BTC/XRP values, confirming the soft-discount path fires where the old code hard-skipped.
+
+**Not deployed yet** — `deploy-trend-filter-soft-gate-2026-07-03.md` has the 8-step block. Empty trades.jsonl / dead cron, SOL's TP guard, and the stale hyphen git clone are logged as separate follow-ups, deliberately not bundled into this deploy.
 
 ### 2026-06-18 (session 11) — Deep strategy review + overhaul recommendations
 
