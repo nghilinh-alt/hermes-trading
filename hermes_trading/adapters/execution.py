@@ -108,10 +108,11 @@ def _structural_sl_tp(
 
     Guards (in order):
       1. max_sl_pct        — raise ValueError if SL distance from entry exceeds threshold (default 5%)
-      2. min_tp_pct        — raise ValueError if structural TP distance from entry is below threshold
-                             (default 3%). Implements "Option B" target-return filter.
-      3. min_rr_ratio      — soft guard: if structural R:R is below threshold (default 2.0), extend
+      2. min_rr_ratio      — soft guard: if structural R:R is below threshold (default 2.0), extend
                              TP to (entry ± sl_dist × min_rr_ratio). Does NOT skip the trade.
+      3. min_tp_pct        — raise ValueError if the FINAL TP distance from entry is below threshold
+                             (default 3%). Implements "Option B" target-return filter. Runs AFTER the
+                             R:R extension (session 15) so the floor applies to the widened TP.
     """
     entry        = float(price_data.get("price", 0))
     sl_buffer    = float(strategy.get("sl_buffer_pct", 0.3)) / 100
@@ -154,15 +155,11 @@ def _structural_sl_tp(
             f"(entry={entry}, sl={sl_price})"
         )
 
-    # Guard 2 (Option B filter): TP must be at least min_tp_pct from entry
-    tp_dist_pct = abs(tp_price - entry) / entry
-    if tp_dist_pct < min_tp_pct:
-        raise ValueError(
-            f"Structural TP too thin: {tp_dist_pct:.2%} < min {min_tp_pct:.2%} "
-            f"(entry={entry}, tp={tp_price}) — Option B target-return filter"
-        )
-
-    # Guard 3 (Soft R:R): extend TP if R:R below threshold
+    # Guard 2 (Soft R:R): extend TP if R:R below threshold. Runs BEFORE the
+    # min_tp_pct floor (session 15, 2026-07-13) so the floor is applied to the
+    # FINAL take-profit, not the raw structural level. Previously this ran after
+    # the floor, so a signal whose nearest structural TP was thin got rejected
+    # before the extension that would have widened it past the floor could run.
     if sl_dist > 0:
         rr_ratio = abs(tp_price - entry) / sl_dist
         if rr_ratio < min_rr_ratio:
@@ -170,6 +167,14 @@ def _structural_sl_tp(
                 tp_price = round(entry + sl_dist * min_rr_ratio, 4)
             else:
                 tp_price = round(entry - sl_dist * min_rr_ratio, 4)
+
+    # Guard 3 (Option B filter): FINAL TP must be at least min_tp_pct from entry
+    tp_dist_pct = abs(tp_price - entry) / entry
+    if tp_dist_pct < min_tp_pct:
+        raise ValueError(
+            f"Structural TP too thin: {tp_dist_pct:.2%} < min {min_tp_pct:.2%} "
+            f"(entry={entry}, tp={tp_price}) — Option B target-return filter"
+        )
 
     return sl_price, tp_price
 
