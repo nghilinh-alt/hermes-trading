@@ -151,17 +151,22 @@ def test_in_kill_zone_new_york():
 # ── gate_htf_bias ─────────────────────────────────────────────────────────────
 
 
-def test_gate_htf_bias_daily_aligned_weekly_not_opposing():
-    assert gate_htf_bias(Direction.BULLISH, TrendState.RANGE, TrendState.UPTREND) is True
-    assert gate_htf_bias(Direction.BULLISH, TrendState.UPTREND, TrendState.UPTREND) is True
+def test_gate_htf_bias_passes_when_direction_matches_computed_bias():
+    long_bias = Bias(BiasDirection.LONG, TrendState.UPTREND, TrendState.RANGE, "weekly uptrend, daily range, discount")
+    assert gate_htf_bias(Direction.BULLISH, long_bias) is True
+    short_bias = Bias(BiasDirection.SHORT, TrendState.DOWNTREND, TrendState.DOWNTREND, "weekly and daily both downtrend")
+    assert gate_htf_bias(Direction.BEARISH, short_bias) is True
 
 
-def test_gate_htf_bias_fails_when_weekly_opposes():
-    assert gate_htf_bias(Direction.BULLISH, TrendState.DOWNTREND, TrendState.UPTREND) is False
+def test_gate_htf_bias_fails_when_direction_does_not_match_bias():
+    long_bias = Bias(BiasDirection.LONG, TrendState.UPTREND, TrendState.UPTREND, "weekly and daily both uptrend")
+    assert gate_htf_bias(Direction.BEARISH, long_bias) is False
 
 
-def test_gate_htf_bias_fails_when_daily_not_aligned():
-    assert gate_htf_bias(Direction.BULLISH, TrendState.UPTREND, TrendState.RANGE) is False
+def test_gate_htf_bias_fails_on_no_trade_bias():
+    no_trade = Bias(BiasDirection.NO_TRADE, TrendState.RANGE, TrendState.RANGE, "conflict")
+    assert gate_htf_bias(Direction.BULLISH, no_trade) is False
+    assert gate_htf_bias(Direction.BEARISH, no_trade) is False
 
 
 # ── stage2_score / grade_from_score ─────────────────────────────────────────────
@@ -200,8 +205,9 @@ def test_grade_from_score_thresholds():
 
 
 def test_stage1_gates_all_pass():
+    bias = Bias(BiasDirection.LONG, TrendState.UPTREND, TrendState.UPTREND, "weekly and daily both uptrend")
     passed, failures = stage1_gates(
-        Direction.BULLISH, TrendState.UPTREND, TrendState.UPTREND,
+        Direction.BULLISH, bias,
         _sweep(), _mss(), object(), rr=3.0, timestamp_ms=8 * 3_600_000,
         size=object(),
     )
@@ -210,8 +216,9 @@ def test_stage1_gates_all_pass():
 
 
 def test_stage1_gates_flags_each_failure_independently():
+    bias = Bias(BiasDirection.LONG, TrendState.UPTREND, TrendState.UPTREND, "weekly and daily both uptrend")
     base_kwargs = dict(
-        direction=Direction.BULLISH, weekly_trend=TrendState.UPTREND, daily_trend=TrendState.UPTREND,
+        direction=Direction.BULLISH, bias=bias,
         sweep=_sweep(), mss=_mss(), entry_zone=object(), rr=3.0, timestamp_ms=8 * 3_600_000, size=object(),
     )
     passed, failures = stage1_gates(**{**base_kwargs, "rr": 1.0})
@@ -225,6 +232,10 @@ def test_stage1_gates_flags_each_failure_independently():
 
     passed, failures = stage1_gates(**{**base_kwargs, "sweep": None})
     assert passed is False and failures == ["liquidity_event"]
+
+    no_trade_bias = Bias(BiasDirection.NO_TRADE, TrendState.RANGE, TrendState.RANGE, "conflict")
+    passed, failures = stage1_gates(**{**base_kwargs, "bias": no_trade_bias})
+    assert passed is False and failures == ["htf_bias"]
 
 
 # ── build_setup (integration) ────────────────────────────────────────────────

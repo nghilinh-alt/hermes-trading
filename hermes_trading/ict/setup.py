@@ -174,29 +174,29 @@ def in_kill_zone(timestamp_ms: int, kill_zones: Sequence[tuple[int, int]] = DEFA
     return any(start <= hour < end for start, end in kill_zones)
 
 
-def gate_htf_bias(direction: Direction, weekly_trend: TrendState, daily_trend: TrendState) -> bool:
+def gate_htf_bias(direction: Direction, bias: Bias) -> bool:
     """
-    Stage 1 gate 1's own wording ("at least Daily aligned and Weekly not
-    opposing") is looser than bias.compute_bias's S:4 long/short/no_trade
-    rule (which requires Weekly uptrend outright, or the discount/premium
-    exception) -- implemented separately per the spec's distinct wording
-    for this gate. Spec S:9.
+    Stage 1 gate 1: the setup's direction must match the already-computed
+    S:4 HTF bias. Spec S:9 phrases this gate as "at least Daily aligned and
+    Weekly not opposing" -- an EARLIER version of this function re-derived
+    that independently from raw weekly/daily TrendState values, which was
+    inconsistent with bias.compute_bias's own S:4 rule: every non-NO_TRADE
+    bias.direction already has Weekly exactly aligned (compute_bias has no
+    branch that permits Weekly=RANGE), and Daily is *either* strictly
+    aligned *or* RANGE-with-correct-discount/premium (compute_bias's own
+    permitted exception) -- the old literal "Daily must be UPTREND/DOWNTREND"
+    re-check rejected that second, spec-valid case. Trusting bias.direction
+    (computed once, upstream) avoids re-litigating it here with a stricter,
+    inconsistent rule.
     """
-    daily_aligned = (
-        (direction == Direction.BULLISH and daily_trend == TrendState.UPTREND)
-        or (direction == Direction.BEARISH and daily_trend == TrendState.DOWNTREND)
-    )
-    weekly_opposing = (
-        (direction == Direction.BULLISH and weekly_trend == TrendState.DOWNTREND)
-        or (direction == Direction.BEARISH and weekly_trend == TrendState.UPTREND)
-    )
-    return daily_aligned and not weekly_opposing
+    if direction == Direction.BULLISH:
+        return bias.direction == BiasDirection.LONG
+    return bias.direction == BiasDirection.SHORT
 
 
 def stage1_gates(
     direction: Direction,
-    weekly_trend: TrendState,
-    daily_trend: TrendState,
+    bias: Bias,
     sweep: Sweep | None,
     mss: StructureBreak | None,
     entry_zone: EntryZone | None,
@@ -209,7 +209,7 @@ def stage1_gates(
 ) -> tuple[bool, list[str]]:
     """The 7 mandatory gates -- fail any -> disqualified regardless of score. Spec S:9 Stage 1."""
     failures: list[str] = []
-    if not gate_htf_bias(direction, weekly_trend, daily_trend):
+    if not gate_htf_bias(direction, bias):
         failures.append("htf_bias")
     if sweep is None:
         failures.append("liquidity_event")
@@ -301,6 +301,8 @@ def build_setup(
     lev_max: int = 10,
     max_bars_after_mss: int = DEFAULT_MAX_BARS_AFTER_MSS,
     min_target_atr_mult: float = DEFAULT_MIN_TARGET_ATR_MULT,
+    a_plus_threshold: int = 14,
+    b_threshold: int = 11,
 ) -> TradeSetup | None:
     """
     Evaluate one bias+sweep+MSS combination end to end: pick the entry
@@ -344,14 +346,14 @@ def build_setup(
         fvg_present, ob_present, entry_zone, entry_zone_kind, dealing_range, rr,
         ote_low=ote_low, ote_high=ote_high,
     )
-    grade = grade_from_score(score)
+    grade = grade_from_score(score, a_plus_threshold=a_plus_threshold, b_threshold=b_threshold)
 
     size = None
     if entry_price is not None and stop_price is not None and grade != Grade.NONE:
         size = _position_size(equity, entry_price, stop_price, grade, lev_max=lev_max)
 
     passed, failures = stage1_gates(
-        direction, bias.weekly_trend, bias.daily_trend, sweep, mss, entry_zone, rr,
+        direction, bias, sweep, mss, entry_zone, rr,
         timestamp_ms, size, min_rr=min_rr, kill_zones=kill_zones,
     )
     if grade == Grade.NONE:

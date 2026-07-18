@@ -21,7 +21,13 @@ from hermes_trading.ict.bias import compute_bias, dealing_range
 from hermes_trading.ict.imbalance import find_breakers, find_fvg, find_order_blocks, is_displacement
 from hermes_trading.ict.liquidity import detect_sweep, liquidity_pools
 from hermes_trading.ict.risk import circuit_breaker_status, max_concurrent_ok, position_size
-from hermes_trading.ict.setup import DEFAULT_KILL_ZONES, build_setup
+from hermes_trading.ict.setup import (
+    DEFAULT_KILL_ZONES,
+    DEFAULT_MAX_BARS_AFTER_MSS,
+    DEFAULT_MIN_RR,
+    DEFAULT_MIN_TARGET_ATR_MULT,
+    build_setup,
+)
 from hermes_trading.ict.structure import detect_bos, detect_mss, find_swings
 from hermes_trading.ict.types import BiasDirection, Direction, Grade, SwingKind
 from hermes_trading.ict.util import Candle, atr
@@ -291,6 +297,12 @@ def run_backtest_single_asset(
     max_concurrent: int = 1,
     daily_loss_limit_pct: float = -0.20,
     weekly_loss_limit_pct: float = -0.40,
+    min_rr: float = DEFAULT_MIN_RR,
+    max_bars_after_mss: int = DEFAULT_MAX_BARS_AFTER_MSS,
+    min_target_atr_mult: float = DEFAULT_MIN_TARGET_ATR_MULT,
+    a_plus_threshold: int = 14,
+    b_threshold: int = 11,
+    disp_atr_mult: float = 1.5,
 ) -> BacktestResult:
     """Walk one asset's history end to end per the S:5 state machine, spec S:11."""
     exec_full = resample(candles_15m, exec_tf)
@@ -302,9 +314,9 @@ def run_backtest_single_asset(
     sweeps = detect_sweep(exec_full, pools_full, atr_period=atr_period)
     bos_events = detect_bos(exec_full, exec_swings)
     mss_events = detect_mss(exec_full, exec_swings, sweeps)
-    fvgs = find_fvg(exec_full, atr_period=atr_period)
-    order_blocks = find_order_blocks(exec_full, bos_events + mss_events, atr_period=atr_period)
-    breakers = find_breakers(order_blocks, bos_events + mss_events, exec_full, atr_period=atr_period)
+    fvgs = find_fvg(exec_full, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
+    order_blocks = find_order_blocks(exec_full, bos_events + mss_events, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
+    breakers = find_breakers(order_blocks, bos_events + mss_events, exec_full, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
     atr_series = atr(exec_full, atr_period)
 
     equity = equity0
@@ -357,12 +369,15 @@ def run_backtest_single_asset(
         dr = dealing_range(daily_swings, as_of_index=len(daily_trunc) - 1)
         pools_asof = liquidity_pools(exec_full, exec_swings, as_of_index=mss.index, atr_period=atr_period,
                                       daily_candles=daily_trunc, weekly_candles=weekly_trunc)
-        displacement = is_displacement(exec_full, mss.index, atr_period=atr_period, atr_series=atr_series)
+        displacement = is_displacement(exec_full, mss.index, atr_period=atr_period, disp_atr_mult=disp_atr_mult, atr_series=atr_series)
         timestamp_ms = exec_full[mss.index].timestamp
 
         considered += 1
         setup = build_setup(bias, sweep, mss, fvgs, order_blocks, breakers, pools_asof, dr, ref_atr,
-                             displacement, timestamp_ms, equity, kill_zones=kill_zones, lev_max=lev_max)
+                             displacement, timestamp_ms, equity, kill_zones=kill_zones, lev_max=lev_max,
+                             min_rr=min_rr, max_bars_after_mss=max_bars_after_mss,
+                             min_target_atr_mult=min_target_atr_mult,
+                             a_plus_threshold=a_plus_threshold, b_threshold=b_threshold)
         if setup is None or not setup.qualified:
             continue
         qualified += 1
