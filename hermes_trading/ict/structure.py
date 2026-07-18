@@ -102,6 +102,49 @@ def _confirmed_as_of(swings: Sequence[Swing], i: int) -> list[Swing]:
     return [s for s in swings if s.confirmed_index <= i]
 
 
+class _IncrementalTrend:
+    """
+    Maintains the alternating swing sequence (last 2 highs, last 2 lows)
+    incrementally as swings are fed in confirmed_index order -- avoids
+    detect_bos/detect_mss re-sorting and re-scanning the full swing history
+    on every single bar (O(bars x swings) -> O(bars + swings log swings)).
+    Produces identical results to calling alternate_swings()/market_structure()
+    fresh each bar, since it only ever touches the most recent same-kind
+    entry, exactly mirroring alternate_swings' own collapse rule.
+    """
+
+    __slots__ = ("last_kind", "highs", "lows")
+
+    def __init__(self) -> None:
+        self.last_kind: SwingKind | None = None
+        self.highs: list[Swing] = []
+        self.lows: list[Swing] = []
+
+    def add(self, swing: Swing) -> None:
+        target = self.highs if swing.kind == SwingKind.HIGH else self.lows
+        if self.last_kind == swing.kind and target:
+            more_extreme = (
+                swing.price > target[-1].price if swing.kind == SwingKind.HIGH else swing.price < target[-1].price
+            )
+            if more_extreme:
+                target[-1] = swing
+        else:
+            target.append(swing)
+            if len(target) > 2:
+                target.pop(0)
+            self.last_kind = swing.kind
+
+    @property
+    def trend(self) -> TrendState:
+        if len(self.highs) < 2 or len(self.lows) < 2:
+            return TrendState.RANGE
+        if self.highs[-1].price > self.highs[-2].price and self.lows[-1].price > self.lows[-2].price:
+            return TrendState.UPTREND
+        if self.highs[-1].price < self.highs[-2].price and self.lows[-1].price < self.lows[-2].price:
+            return TrendState.DOWNTREND
+        return TrendState.RANGE
+
+
 def detect_bos(candles: Sequence[Candle], swings: Sequence[Swing]) -> list[StructureBreak]:
     """
     Break of Structure: trend-continuation close beyond the most recent
@@ -111,19 +154,22 @@ def detect_bos(candles: Sequence[Candle], swings: Sequence[Swing]) -> list[Struc
     considered, so a break at i never depends on future data.
     """
     breaks: list[StructureBreak] = []
+    sorted_swings = sorted(swings, key=lambda s: s.confirmed_index)
+    tracker = _IncrementalTrend()
+    ptr, n_swings = 0, len(sorted_swings)
+
     for i, c in enumerate(candles):
-        confirmed = _confirmed_as_of(swings, i)
-        trend = market_structure(confirmed)
-        alt = alternate_swings(confirmed)
-        highs = [s for s in alt if s.kind == SwingKind.HIGH]
-        lows = [s for s in alt if s.kind == SwingKind.LOW]
-        if trend == TrendState.UPTREND and highs and c.close > highs[-1].price:
+        while ptr < n_swings and sorted_swings[ptr].confirmed_index <= i:
+            tracker.add(sorted_swings[ptr])
+            ptr += 1
+        trend = tracker.trend
+        if trend == TrendState.UPTREND and tracker.highs and c.close > tracker.highs[-1].price:
             breaks.append(
-                StructureBreak(index=i, kind=BreakKind.BOS, direction=Direction.BULLISH, broken_swing=highs[-1], close=c.close)
+                StructureBreak(index=i, kind=BreakKind.BOS, direction=Direction.BULLISH, broken_swing=tracker.highs[-1], close=c.close)
             )
-        elif trend == TrendState.DOWNTREND and lows and c.close < lows[-1].price:
+        elif trend == TrendState.DOWNTREND and tracker.lows and c.close < tracker.lows[-1].price:
             breaks.append(
-                StructureBreak(index=i, kind=BreakKind.BOS, direction=Direction.BEARISH, broken_swing=lows[-1], close=c.close)
+                StructureBreak(index=i, kind=BreakKind.BOS, direction=Direction.BEARISH, broken_swing=tracker.lows[-1], close=c.close)
             )
     return breaks
 
@@ -143,34 +189,44 @@ def detect_mss(
     from an ordinary break) -- it is simply not classified by this function.
     """
     breaks: list[StructureBreak] = []
+    sorted_swings = sorted(swings, key=lambda s: s.confirmed_index)
+    sorted_sweeps = sorted(sweeps, key=lambda sw: sw.index)
+    tracker = _IncrementalTrend()
+    swing_ptr, n_swings = 0, len(sorted_swings)
+    sweep_ptr, n_sweeps = 0, len(sorted_sweeps)
+    last_sweep: Sweep | None = None
+
     for i, c in enumerate(candles):
-        prior_sweeps = [sw for sw in sweeps if sw.index <= i]
-        if not prior_sweeps:
+        while swing_ptr < n_swings and sorted_swings[swing_ptr].confirmed_index <= i:
+            tracker.add(sorted_swings[swing_ptr])
+            swing_ptr += 1
+        while sweep_ptr < n_sweeps and sorted_sweeps[sweep_ptr].index <= i:
+            candidate = sorted_sweeps[sweep_ptr]
+            # Ties (multiple sweeps at the same bar) keep the first one seen,
+            # matching max(prior_sweeps, key=lambda sw: sw.index)'s tie behavior.
+            if last_sweep is None or candidate.index > last_sweep.index:
+                last_sweep = candidate
+            sweep_ptr += 1
+        if last_sweep is None:
             continue
-        last_sweep = max(prior_sweeps, key=lambda sw: sw.index)
 
-        confirmed = _confirmed_as_of(swings, i)
-        trend = market_structure(confirmed)
-        alt = alternate_swings(confirmed)
-        highs = [s for s in alt if s.kind == SwingKind.HIGH]
-        lows = [s for s in alt if s.kind == SwingKind.LOW]
-
+        trend = tracker.trend
         if (
             trend == TrendState.DOWNTREND
-            and highs
-            and c.close > highs[-1].price
+            and tracker.highs
+            and c.close > tracker.highs[-1].price
             and last_sweep.direction == Direction.BULLISH
         ):
             breaks.append(
-                StructureBreak(index=i, kind=BreakKind.MSS, direction=Direction.BULLISH, broken_swing=highs[-1], close=c.close)
+                StructureBreak(index=i, kind=BreakKind.MSS, direction=Direction.BULLISH, broken_swing=tracker.highs[-1], close=c.close)
             )
         elif (
             trend == TrendState.UPTREND
-            and lows
-            and c.close < lows[-1].price
+            and tracker.lows
+            and c.close < tracker.lows[-1].price
             and last_sweep.direction == Direction.BEARISH
         ):
             breaks.append(
-                StructureBreak(index=i, kind=BreakKind.MSS, direction=Direction.BEARISH, broken_swing=lows[-1], close=c.close)
+                StructureBreak(index=i, kind=BreakKind.MSS, direction=Direction.BEARISH, broken_swing=tracker.lows[-1], close=c.close)
             )
     return breaks

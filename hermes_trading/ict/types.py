@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 
 class Direction(str, Enum):
@@ -199,3 +199,79 @@ class PremiumDiscount:
     retracement_pct: float
     zone: PremiumDiscountZone
     in_ote: bool
+
+
+# ── Phase 2: setup qualification, sizing, backtest ───────────────────────────
+
+
+class SetupState(str, Enum):
+    """Per-asset, per-bias setup lifecycle. Spec S:5."""
+
+    IDLE = "idle"
+    BIAS_SET = "bias_set"
+    LIQUIDITY_MAPPED = "liquidity_mapped"
+    SWEEP_DETECTED = "sweep_detected"
+    MSS_CONFIRMED = "mss_confirmed"
+    ENTRY_ARMED = "entry_armed"
+    IN_TRADE = "in_trade"
+    MANAGING = "managing"
+    CLOSED = "closed"
+    INVALIDATED = "invalidated"
+
+
+class Grade(str, Enum):
+    """Stage 2 setup grade. Spec S:9."""
+
+    A_PLUS = "a_plus"
+    B = "b"
+    NONE = "none"
+
+
+class EntryZoneKind(str, Enum):
+    FVG = "fvg"
+    ORDER_BLOCK = "order_block"
+    BREAKER = "breaker"
+
+
+EntryZone = Union[FVG, OrderBlock, Breaker]
+
+
+@dataclass(frozen=True)
+class TradeSetup:
+    """
+    The result of evaluating one bias+sweep+MSS combination for a trade.
+    Always returned once a bias direction exists (Bias.direction is not
+    NO_TRADE) so callers can see *why* a setup was rejected, not just that
+    it was -- entry/stop/target/rr are None if no valid zone/target was
+    found; check `.qualified` (Stage 1 passed AND Grade != NONE) before
+    treating it as a real trade. Spec S:6, S:9.
+    """
+
+    direction: Direction
+    bias: Bias
+    sweep: Sweep
+    mss: StructureBreak
+    entry_zone: Optional[EntryZone]
+    entry_zone_kind: Optional[EntryZoneKind]
+    entry_price: Optional[float]
+    stop_price: Optional[float]
+    target_price: Optional[float]
+    rr: Optional[float]
+    score: int
+    grade: Grade
+    gate_failures: tuple[str, ...] = ()
+
+    @property
+    def qualified(self) -> bool:
+        return not self.gate_failures and self.grade != Grade.NONE
+
+
+@dataclass(frozen=True)
+class PositionSize:
+    """Sizing result for a qualified setup. Spec S:7."""
+
+    risk_usd: float
+    notional: float
+    leverage: int
+    qty: float
+    stop_pct: float

@@ -217,3 +217,24 @@ def test_detect_mss_wrong_direction_sweep_does_not_qualify():
     # A bearish sweep doesn't set up a bullish MSS.
     sweep = Sweep(index=7, pool=_ssl_pool(120, 0), penetration=1.0, direction=Direction.BEARISH)
     assert detect_mss(candles, swings, sweeps=[sweep]) == []
+
+
+def test_detect_mss_tie_break_on_same_bar_sweeps_keeps_the_first():
+    """
+    Regression: when multiple sweeps land on the same bar, "the last sweep"
+    must resolve the same way as max(sweeps, key=lambda sw: sw.index) --
+    first-seen wins among ties -- not whichever happens to be iterated last.
+    """
+    swings = [
+        Swing(0, 120, SwingKind.HIGH, 1),
+        Swing(2, 100, SwingKind.LOW, 3),
+        Swing(4, 110, SwingKind.HIGH, 5),
+        Swing(6, 90, SwingKind.LOW, 7),
+    ]
+    candles = make_candles([(100, 101, 99, 100)] * 8 + [(110, 113, 109, 112)])
+    # Both sweeps confirm on bar 7; the correct-direction one is listed first.
+    bullish_first = Sweep(index=7, pool=_ssl_pool(90, 6), penetration=1.0, direction=Direction.BULLISH)
+    bearish_second = Sweep(index=7, pool=_ssl_pool(120, 0), penetration=1.0, direction=Direction.BEARISH)
+    breaks = detect_mss(candles, swings, sweeps=[bullish_first, bearish_second])
+    assert len(breaks) == 1
+    assert breaks[0].direction == Direction.BULLISH

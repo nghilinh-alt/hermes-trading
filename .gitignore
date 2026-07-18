@@ -4,6 +4,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .Python
+.pytest_cache/
+.coverage
 
 # IDE settings
 .idea/
@@ -18,6 +20,9 @@ Thumbs.db
 # Environment variables (secrets)
 .env
 state/.env
+
+# ICT backtest data -- large, regeneratable via tools/fetch_ict_backtest_data.py, goes stale
+data/ict-backtest/
 
 # Trading state and logs (optional - remove from git if not tracked)
 state/*.json
