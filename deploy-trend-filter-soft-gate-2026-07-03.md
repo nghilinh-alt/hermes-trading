@@ -45,8 +45,15 @@ scp C:\Users\nghil\Projects\Hermes\Hermes-Trading\state\xrp_usdt\strategy.yaml r
 ## Step 5 — Validate syntax on VPS
 
 ```powershell
-ssh root@187.127.108.173 "cd /opt/trading/hermes_trading && .venv/bin/python -m py_compile hermes_trading/loop.py && echo SYNTAX_OK && .venv/bin/python -c \"import yaml; [yaml.safe_load(open(f'state/{a}/strategy.yaml')) for a in ['btc_usdt','eth_usdt','sol_usdt','xrp_usdt']]; print('YAML_OK')\" && echo DONE"
+@'
+cd /opt/trading/hermes_trading
+.venv/bin/python -m py_compile hermes_trading/loop.py && echo SYNTAX_OK
+.venv/bin/python -c 'import yaml; [yaml.safe_load(open(f"state/{a}/strategy.yaml")) for a in ["btc_usdt","eth_usdt","sol_usdt","xrp_usdt"]]; print("YAML_OK")'
+echo DONE
+'@ | ssh root@187.127.108.173 bash
 ```
+
+(Using a PowerShell here-string piped to `ssh ... bash` instead of a quoted command string — the previous version had a Python string nested inside an escaped double-quote nested inside a PowerShell double-quoted string, three layers of quoting that PowerShell would have mangled the same way it mangled `$d` and `$f` earlier.)
 
 ## Step 6 — Restart the bot
 
@@ -57,8 +64,14 @@ ssh root@187.127.108.173 "pkill -f hermes_trading.run; sleep 2; cd /opt/trading/
 ## Step 7 — Verify heartbeats came back fresh
 
 ```powershell
-ssh root@187.127.108.173 "sleep 20 && for f in /opt/trading/hermes_trading/state/*/heartbeat.json; do echo $f; cat $f; echo; done && echo DONE"
+@'
+sleep 20
+for f in /opt/trading/hermes_trading/state/*/heartbeat.json; do echo $f; cat $f; echo; done
+echo DONE
+'@ | ssh root@187.127.108.173 bash
 ```
+
+(Same here-string fix — `$f` was getting eaten by PowerShell the same way `$d` did in the earlier backup step.)
 
 ## Step 8 — Smoke-check the new log line shows up (may take up to 15 min for first tick)
 

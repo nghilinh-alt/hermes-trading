@@ -1,0 +1,52 @@
+# HerMES-Trading — SCALP worker goal configuration
+# Loaded only when the worker is started with STATE_DIR=state-scalp.
+# This is a SEPARATE process from the live 15m swing worker (STATE_DIR=state).
+# It shares the same code + Bybit account but has its own state tree, trade
+# logs, reflection state, and — critically — its own gate set (see per-asset
+# strategy.yaml). Nothing here touches the live BTC/ETH/SOL/XRP swing loops.
+
+asset: BTC/USDT   # Primary asset (used if assets list is absent)
+assets:           # Scalp basket — "start on several" (Linh, 2026-07-13)
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - XRP/USDT
+mode: paper       # START IN PAPER. Flip to live per-asset only after 3-5 clean days.
+timeframe: 15m    # Same candle feed as the live worker (Linh's choice) — no TF conflict.
+
+# Risk Management (worker-level; per-trade gates live in each strategy.yaml)
+risk:
+  max_position_usd: 100.0
+  stop_loss_pct: 0.6                 # scalp-tight; overridden per asset
+  take_profit_pct: 0.8               # scalp-tight; overridden per asset
+  trailing_stop_pct: 0.4
+
+# Reflection & Learning
+reflection_every: 5                  # Scalp WILL actually hit this (unlike the live assets).
+reflection:
+  enabled: true
+  interval_seconds: 3600
+  consider_past_trades: true
+  target_improvement_pct: 1.5
+
+score:
+  metrics:
+    - pnl
+    - sharpe_ratio
+    - win_rate
+    - max_drawdown
+
+data:
+  exchanges: ["bybit"]
+  macro_sources: ["federalreserve", "tradingeconomics"]
+  news_api_key: ""
+  onchain_api_key: ""
+
+objective:
+  type: pnl
+  target_value: 25.0
+  timeline_days: 30
+
+environment:
+  log_level: "INFO"
+  output_format: "rich"

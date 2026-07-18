@@ -1,0 +1,104 @@
+# SCALP strategy template — session 15 (2026-07-13)
+# Copy into each scalp asset dir: state-scalp/btc_usdt/strategy.yaml, etc.
+# (set `asset:` accordingly). Draft values — TO BE TUNED IN PAPER.
+#
+# Design intent: multi-timeframe S/R confluence entries with VWAP + 50MA + 200MA
+# trend context, tight targets, many trades. Every gate below is deliberately
+# INVERTED from the live swing configs (which target 3%+ moves). See
+# plan-scalp-strategy-2026-07-13.md for the full rationale and the before/after
+# gate table.
+#
+# NOTE: two indicators referenced here DO NOT EXIST YET and are built in step 1
+#   - sma_200      (net-new; needs fetch limit >= 250 — see deploy-scalp-step1)
+#   - mtf_sr_zone  (net-new; multi-TF S/R as tolerance bands + confluence count)
+# vwap and ema_trend(50) already exist in price.py and are reused as-is.
+
+version: '01'
+asset: BTC/USDT           # <-- change per asset when copying
+trading_mode: paper       # paper until 3-5 clean days, then flip per asset
+
+# ── Entry gate ────────────────────────────────────────────────────────────
+entry:
+  direction: both
+  min_confidence: 0.4     # (live: 0.5) fewer indicators in the scalp set
+  min_indicators: 2       # (live: 3)
+
+# ── Scalp indicator set: VWAP + 50MA + 200MA + multi-TF S/R zones ──────────
+indicators:
+- name: mtf_sr_zone       # NET-NEW — the entry trigger (price reacting at a zone)
+  required: false
+  weight: 1.0
+  params:
+    timeframes: [15m, 1h, 4h]
+    tolerance_pct: 0.25    # how close to a level counts as "in the zone"
+    min_confluence: 2      # how many TFs must agree near the price
+- name: vwap              # existing — intraday fair-value / bias
+  required: false
+  weight: 0.6
+  params: {}
+- name: ema_trend         # existing "50MA" — fast trend
+  required: false
+  weight: 0.5
+  params:
+    period: 50
+- name: sma_200           # NET-NEW "200MA" — slow trend anchor (SMA recommended over EMA)
+  required: false
+  weight: 0.5
+  params:
+    period: 200
+
+# ── SL/TP: tight, scalp-scaled (INVERTED from live) ────────────────────────
+stop_loss_pct: 0.5        # (live: 2.0) fallback if no structural level
+sl_buffer_pct: 0.1        # (live: 0.3)
+max_sl_pct: 1.0           # (live: 5.0) refuse anything but a tight stop
+min_tp_pct: 0.4           # (live: 3.0) THE key change — was the #1 trade-killer
+min_rr_ratio: 1.2         # (live: 2.0) scalps live on hit-rate, not 2:1 payoff
+min_profit_usd: 1.0       # (live: 5.0) a 0.5% target on small size won't clear $5
+trail_atr_mult: 1.0       # (live: 2.0) tighter trail
+
+# ── Sizing ─────────────────────────────────────────────────────────────────
+position_size_r: 0.8
+risk_per_trade: 0.02
+position_pct: 0.10
+position_pct_curve:
+- - 0.4
+  - 0.10
+- - 0.7
+  - 0.15
+- - 1.0
+  - 0.20
+min_leverage: 3
+max_leverage: 8
+leverage_curve:
+- - 0.5
+  - 4
+- - 0.6
+  - 5
+- - 0.75
+  - 7
+- - 1.0
+  - 8
+
+# ── Frequency: scalp is a volume game ──────────────────────────────────────
+max_trades_per_day: 15    # (live: 3)
+# session filter intentionally OMITTED (live had session_blocked_end_utc: 7,
+# which discarded ~29% of the day). Add back only if paper shows dead hours.
+
+# ── Trend filter: keep the daily-bias gate, it's cheap protection ──────────
+trend_filter:
+  enabled: true
+  daily_ema_period: 20
+  ema_4h_period: 50
+  ambiguous_band_pct: 0.3
+  trend_4h_soft_discount: 0.7
+
+# Portfolio daily loss cap — separate pool from the live worker
+max_portfolio_daily_loss_usd: 40.0
+
+# ── Reflection guard rails (scalp WILL trigger reflection) ─────────────────
+# Bound the tunable ranges so Hermes can't drift these back toward swing values
+# and re-strangle the scalp. Enforced in step 1's reflect.py change (see deploy doc).
+reflect_bounds:
+  min_tp_pct:   [0.3, 1.0]
+  min_rr_ratio: [1.0, 1.5]
+  min_confidence: [0.35, 0.55]
