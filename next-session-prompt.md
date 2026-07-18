@@ -4,66 +4,50 @@ Copy the block below into a fresh chat. Self-contained, but the agent should imm
 
 ---
 
-You are continuing work on Hermes-Trading, a self-improving crypto trading bot for Rogue Night (sole director Linh). The bot runs LIVE on Bybit via ccxt, trades BTC/ETH/SOL/XRP USDT-perp on a 15m timeframe (TAO is currently disabled — `trading_enabled: false`) with multi-indicator confidence scoring and a Hermes-driven (Ollama qwen2.5:3b) reflection loop.
+You are continuing work on Hermes-Trading for Rogue Night (sole director Linh). **As of session 18 (2026-07-18), the old indicator-weight live agent is HALTED and archived.** The project pivoted to building a new **ICT (Inner Circle Trader) swing strategy** — Phase 1 (mechanical detection primitives + tests) is built and shipped; nothing beyond that is built yet.
 
 ## First thing to do this session
 
-1. Read `C:\Users\nghil\Projects\Hermes\Hermes-Trading\memory.md` in full — Last Updated, Key Decisions table, Handoffs section. Session 14 (2026-07-08) is the most recent and has the live open item.
-2. Read `C:\Users\nghil\Projects\Hermes\Hermes-Trading\diagnosis-session-14-2026-07-08.md` — full trade-frequency root-cause analysis.
+1. Read `C:\Users\nghil\Projects\Hermes\Hermes-Trading\memory.md` in full — Last Updated (session 18), Handoffs section (session 18 entry).
+2. Read `C:\Users\nghil\Projects\Hermes\Hermes-Trading\ict-strategy-plan-2026-07-18.md` — the mechanical spec, all sections, especially S:11 (backtester design) if Phase 2 is the next task.
+3. Read `C:\Users\nghil\Projects\Hermes\Hermes-Trading\ict-claude-code-prompt.md` — the Phase 1 build prompt (context on what's already done and why).
 
 Per CLAUDE.md: read team memory at session start, update it before ending.
 
-## Where things stand (as of session 14, 2026-07-08)
+## Where things stand (as of session 18, 2026-07-18)
 
-**Trade frequency root cause found, decision pending with Linh — nothing deployed yet:**
-
-- Session 12 (07-03) fixed a hard AND-gate in the trend filter (daily EMA20 vs 4h EMA50) that was blocking BTC/XRP on nearly every tick. Confirmed via a restart-scoped live diagnostic (process running continuously since the 07-03 11:35 deploy, no crashes since) that this fix **works exactly as intended** — 4h-disagreement and ambiguous-band skips are both negligible (6 and 59 respectively over 4d20h).
-- The actual dominant blocker, previously misdiagnosed as SOL-specific, is **`min_tp_pct: 3.0%`** in `execution.py::_structural_sl_tp()` — the structural-TP guard that only runs after a signal clears every upstream gate. It rejected 3255 attempts across BTC(982)/ETH(1057)/SOL(673)/TAO(332)/XRP(211) over the same window — more rejections than the session-hours time block itself (2240).
-- Reflection-driven gate drift was ruled out: `hypotheses.jsonl` is empty for all 5 assets on the live VPS — no asset has reached the 5-closed-trade `reflection_every` threshold, so Hermes hasn't mutated anything since the deploy.
-- **Open decision for Linh**: lower `min_tp_pct` (frequency should recover sharply — this is the whole gap) or leave it as a deliberate 3% quality floor. **Ask Linh first thing this session whether a decision has been made.** If yes, implement one variable at a time per the project's standing discipline, write a `deploy-*.md` doc before touching the VPS, and don't bundle it with anything else.
-- Separately, unrelated to trade frequency: the position-sizing/leverage fix from session 12 (`d8a49c7`, `75ef76b` — `position_notional` now actually multiplies margin × leverage) is implemented locally but **still not deployed**. It was deliberately held back to isolate the trend-filter fix's effect; that isolation period has now run its course, so it may be ready to deploy once Linh has separately weighed in — confirm with Linh, don't assume.
-
-## Known standing issues (not yet fixed, don't need re-diagnosis)
-
-- **BTC/ETH/SOL `trades.jsonl` were 0 lines as of the 07-08 diagnostic** — flagged since session 11, still unresolved. Low trade count so far is largely explained by `min_tp_pct`, but worth re-checking after any frequency fix to confirm the files are actually being written to, not silently broken.
-- **TAO disabled** (`trading_enabled: false`) but still shadow-evaluates entries for logging/paper purposes — confirm with Linh whether TAO should stay off or be re-enabled once XRP/other assets are healthier.
+- **Old live agent**: halted. Pre-halt check confirmed zero open positions on Bybit for all 5 assets, then `pkill -f hermes_trading.run` on the VPS. Fully archived at `archive/live-paper-archived-2026-07-18/` (full `state/` trees, `state-scalp/`, legacy root `strategy.yaml`). Rollback command is in that archive's README if ever needed — VPS `.venv`/code/state were left in place, only the process was killed.
+- **ICT Phase 1**: `hermes_trading/ict/` (types, structure, liquidity, imbalance, bias) + `hermes_trading/brokers/base.py` (interface only), built exactly to the Phase 1 scope in `ict-claude-code-prompt.md`. 66 tests, 96% coverage, all green. Committed (`61d3af6` archive, `1b6efaa` ICT) and pushed to GitHub + the VPS staging clone.
+- **Not started**: Phase 2 (event-driven backtester, spec S:11), Phase 3 (scanner), Phase 4+ (paper/live worker, futures adapter). The build prompt explicitly gates Phase 2 behind Linh's sign-off on Phase 1 — **do not start the backtester unless Linh has reviewed/approved Phase 1 first.**
+- **Open item**: `tests/ict/fixtures/README.md` flags that Phase 1's fixtures are synthetic (hand-built + a seeded stress test), not real exchange data, because this session's Python env had a broken project `.venv` and no `ccxt` in the system Python. Worth a real-data validation pass before backtesting if a working venv becomes available.
 
 ## Hard-won operational lessons — do not relearn
 
-1. **This sandbox has no VPS network access** (`/dev/tcp/187.127.108.173/22` unreachable — confirmed every session since at least session 12). All VPS diagnostics require Linh to run an SSH block from her own PowerShell and paste back output. Don't attempt to work around this via any other network path.
+1. **VPS network access status is UNCERTAIN — re-verify each session, don't assume.** Sessions 12-17 all noted "no VPS network access from this sandbox." Session 18 found direct SSH worked fine (`ssh 187.127.108.173` using `~/.ssh/hermes_vps`, configured in `~/.ssh/config`). Test with a harmless read-only command (`ssh 187.127.108.173 whoami`) before either assuming you're blocked (and asking Linh to run SSH blocks manually) or assuming you have access.
 
-2. **`bot.log` is append-mode across restarts** — a full-log `grep -c` can silently include history from before the change you're trying to measure. Always scope counts to the current process run: `ps -p $(pgrep -f hermes_trading.run) -o lstart,etime` to get the current process's start time, then find the matching `nohup: ignoring input` line in `bot.log` (each restart writes one) and `tail -n +N` from there before counting anything.
+2. **The local project `.venv` is broken in this sandbox**: `.venv/pyvenv.cfg` has `home = /usr/bin` and `.venv/bin/python` is a dangling symlink (works in a different environment, not here). Use the system Python (`python`, `python -m pytest` — both on PATH; `pytest` is installed globally even though only recently added to `pyproject.toml`'s `dev` extra; `ccxt` is NOT in the system Python). Check `python -c "import hermes_trading"` works before assuming an import path problem is a real bug.
 
-3. **Some skip-reason strings live in `execution.py` (raised as `ValueError`, caught and logged by `loop.py`'s generic "Entry skipped — {e}" wrapper), not in the per-tick entry-evaluation logging in `loop.py`.** `min_tp_pct`, `max_sl_pct`, and `min_profit_usd` failures all come through this path. Grep the specific exception text (e.g. `"Structural TP too thin"`), not just the generic wrapper string — the wrapper uses an em-dash (`—`) that doesn't always survive the SSH/PowerShell round-trip cleanly and can silently under-count.
+3. **`bot.log` is append-mode across restarts** — a full-log `grep -c` can silently include history from before the change you're trying to measure. Always scope counts to the current process run: `ps -p $(pgrep -f hermes_trading.run) -o lstart,etime` to get the current process's start time, then find the matching `nohup: ignoring input` line in `bot.log` (each restart writes one) and `tail -n +N` from there before counting anything. (Only relevant if the old agent is ever restarted — it's halted as of session 18.)
 
-4. **The `FIRE`/`NO-FIRE` string only exists in `evaluation_summary`, a field written into trade records** — it is never printed to `bot.log`. Don't grep the log for it as a proxy for "did a signal fire."
+4. **PowerShell quote tax via SSH** (if working from PowerShell rather than this sandbox's bash): embedded `"..."` in single-quoted PowerShell strings get stripped unpredictably, especially around `(`, `)`, `|`. Quote every `echo` argument that contains punctuation; prefer a here-string piped to ssh (`@'...'@ | ssh root@host bash`) for anything multi-line.
 
-5. **PowerShell quote tax via SSH**: embedded `"..."` in single-quoted PowerShell strings get stripped unpredictably, especially around `(`, `)`, `|`, nested quotes, and unquoted `echo` arguments containing parentheses will break `bash` with a syntax error. Workarounds:
-   - Quote every `echo` argument that contains punctuation: `echo "--- like this ---"`, never `echo --- like this ---`.
-   - Here-string piped to ssh: `@'...'@ | ssh root@host bash`
-   - Doubled single quotes inside a PowerShell single-quoted string collapse to one literal `'`.
-   - Never trust a quoting pattern that worked once; it may break on the next invocation.
+5. **VPS layout is two clones**:
+   - `/opt/trading/hermes-trading/` (HYPHEN) — git pull / staging target. Now also holds the ICT Phase 1 code (synced via scp session 18, not yet `git pull`-ed there — do that before making further edits in that clone).
+   - `/opt/trading/hermes_trading/` (UNDERSCORE) — old agent's runtime dir. Has `.venv/`, top-level `bot.log`, `state/<slug>/`. Worker process is halted; files untouched.
+   - **Never blind-`cp` strategy.yamls** between them if the old system is ever revived — they may be reflection-evolved. Diff first.
 
-6. **VPS layout is two clones**:
-   - `/opt/trading/hermes-trading/` (HYPHEN) — git pull target only, staging.
-   - `/opt/trading/hermes_trading/` (UNDERSCORE) — running agent. Has `.venv/`, top-level `bot.log`, `state/<slug>/`.
-   - Deploy pattern: `git pull` in hyphen clone (or `scp` directly), then `cp`/`scp` files into the underscore clone.
-   - **Never blind-`cp` strategy.yamls** between them — they may be reflection-evolved. Diff first.
+6. **Git locks on the Windows mount** (`.git/index.lock`, `.git/HEAD.lock`): both showed up stale (3+ days old, no active git process) this session and were safely removed before retrying. If you hit `fatal: Unable to create '.../.git/*.lock': File exists`, check `ps aux | grep git` first (should be empty) and the lock file's mtime before deleting it.
 
-7. **One deploy step per PowerShell block.** Never combine diff+cp or pull+cp+restart in the same block — Linh may only run part of it, or a mid-block failure leaves things in a partial state that's hard to diagnose after the fact.
-
-8. **Daemonizing over non-interactive SSH**: use `setsid .venv/bin/python -m hermes_trading.run >> bot.log 2>&1 &`, not `nohup ... & disown` (disown doesn't work in non-interactive one-liners) — confirmed working in the session 12 deploy after an earlier restart failure.
-
-9. **Git locks on the Windows mount** (`.git/index.lock`): can't be deleted, but can be moved — `Remove-Item .git\index.lock -Force -ErrorAction SilentlyContinue` from PowerShell before `git add`.
+7. **`pkill -f <pattern>` self-match gotcha**: if your SSH command's own text contains the same pattern you're killing (e.g. `ssh host "pkill -f hermes_trading.run; pgrep -af hermes_trading.run"` — the command line itself contains "hermes_trading.run"), `pkill` may kill the wrapping shell too, dropping the SSH connection with a bare exit code before any output prints. Don't read that as failure — re-check with a plain `pgrep -af <target>` in a fresh, minimal SSH call.
 
 ## Style + protocol reminders
 
 - All outputs saved as `.md` to the project folder.
 - Flag client-facing deliverables for Linh's review before sending. (This project has no clients yet — everything so far is internal, but the rule stands.)
 - Update `memory.md` before ending each session: Last Updated, Key Decisions, Handoffs.
-- No VPS deploy or gate change without Linh's explicit sign-off — this project has been burned before by bundling multiple changes into one deploy and losing the ability to attribute effects.
-- Change one variable at a time, measure over a fixed window (3–5 days minimum) before stacking the next change.
+- No VPS deploy or gate change without Linh's explicit sign-off — this project has been burned before by bundling multiple changes into one deploy and losing the ability to attribute effects. (Applies to the old system; the ICT system has no live/VPS execution path yet at all.)
+- Change one variable at a time, measure over a fixed window before stacking the next change.
 
 ## Start of session
 
-Read `memory.md`, then ask Linh: has a decision been made on `min_tp_pct`? If yes, implement + write a `deploy-*.md` doc, one variable at a time. If not, don't propose new changes unprompted — the diagnosis is done, the ball is in Linh's court.
+Read `memory.md`, then ask Linh: has Phase 1 (ICT primitives + tests) been reviewed? If approved, move to Phase 2 (backtester, spec S:11) — read that section closely before writing any code, since it introduces new constraints (multi-TF alignment, fills/costs, walk-forward validation). If not yet reviewed, don't start Phase 2 unprompted.
