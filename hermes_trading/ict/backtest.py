@@ -196,6 +196,42 @@ def _search_fill(exec_full, start_index, entry_price, direction, sweep, mss, ttl
     return None
 
 
+def resolve_setup_status(exec_full, start_index, entry_price, direction, sweep, mss, ttl_bars, as_of_index,
+                          atr_series=None, mss_retrace_buffer_mult: float = DEFAULT_MSS_RETRACE_BUFFER_MULT):
+    """
+    Resolve a candidate setup's status as of `as_of_index` -- the most
+    recent bar available "now" -- rather than a fixed historical lookahead
+    window. Generalizes `_search_fill`'s fill/invalidate walk so the same
+    logic drives both the backtest (which always knows the full history
+    up front) and the live scanner (which only knows "now" and genuinely
+    doesn't know the future). Spec S:5.
+
+    Returns one of:
+      ("filled", fill_index)   -- limit order touched, not invalidated first
+      ("invalidated", None)    -- sweep-extreme or MSS-retrace breach first
+      ("expired", None)        -- TTL window fully elapsed with neither
+      ("pending", None)        -- still inside the TTL window, unresolved
+                                   either way -- this is what a live scanner
+                                   should alert on (spec S:5 ENTRY_ARMED)
+
+    `_search_fill(..., ttl_bars)` is equivalent to calling this with
+    `as_of_index >= start_index + ttl_bars` and reading the fill index (or
+    None) back out -- same window, same walk, same invalidation rule.
+    """
+    ttl_end_index = start_index + ttl_bars
+    scan_end = min(as_of_index, ttl_end_index, len(exec_full) - 1)
+    for j in range(start_index, scan_end + 1):
+        c = exec_full[j]
+        atr_value = atr_series[j] if atr_series is not None else None
+        if _invalidated(direction, c, sweep, mss, atr_value, mss_retrace_buffer_mult):
+            return "invalidated", None
+        if c.low <= entry_price <= c.high:
+            return "filled", j
+    if as_of_index >= ttl_end_index:
+        return "expired", None
+    return "pending", None
+
+
 def _manage_position(
     exec_full: Sequence[Candle],
     exec_swings,

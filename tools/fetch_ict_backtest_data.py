@@ -16,7 +16,7 @@ import ccxt
 
 ASSETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "TAO/USDT"]
 TIMEFRAME = "15m"
-DAYS_BACK = 730
+DAYS_BACK = 1825  # 5 years -- clipped automatically per-asset by fetch_asset() to whatever's actually listed
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "ict-backtest"
 
 
