@@ -23,6 +23,8 @@ state/.env
 
 # ICT backtest data -- large, regeneratable via tools/fetch_ict_backtest_data.py, goes stale
 data/ict-backtest/
+data/ict-live/
+state-ict/
 
 # Trading state and logs (optional - remove from git if not tracked)
 state/*.json
