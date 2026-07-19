@@ -143,39 +143,52 @@ def _matching_sweep(sweeps, mss):
     return max(prior, key=lambda sw: sw.index)
 
 
-def _invalidated(direction: Direction, candle: Candle, sweep, mss) -> bool:
+DEFAULT_MSS_RETRACE_BUFFER_MULT = 0.25
+
+
+def _invalidated(direction: Direction, candle: Candle, sweep, mss, atr_value: float | None,
+                  mss_retrace_buffer_mult: float = DEFAULT_MSS_RETRACE_BUFFER_MULT) -> bool:
     """
     Spec S:5: price closes beyond the sweep extreme, or the MSS is fully
-    retraced. "Fully retraced" is read as the bar's CLOSE going back beyond
-    mss.broken_swing.price (the exact level whose break confirmed the MSS)
-    -- consistent with BOS/MSS detection itself being close-based, not
-    wick-based, throughout structure.py. A limit-fill wick that merely
-    TOUCHES the entry zone without the bar's close breaching that level is
-    not, by itself, invalidation -- the entry zone typically sits close to
-    the break level, not far beyond it, so a normal retracement-and-fill
-    does not require the close to violate this level.
+    retraced.
+
+    "Fully retraced" requires the bar's CLOSE to clear mss.broken_swing.price
+    (the level whose break confirmed the MSS) by a meaningful ATR-scaled
+    margin, not merely graze it. A first-attempt retracement bar that dips
+    into the entry zone -- which typically sits close to (often just below)
+    the break level by construction -- will very often close somewhere
+    near that level without having fully reclaimed it within a single 1H
+    bar; treating any close-below-the-line as "fully retraced" invalidated
+    ~38% of same-bar touches purely on this graze, discarding what was
+    usually a normal retracement-in-progress, not a failed reversal.
+    Requiring a real margin (matching how every other spec threshold in
+    this codebase is ATR-scaled, e.g. sl_buffer, sweep_penetration) keeps
+    this a distinct, meaningful signal from the sweep-extreme check.
+    `atr_value=None` (insufficient history) disables this specific check.
     """
     if direction == Direction.BULLISH:
         wick_extreme = sweep.pool.price - sweep.penetration
         if candle.close < wick_extreme:
             return True
-        if candle.close < mss.broken_swing.price:
+        if atr_value is not None and candle.close < mss.broken_swing.price - mss_retrace_buffer_mult * atr_value:
             return True
     else:
         wick_extreme = sweep.pool.price + sweep.penetration
         if candle.close > wick_extreme:
             return True
-        if candle.close > mss.broken_swing.price:
+        if atr_value is not None and candle.close > mss.broken_swing.price + mss_retrace_buffer_mult * atr_value:
             return True
     return False
 
 
-def _search_fill(exec_full, start_index, entry_price, direction, sweep, mss, ttl_bars):
+def _search_fill(exec_full, start_index, entry_price, direction, sweep, mss, ttl_bars, atr_series=None,
+                  mss_retrace_buffer_mult: float = DEFAULT_MSS_RETRACE_BUFFER_MULT):
     """Walk forward looking for a limit fill, invalidation, or TTL timeout. Spec S:5."""
     end = min(start_index + ttl_bars, len(exec_full) - 1)
     for j in range(start_index, end + 1):
         c = exec_full[j]
-        if _invalidated(direction, c, sweep, mss):
+        atr_value = atr_series[j] if atr_series is not None else None
+        if _invalidated(direction, c, sweep, mss, atr_value, mss_retrace_buffer_mult):
             return None
         if c.low <= entry_price <= c.high:
             return j
@@ -303,6 +316,7 @@ def run_backtest_single_asset(
     a_plus_threshold: int = 14,
     b_threshold: int = 11,
     disp_atr_mult: float = 1.5,
+    mss_retrace_buffer_mult: float = DEFAULT_MSS_RETRACE_BUFFER_MULT,
 ) -> BacktestResult:
     """Walk one asset's history end to end per the S:5 state machine, spec S:11."""
     exec_full = resample(candles_15m, exec_tf)
@@ -386,7 +400,8 @@ def run_backtest_single_asset(
         if size is None or not max_concurrent_ok(0, max_concurrent=max_concurrent):
             continue
 
-        fill_index = _search_fill(exec_full, mss.index + 1, setup.entry_price, setup.direction, sweep, mss, state_ttl_bars)
+        fill_index = _search_fill(exec_full, mss.index + 1, setup.entry_price, setup.direction, sweep, mss,
+                                   state_ttl_bars, atr_series=atr_series, mss_retrace_buffer_mult=mss_retrace_buffer_mult)
         if fill_index is None:
             continue
 

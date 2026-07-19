@@ -107,20 +107,42 @@ def _bullish_sweep_and_mss():
 def test_invalidated_when_close_beyond_sweep_extreme():
     sweep, mss = _bullish_sweep_and_mss()
     candle = Candle(timestamp=0, open=98, high=99, low=95, close=96, volume=1)  # closes below 97
-    assert _invalidated(Direction.BULLISH, candle, sweep, mss) is True
+    assert _invalidated(Direction.BULLISH, candle, sweep, mss, atr_value=8.0) is True
 
 
-def test_invalidated_when_mss_fully_retraced():
+def test_invalidated_when_mss_fully_retraced_by_a_meaningful_margin():
     sweep, mss = _bullish_sweep_and_mss()
-    candle = Candle(timestamp=0, open=107, high=108, low=104, close=105, volume=1)  # closes below 106
-    assert _invalidated(Direction.BULLISH, candle, sweep, mss) is True
+    # broken_swing.price=106, buffer=0.25*8=2 -> invalidation threshold is 104. Closing at 103 clears it decisively.
+    candle = Candle(timestamp=0, open=107, high=108, low=102, close=103, volume=1)
+    assert _invalidated(Direction.BULLISH, candle, sweep, mss, atr_value=8.0) is True
+
+
+def test_not_invalidated_by_a_graze_just_below_broken_swing_price():
+    """
+    Regression: a first-attempt retracement bar that dips into the entry
+    zone and closes just below (not decisively through) the broken swing
+    level is normal retracement-in-progress, not a failed reversal --
+    requires clearing the level by mss_retrace_buffer_mult x ATR, not
+    merely closing under the exact line.
+    """
+    sweep, mss = _bullish_sweep_and_mss()
+    # close=105 is below 106 but within the 2.0-point buffer (threshold 104) -- a graze, not a real retrace.
+    candle = Candle(timestamp=0, open=107, high=108, low=104, close=105, volume=1)
+    assert _invalidated(Direction.BULLISH, candle, sweep, mss, atr_value=8.0) is False
 
 
 def test_not_invalidated_by_a_wick_that_closes_back_above_the_level():
     sweep, mss = _bullish_sweep_and_mss()
     # Wicks down to grab a zone at 105 but closes back at 106.2 -- a normal retracement-and-hold, not invalidation.
     candle = Candle(timestamp=0, open=106.5, high=106.8, low=104.5, close=106.2, volume=1)
-    assert _invalidated(Direction.BULLISH, candle, sweep, mss) is False
+    assert _invalidated(Direction.BULLISH, candle, sweep, mss, atr_value=8.0) is False
+
+
+def test_broken_swing_check_disabled_without_atr():
+    """atr_value=None (insufficient history) disables the retrace-margin check entirely."""
+    sweep, mss = _bullish_sweep_and_mss()
+    candle = Candle(timestamp=0, open=107, high=108, low=99, close=100, volume=1)  # well below 106, no ATR available
+    assert _invalidated(Direction.BULLISH, candle, sweep, mss, atr_value=None) is False
 
 
 # ── _search_fill ──────────────────────────────────────────────────────────────
