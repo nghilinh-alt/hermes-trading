@@ -117,6 +117,7 @@ class ClosedTrade:
     r_multiple: float
     close_reason: str  # "target" | "stop" | "trail_stop" | "timeout_no_fill" (never a trade) | "invalidated"
     hold_bars: int
+    entry_timestamp: int = 0  # epoch ms of the fill bar; 0 for callers that predate this field
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,7 @@ def _manage_position(
     """
     risk_per_unit = abs(entry - initial_stop)
     partial_level = entry + partial_r * risk_per_unit if direction == Direction.BULLISH else entry - partial_r * risk_per_unit
+    entry_timestamp = exec_full[fill_index].timestamp
 
     remaining_qty = qty
     current_stop = initial_stop
@@ -238,7 +240,7 @@ def _manage_position(
                 fees += remaining_qty * exit_price * fee_pct
                 reason = "trail_stop" if partial_taken else "stop"
                 return ClosedTrade(asset, direction, grade, fill_index, entry, j, exit_price, initial_stop, target,
-                                    realized_pnl - fees, realized_pnl / (qty * risk_per_unit), reason, j - fill_index)
+                                    realized_pnl - fees, realized_pnl / (qty * risk_per_unit), reason, j - fill_index, entry_timestamp)
             if not partial_taken and c.high >= partial_level:
                 partial_qty = remaining_qty * partial_fraction
                 realized_pnl += partial_qty * (partial_level - entry)
@@ -251,7 +253,7 @@ def _manage_position(
                 realized_pnl += remaining_qty * (exit_price - entry)
                 fees += remaining_qty * exit_price * fee_pct
                 return ClosedTrade(asset, direction, grade, fill_index, entry, j, exit_price, initial_stop, target,
-                                    realized_pnl - fees, realized_pnl / (qty * risk_per_unit), "target", j - fill_index)
+                                    realized_pnl - fees, realized_pnl / (qty * risk_per_unit), "target", j - fill_index, entry_timestamp)
             if partial_taken:
                 recent_lows = [s for s in exec_swings if s.kind == SwingKind.LOW and s.index > fill_index and s.confirmed_index <= j]
                 if recent_lows:
@@ -263,7 +265,7 @@ def _manage_position(
                 fees += remaining_qty * exit_price * fee_pct
                 reason = "trail_stop" if partial_taken else "stop"
                 return ClosedTrade(asset, direction, grade, fill_index, entry, j, exit_price, initial_stop, target,
-                                    realized_pnl - fees, realized_pnl / (qty * risk_per_unit), reason, j - fill_index)
+                                    realized_pnl - fees, realized_pnl / (qty * risk_per_unit), reason, j - fill_index, entry_timestamp)
             if not partial_taken and c.low <= partial_level:
                 partial_qty = remaining_qty * partial_fraction
                 realized_pnl += partial_qty * (entry - partial_level)
@@ -276,7 +278,7 @@ def _manage_position(
                 realized_pnl += remaining_qty * (entry - exit_price)
                 fees += remaining_qty * exit_price * fee_pct
                 return ClosedTrade(asset, direction, grade, fill_index, entry, j, exit_price, initial_stop, target,
-                                    realized_pnl - fees, realized_pnl / (qty * risk_per_unit), "target", j - fill_index)
+                                    realized_pnl - fees, realized_pnl / (qty * risk_per_unit), "target", j - fill_index, entry_timestamp)
             if partial_taken:
                 recent_highs = [s for s in exec_swings if s.kind == SwingKind.HIGH and s.index > fill_index and s.confirmed_index <= j]
                 if recent_highs:
@@ -290,7 +292,7 @@ def _manage_position(
         realized_pnl += remaining_qty * (entry - exit_price)
     fees += remaining_qty * exit_price * fee_pct
     return ClosedTrade(asset, direction, grade, fill_index, entry, last_j, exit_price, initial_stop, target,
-                        realized_pnl - fees, realized_pnl / (qty * risk_per_unit), "end_of_data", last_j - fill_index)
+                        realized_pnl - fees, realized_pnl / (qty * risk_per_unit), "end_of_data", last_j - fill_index, entry_timestamp)
 
 
 def run_backtest_single_asset(
