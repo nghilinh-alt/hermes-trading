@@ -35,8 +35,90 @@ from hermes_trading.ict.setup import (
     build_setup,
 )
 from hermes_trading.ict.structure import detect_bos, detect_mss, find_swings
-from hermes_trading.ict.types import BiasDirection, Direction, Grade
+from hermes_trading.ict.types import BiasDirection, Direction, Grade, StructureBreak, Sweep
 from hermes_trading.ict.util import Candle, atr
+
+
+@dataclass(frozen=True)
+class DetectionContext:
+    """Shared output of the resample -> swings -> sweeps -> MSS -> FVG/OB/breaker -> ATR pipeline."""
+
+    exec_full: list[Candle]
+    daily_full: list[Candle]
+    weekly_full: list[Candle]
+    exec_swings: list
+    sweeps: list
+    mss_events: list
+    fvgs: list
+    order_blocks: list
+    breakers: list
+    atr_series: list
+
+
+def build_detection_context(
+    candles_15m: Sequence[Candle],
+    *,
+    exec_tf: str = "1h",
+    swing_n_exec: int = DEFAULT_SWING_N["1h"],
+    atr_period: int = 14,
+    disp_atr_mult: float = 1.5,
+) -> DetectionContext:
+    """
+    Compute the shared detection pipeline once. Pulled out of `scan_asset`
+    (pure extraction, no behavior change -- `scan_asset`'s own test suite
+    is the acceptance bar) so `hermes_trading.ict.live` can re-locate an
+    already-resting order's `Sweep`/`StructureBreak` each cycle via
+    `locate_pending_setup` without re-deriving detection logic in a second
+    place.
+    """
+    exec_full = resample(candles_15m, exec_tf)
+    if not exec_full:
+        # Matches the original scan_asset's short-circuit -- avoids feeding
+        # empty series into liquidity_pools/atr, which index as_of_index=-1
+        # against an equally-empty ATR series and raise IndexError.
+        return DetectionContext(
+            exec_full=[], daily_full=[], weekly_full=[], exec_swings=[], sweeps=[],
+            mss_events=[], fvgs=[], order_blocks=[], breakers=[], atr_series=[],
+        )
+    daily_full = resample(candles_15m, "1d")
+    weekly_full = resample(candles_15m, "1w")
+
+    exec_swings = find_swings(exec_full, swing_n_exec)
+    pools_full = liquidity_pools(exec_full, exec_swings, atr_period=atr_period)
+    sweeps = detect_sweep(exec_full, pools_full, atr_period=atr_period)
+    bos_events = detect_bos(exec_full, exec_swings)
+    mss_events = detect_mss(exec_full, exec_swings, sweeps)
+    fvgs = find_fvg(exec_full, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
+    order_blocks = find_order_blocks(exec_full, bos_events + mss_events, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
+    breakers = find_breakers(order_blocks, bos_events + mss_events, exec_full, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
+    atr_series = atr(exec_full, atr_period)
+
+    return DetectionContext(
+        exec_full=exec_full, daily_full=daily_full, weekly_full=weekly_full,
+        exec_swings=exec_swings, sweeps=sweeps, mss_events=mss_events,
+        fvgs=fvgs, order_blocks=order_blocks, breakers=breakers, atr_series=atr_series,
+    )
+
+
+def locate_pending_setup(ctx: DetectionContext, mss_timestamp: int) -> tuple[Sweep, StructureBreak] | None:
+    """
+    Re-locate the Sweep/StructureBreak for a specific MSS bar by timestamp
+    in a freshly (re)computed DetectionContext. Detection is deterministic
+    and lookahead-safe, so the same historical MSS reappears identically
+    every cycle -- this lets a caller that only persisted a timestamp
+    (e.g. a resting live order) recover the objects `resolve_setup_status`
+    needs without keeping the detection pipeline's output alive itself.
+    Returns None if the MSS isn't found or its matching sweep doesn't
+    agree in direction (mirrors `scan_asset`'s own skip condition).
+    """
+    for mss in ctx.mss_events:
+        if ctx.exec_full[mss.index].timestamp != mss_timestamp:
+            continue
+        sweep = _matching_sweep(ctx.sweeps, mss)
+        if sweep is None or sweep.direction != mss.direction:
+            return None
+        return sweep, mss
+    return None
 
 
 @dataclass(frozen=True)
@@ -98,23 +180,22 @@ def scan_asset(
     that point (spec S:12's "also used live" reusability, verified in
     tests/ict/test_scanner.py).
     """
-    exec_full = resample(candles_15m, exec_tf)
+    ctx = build_detection_context(candles_15m, exec_tf=exec_tf, swing_n_exec=swing_n_exec,
+                                   atr_period=atr_period, disp_atr_mult=disp_atr_mult)
+    exec_full = ctx.exec_full
     if not exec_full:
         return []
     if as_of_index is None:
         as_of_index = len(exec_full) - 1
-    daily_full = resample(candles_15m, "1d")
-    weekly_full = resample(candles_15m, "1w")
-
-    exec_swings = find_swings(exec_full, swing_n_exec)
-    pools_full = liquidity_pools(exec_full, exec_swings, atr_period=atr_period)
-    sweeps = detect_sweep(exec_full, pools_full, atr_period=atr_period)
-    bos_events = detect_bos(exec_full, exec_swings)
-    mss_events = detect_mss(exec_full, exec_swings, sweeps)
-    fvgs = find_fvg(exec_full, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
-    order_blocks = find_order_blocks(exec_full, bos_events + mss_events, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
-    breakers = find_breakers(order_blocks, bos_events + mss_events, exec_full, atr_period=atr_period, disp_atr_mult=disp_atr_mult)
-    atr_series = atr(exec_full, atr_period)
+    daily_full = ctx.daily_full
+    weekly_full = ctx.weekly_full
+    exec_swings = ctx.exec_swings
+    sweeps = ctx.sweeps
+    mss_events = ctx.mss_events
+    fvgs = ctx.fvgs
+    order_blocks = ctx.order_blocks
+    breakers = ctx.breakers
+    atr_series = ctx.atr_series
 
     already_alerted = already_alerted or set()
     alerts: list[Alert] = []

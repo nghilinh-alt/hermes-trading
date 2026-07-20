@@ -34,7 +34,7 @@ from hermes_trading.ict.backtest import (
 from hermes_trading.ict.bias import compute_bias, dealing_range
 from hermes_trading.ict.imbalance import find_breakers, find_fvg, find_order_blocks, is_displacement
 from hermes_trading.ict.liquidity import detect_sweep, liquidity_pools
-from hermes_trading.ict.scanner import scan_asset
+from hermes_trading.ict.scanner import build_detection_context, locate_pending_setup, scan_asset
 from hermes_trading.ict.setup import build_setup
 from hermes_trading.ict.structure import detect_bos, detect_mss, find_swings
 from hermes_trading.ict.types import BiasDirection, Direction
@@ -169,3 +169,19 @@ def test_scanner_dedup_via_already_alerted(anchor):
 
 def test_scan_asset_empty_series_returns_no_alerts():
     assert scan_asset([], "BTC/USDT", 1000.0) == []
+
+
+def test_locate_pending_setup_finds_same_sweep_and_mss_scan_asset_found(anchor):
+    """locate_pending_setup must recover the identical (Sweep, StructureBreak) pair
+    scan_asset's own internal loop found for a known-pending setup's MSS timestamp."""
+    candles, mss, setup, fill_index = anchor
+
+    ctx = build_detection_context(candles, disp_atr_mult=CALIBRATED["disp_atr_mult"])
+    mss_timestamp = ctx.exec_full[mss.index].timestamp
+
+    found = locate_pending_setup(ctx, mss_timestamp)
+    assert found is not None
+    sweep, located_mss = found
+    assert located_mss.index == mss.index
+    assert located_mss.direction == mss.direction
+    assert sweep.direction == setup.direction

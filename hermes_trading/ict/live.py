@@ -1,0 +1,582 @@
+"""
+hermes_trading.ict.live -- real-time (real money) trading state machine.
+
+Reuses scan_asset (new-setup detection), resolve_setup_status (resting-
+order pending/invalidated/expired resolution), and
+position_size/circuit_breaker_status/max_concurrent_ok (risk.py) exactly
+as already tested. The one genuinely new piece is replay_management_bars,
+which mirrors _manage_position's (hermes_trading.ict.backtest) 2R-partial/
+breakeven/trail thresholds bar-by-bar but -- unlike _manage_position --
+never simulates a stop/target hit from candles: live exits are always
+ground-truthed from the broker's actual position/closed-pnl state via
+reconciliation, since a simulated exit price would silently diverge from
+the real fill price and fees.
+
+State model, persisted per asset under state-ict-live/<asset>/ (see
+tools/run_ict_live.py for the file layout): a single `position.json`
+tagged by status ("flat" | "resting_order" | "open_position"), an
+`attempted.json` set of MSS timestamps already acted on (separate from
+the alert-only scanner's own `alerted.json` -- different meaning), a
+`circuit_breaker.json` day/week PnL bucket, and an append-only
+`trades.jsonl` log of real closed trades. Fail-safe by design: local
+state the broker's ground truth can't confirm (e.g. broker shows an open
+position with no matching local record) stops all automated management
+of that asset (`NEEDS_MANUAL_REVIEW.flag`) rather than guessing.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+from hermes_trading.brokers.base import BrokerAdapter
+from hermes_trading.ict.backtest import (
+    DEFAULT_MSS_RETRACE_BUFFER_MULT,
+    DEFAULT_PARTIAL_FRACTION,
+    DEFAULT_PARTIAL_R,
+    DEFAULT_STATE_TTL_BARS,
+    _bucket_start,
+    resolve_setup_status,
+)
+from hermes_trading.ict.risk import (
+    DEFAULT_DAILY_LOSS_LIMIT_PCT,
+    DEFAULT_MAX_CONCURRENT_TRADES,
+    DEFAULT_WEEKLY_LOSS_LIMIT_PCT,
+    circuit_breaker_status,
+    max_concurrent_ok,
+    position_size,
+)
+from hermes_trading.ict.scanner import build_detection_context, locate_pending_setup, scan_asset
+from hermes_trading.ict.types import Direction, SwingKind
+from hermes_trading.ict.util import Candle
+
+_DETECTION_CONTEXT_KEYS = {"exec_tf", "swing_n_exec", "atr_period", "disp_atr_mult"}
+
+
+def _detection_kwargs(scan_params: dict) -> dict:
+    return {k: v for k, v in scan_params.items() if k in _DETECTION_CONTEXT_KEYS}
+
+
+def _index_for_timestamp(exec_full: Sequence[Candle], ts: int) -> int | None:
+    for i, c in enumerate(exec_full):
+        if c.timestamp == ts:
+            return i
+    return None
+
+
+def _index_after_timestamp(exec_full: Sequence[Candle], ts: int) -> int | None:
+    for i, c in enumerate(exec_full):
+        if c.timestamp > ts:
+            return i
+    return None
+
+
+# ── Management-bar replay -- new, NOT a reuse of _manage_position; see module docstring ──
+
+
+@dataclass(frozen=True)
+class ManagementAction:
+    kind: str  # "partial_take" | "trail_stop"
+    bar_index: int
+    price: float  # partial trigger price, or the new stop level
+
+
+def replay_management_bars(
+    exec_full: Sequence[Candle],
+    exec_swings,
+    direction: Direction,
+    entry_price: float,
+    initial_stop: float,
+    fill_index: int,
+    partial_taken: bool,
+    current_stop: float,
+    start_index: int,
+    end_index: int,
+    *,
+    partial_r: float = DEFAULT_PARTIAL_R,
+) -> list[ManagementAction]:
+    """
+    Walk exec_full[start_index..end_index] (inclusive) replaying ONLY the
+    2R-partial-take and post-breakeven trailing-stop decisions, mirroring
+    _manage_position's exact thresholds bar-for-bar -- NOT stop/target
+    hits, which are always ground-truthed from the live broker's actual
+    position state, never simulated from candles. Bounded to
+    [start_index, end_index] rather than jumping straight to the latest
+    bar so a cycle that's behind (e.g. after downtime) catches up bar by
+    bar and can't silently skip an intermediate event. `fill_index` is the
+    ORIGINAL fill bar (not necessarily start_index -- a resumed cycle's
+    start_index is wherever it last left off, but swing eligibility for
+    trailing is always relative to the true fill), matching
+    _manage_position's `s.index > fill_index` swing filter exactly.
+
+    See test_replay_management_bars_matches_manage_position_reference for
+    the differential regression test against _manage_position.
+    """
+    risk_per_unit = abs(entry_price - initial_stop)
+    partial_level = (
+        entry_price + partial_r * risk_per_unit if direction == Direction.BULLISH
+        else entry_price - partial_r * risk_per_unit
+    )
+
+    actions: list[ManagementAction] = []
+    stop = current_stop
+    taken = partial_taken
+
+    for j in range(start_index, min(end_index, len(exec_full) - 1) + 1):
+        c = exec_full[j]
+        if direction == Direction.BULLISH:
+            if not taken and c.high >= partial_level:
+                actions.append(ManagementAction("partial_take", j, partial_level))
+                taken = True
+                new_stop = max(stop, entry_price)
+                if new_stop != stop:
+                    actions.append(ManagementAction("trail_stop", j, new_stop))
+                    stop = new_stop
+            if taken:
+                recent_lows = [s for s in exec_swings if s.kind == SwingKind.LOW and s.index > fill_index and s.confirmed_index <= j]
+                if recent_lows:
+                    new_stop = max(stop, recent_lows[-1].price)
+                    if new_stop != stop:
+                        actions.append(ManagementAction("trail_stop", j, new_stop))
+                        stop = new_stop
+        else:
+            if not taken and c.low <= partial_level:
+                actions.append(ManagementAction("partial_take", j, partial_level))
+                taken = True
+                new_stop = min(stop, entry_price)
+                if new_stop != stop:
+                    actions.append(ManagementAction("trail_stop", j, new_stop))
+                    stop = new_stop
+            if taken:
+                recent_highs = [s for s in exec_swings if s.kind == SwingKind.HIGH and s.index > fill_index and s.confirmed_index <= j]
+                if recent_highs:
+                    new_stop = min(stop, recent_highs[-1].price)
+                    if new_stop != stop:
+                        actions.append(ManagementAction("trail_stop", j, new_stop))
+                        stop = new_stop
+
+    return actions
+
+
+# ── Persisted per-asset state ─────────────────────────────────────────────
+
+
+class AssetStateStore:
+    """File-backed state for one asset under state-ict-live/<asset>/."""
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def _position_path(self) -> Path:
+        return self.state_dir / "position.json"
+
+    @property
+    def _attempted_path(self) -> Path:
+        return self.state_dir / "attempted.json"
+
+    @property
+    def _circuit_breaker_path(self) -> Path:
+        return self.state_dir / "circuit_breaker.json"
+
+    @property
+    def _trades_path(self) -> Path:
+        return self.state_dir / "trades.jsonl"
+
+    @property
+    def needs_review_flag_path(self) -> Path:
+        return self.state_dir / "NEEDS_MANUAL_REVIEW.flag"
+
+    def load_position(self) -> dict:
+        if not self._position_path.exists():
+            return {"status": "flat"}
+        return json.loads(self._position_path.read_text())
+
+    def save_position(self, position: dict) -> None:
+        self._position_path.write_text(json.dumps(position, indent=2))
+
+    def load_attempted(self) -> set[int]:
+        if not self._attempted_path.exists():
+            return set()
+        return set(json.loads(self._attempted_path.read_text()))
+
+    def save_attempted(self, attempted: set[int]) -> None:
+        self._attempted_path.write_text(json.dumps(sorted(attempted)))
+
+    def load_circuit_breaker(self) -> dict:
+        if not self._circuit_breaker_path.exists():
+            return {
+                "day_bucket_start_ms": None, "equity_at_day_start": None,
+                "week_bucket_start_ms": None, "equity_at_week_start": None,
+            }
+        return json.loads(self._circuit_breaker_path.read_text())
+
+    def save_circuit_breaker(self, cb: dict) -> None:
+        self._circuit_breaker_path.write_text(json.dumps(cb))
+
+    def append_trade(self, trade: dict) -> None:
+        with self._trades_path.open("a") as f:
+            f.write(json.dumps(trade) + "\n")
+
+    def is_needs_review(self) -> bool:
+        return self.needs_review_flag_path.exists()
+
+    def flag_needs_review(self, reason: str) -> None:
+        self.needs_review_flag_path.write_text(reason)
+
+
+def _update_circuit_breaker_bucket(cb: dict, now_ms: int, equity: float) -> dict:
+    day_bucket = _bucket_start(now_ms, "1d")
+    week_bucket = _bucket_start(now_ms, "1w")
+    if cb.get("day_bucket_start_ms") != day_bucket:
+        cb["day_bucket_start_ms"] = day_bucket
+        cb["equity_at_day_start"] = equity
+    if cb.get("week_bucket_start_ms") != week_bucket:
+        cb["week_bucket_start_ms"] = week_bucket
+        cb["equity_at_week_start"] = equity
+    return cb
+
+
+# ── Per-cycle result ───────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class CycleResult:
+    asset: str
+    status: str  # "flat" | "resting_order" | "open_position" | "needs_review" | "error"
+    action: str  # human-readable description of what happened this cycle
+    mutated: bool  # True if a broker-mutating call (or a state write) actually happened
+
+
+# ── Per-asset cycle ────────────────────────────────────────────────────────
+
+
+def run_asset_cycle(
+    asset: str,
+    broker: BrokerAdapter,
+    candles_15m: Sequence[Candle],
+    store: AssetStateStore,
+    busy_count: int,
+    *,
+    dry_run: bool = False,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT_TRADES,
+    daily_limit_pct: float = DEFAULT_DAILY_LOSS_LIMIT_PCT,
+    weekly_limit_pct: float = DEFAULT_WEEKLY_LOSS_LIMIT_PCT,
+    **scan_params,
+) -> CycleResult:
+    if store.is_needs_review():
+        return CycleResult(asset, "needs_review", "flagged for manual review -- no automated action taken", False)
+
+    position = store.load_position()
+    status = position.get("status", "flat")
+
+    if status == "flat":
+        if broker.has_open_position(asset):
+            store.flag_needs_review(
+                f"local state is flat but the broker shows an open position for {asset} with no local record"
+            )
+            return CycleResult(asset, "needs_review", "unrecoverable drift: broker has a position, no local record", False)
+        return _look_for_new_setup(asset, broker, candles_15m, store, busy_count, dry_run=dry_run,
+                                    max_concurrent=max_concurrent, daily_limit_pct=daily_limit_pct,
+                                    weekly_limit_pct=weekly_limit_pct, **scan_params)
+
+    if status == "resting_order":
+        open_orders = broker.get_open_orders(asset)
+        still_resting = any(str(o.get("id")) == str(position.get("order_id")) for o in open_orders)
+        if not still_resting:
+            if broker.has_open_position(asset):
+                return _handle_resting_order_filled(asset, broker, candles_15m, store, position, dry_run=dry_run)
+            if not dry_run:
+                store.save_position({"status": "flat"})
+            return CycleResult(asset, "flat", "resting order gone at the exchange with no fill -- reset to flat", not dry_run)
+        return _check_resting_order_status(asset, broker, candles_15m, store, position, dry_run=dry_run, **scan_params)
+
+    if status == "open_position":
+        if not broker.has_open_position(asset):
+            return _handle_position_closed(asset, broker, store, position, dry_run=dry_run)
+        return _manage_open_position(asset, broker, candles_15m, store, position, dry_run=dry_run, **scan_params)
+
+    raise ValueError(f"unknown local position status {status!r} for {asset}")
+
+
+def _look_for_new_setup(
+    asset, broker, candles_15m, store, busy_count, *, dry_run,
+    max_concurrent, daily_limit_pct, weekly_limit_pct, **scan_params,
+) -> CycleResult:
+    if not max_concurrent_ok(busy_count, max_concurrent=max_concurrent):
+        return CycleResult(asset, "flat", f"max_concurrent reached ({busy_count}/{max_concurrent}) -- skipping new-entry check", False)
+    if not candles_15m:
+        return CycleResult(asset, "flat", "no candle history yet", False)
+
+    equity = broker.get_balance()
+    now_ms = candles_15m[-1].timestamp
+    cb = _update_circuit_breaker_bucket(store.load_circuit_breaker(), now_ms, equity)
+    daily_pnl_pct = ((equity - cb["equity_at_day_start"]) / cb["equity_at_day_start"]) if cb["equity_at_day_start"] else 0.0
+    weekly_pnl_pct = ((equity - cb["equity_at_week_start"]) / cb["equity_at_week_start"]) if cb["equity_at_week_start"] else 0.0
+    if not dry_run:
+        store.save_circuit_breaker(cb)
+
+    if circuit_breaker_status(daily_pnl_pct, weekly_pnl_pct, daily_limit_pct=daily_limit_pct, weekly_limit_pct=weekly_limit_pct):
+        return CycleResult(asset, "flat", "circuit breaker active -- standing down", False)
+
+    attempted = store.load_attempted()
+    alerts = scan_asset(candles_15m, asset, equity, already_alerted=attempted, **scan_params)
+    if not alerts:
+        return CycleResult(asset, "flat", "no qualified pending setup", False)
+
+    alert = alerts[0]
+    entry_price = (alert.entry_zone[0] + alert.entry_zone[1]) / 2
+    size = position_size(equity, entry_price, alert.stop, alert.grade)
+
+    if not dry_run:
+        attempted.add(alert.timestamp)
+        store.save_attempted(attempted)
+
+    if size is None:
+        # Not expected in practice (a qualified alert is always A_PLUS/B, and
+        # position_size only returns None for Grade.NONE) but this crosses a
+        # module boundary (setup.py's qualification guarantee), so it's worth
+        # a real check rather than trusting it silently -- real money.
+        return CycleResult(asset, "flat", "position_size returned None for this grade -- skipping", False)
+
+    side = "buy" if alert.direction == Direction.BULLISH else "sell"
+    if not dry_run:
+        result = broker.place_order(
+            asset, side, size.qty, order_type="limit", price=entry_price,
+            stop_loss=alert.stop, take_profit=alert.target, leverage=size.leverage,
+        )
+        order_id = result.order_id
+    else:
+        order_id = "DRY_RUN"
+
+    new_position = {
+        "status": "resting_order",
+        "order_id": order_id,
+        "direction": alert.direction.value,
+        "entry_price": entry_price,
+        "stop_price": alert.stop,
+        "target_price": alert.target,
+        "grade": alert.grade.value,
+        "qty": size.qty,
+        "leverage": size.leverage,
+        "notional": size.notional,
+        "risk_usd": size.risk_usd,
+        "mss_timestamp": alert.timestamp,
+        "placed_at_ms": now_ms,
+    }
+    if not dry_run:
+        store.save_position(new_position)
+    return CycleResult(asset, "resting_order", f"placed {side} limit @ {entry_price} qty={size.qty} lev={size.leverage}x", not dry_run)
+
+
+def _check_resting_order_status(asset, broker, candles_15m, store, position, *, dry_run, **scan_params) -> CycleResult:
+    ctx = build_detection_context(candles_15m, **_detection_kwargs(scan_params))
+    if not ctx.exec_full:
+        return CycleResult(asset, "resting_order", "no candle history yet -- leaving order resting", False)
+
+    found = locate_pending_setup(ctx, position["mss_timestamp"])
+    if found is None:
+        store.flag_needs_review(f"resting order's original MSS (ts={position['mss_timestamp']}) not found in current detection context for {asset}")
+        return CycleResult(asset, "needs_review", "resting order's MSS vanished from detection context", False)
+    sweep, mss = found
+
+    as_of_index = len(ctx.exec_full) - 1
+    status, _ = resolve_setup_status(
+        ctx.exec_full, mss.index + 1, position["entry_price"], Direction(position["direction"]),
+        sweep, mss, scan_params.get("state_ttl_bars", DEFAULT_STATE_TTL_BARS), as_of_index,
+        atr_series=ctx.atr_series,
+        mss_retrace_buffer_mult=scan_params.get("mss_retrace_buffer_mult", DEFAULT_MSS_RETRACE_BUFFER_MULT),
+    )
+
+    if status == "pending":
+        return CycleResult(asset, "resting_order", "still pending, left resting", False)
+    if status == "filled":
+        # Candle walk suggests a fill, but the broker's open-orders check
+        # this same cycle still listed it as resting -- a small timing
+        # race. Leave it; next cycle's broker-truth check picks up the
+        # actual fill (or, if it truly never filled, this will resolve
+        # itself to invalidated/expired on a later cycle).
+        return CycleResult(asset, "resting_order", "candle walk suggests filled -- awaiting broker confirmation next cycle", False)
+
+    if not dry_run:
+        broker.cancel_order(position["order_id"], asset)
+        store.save_position({"status": "flat"})
+    return CycleResult(asset, "flat", f"resting order cancelled ({status})", not dry_run)
+
+
+def _handle_resting_order_filled(asset, broker, candles_15m, store, position, *, dry_run) -> CycleResult:
+    broker_positions = broker.get_positions(asset)
+    if not broker_positions:
+        return CycleResult(asset, "resting_order", "order gone but no position found yet -- rechecking next cycle", False)
+    pos = broker_positions[0]
+    direction = Direction.BULLISH if pos.side == "long" else Direction.BEARISH
+    fill_price = pos.entry_price
+
+    # Defensive re-verification: guarantee protective SL/TP are attached to
+    # the now-open position regardless of whether Bybit's native
+    # stopLoss/takeProfit-on-a-resting-limit-order carried through to the
+    # fill (see the live-worker deployment plan's pre-flight verification
+    # note -- this call is the safety net either way).
+    if not dry_run:
+        broker.set_position_protection(asset, stop_loss=position["stop_price"], take_profit=position["target_price"])
+
+    ctx = build_detection_context(candles_15m)
+    found = locate_pending_setup(ctx, position["mss_timestamp"])
+    fill_index = found[1].index if found is not None else 0
+    fill_timestamp = ctx.exec_full[fill_index].timestamp if ctx.exec_full else position.get("placed_at_ms", 0)
+    last_bar_ts = ctx.exec_full[-1].timestamp if ctx.exec_full else fill_timestamp
+
+    new_position = {
+        "status": "open_position",
+        "order_id": position["order_id"],
+        "direction": direction.value,
+        "entry_price": fill_price,
+        "initial_stop_price": position["stop_price"],
+        "current_stop_price": position["stop_price"],
+        "target_price": position["target_price"],
+        "grade": position["grade"],
+        "qty_total": position["qty"],
+        "qty_remaining": position["qty"],
+        "leverage": position["leverage"],
+        "partial_taken": False,
+        "partial_realized_pnl_usd": 0.0,
+        "mss_timestamp": position["mss_timestamp"],
+        "fill_timestamp": fill_timestamp,
+        "last_processed_bar_ts": last_bar_ts,
+    }
+    if not dry_run:
+        store.save_position(new_position)
+    return CycleResult(asset, "open_position", f"resting order filled at {fill_price}, SL/TP re-verified", not dry_run)
+
+
+def _manage_open_position(asset, broker, candles_15m, store, position, *, dry_run, **scan_params) -> CycleResult:
+    ctx = build_detection_context(candles_15m, **_detection_kwargs(scan_params))
+    if not ctx.exec_full:
+        return CycleResult(asset, "open_position", "no candle history yet", False)
+
+    start_index = _index_after_timestamp(ctx.exec_full, position["last_processed_bar_ts"])
+    end_index = len(ctx.exec_full) - 1
+    if start_index is None or start_index > end_index:
+        return CycleResult(asset, "open_position", "no new bars since last check", False)
+
+    fill_index = _index_for_timestamp(ctx.exec_full, position["fill_timestamp"])
+    if fill_index is None:
+        store.flag_needs_review(f"open position's fill_timestamp not found in current candle history for {asset}")
+        return CycleResult(asset, "needs_review", "fill bar vanished from candle history", False)
+
+    direction = Direction(position["direction"])
+    actions = replay_management_bars(
+        ctx.exec_full, ctx.exec_swings, direction,
+        position["entry_price"], position["initial_stop_price"], fill_index,
+        position["partial_taken"], position["current_stop_price"], start_index, end_index,
+    )
+
+    mutated = False
+    for action in actions:
+        if action.kind == "partial_take":
+            partial_qty = position["qty_remaining"] * DEFAULT_PARTIAL_FRACTION
+            close_side = "sell" if direction == Direction.BULLISH else "buy"
+            if not dry_run:
+                result = broker.reduce_position(asset, close_side, partial_qty)
+                partial_qty = result.qty
+            position["qty_remaining"] -= partial_qty
+            position["partial_taken"] = True
+        elif action.kind == "trail_stop":
+            if not dry_run:
+                broker.update_trailing_stop(asset, position["direction"], action.price)
+            position["current_stop_price"] = action.price
+        if not dry_run:
+            # Persist after EACH action, not just once at the end -- if a
+            # later action raises, this one's effect is already durably
+            # recorded and won't be re-attempted next cycle.
+            store.save_position(position)
+            mutated = True
+
+    position["last_processed_bar_ts"] = ctx.exec_full[end_index].timestamp
+    if not dry_run:
+        store.save_position(position)
+
+    summary = f"replayed {len(actions)} management action(s)" if actions else "no management action needed"
+    return CycleResult(asset, "open_position", summary, mutated)
+
+
+def _handle_position_closed(asset, broker, store, position, *, dry_run) -> CycleResult:
+    closed_trades = broker.fetch_recent_closed_trades(asset, limit=5)
+    matching = [t for t in closed_trades if t.get("created_ms", 0) >= position.get("fill_timestamp", 0)]
+    if not matching:
+        # Bybit's closed-pnl feed can lag slightly -- leave local state as
+        # open_position and recheck next cycle rather than guessing at PnL.
+        return CycleResult(asset, "open_position", "position closed at exchange but no matching closed-pnl record yet -- rechecking next cycle", False)
+
+    trade = matching[0]
+    total_pnl = trade["closed_pnl_usd"] + position.get("partial_realized_pnl_usd", 0.0)
+
+    record = {
+        "asset": asset,
+        "direction": position["direction"],
+        "grade": position["grade"],
+        "entry_price": position["entry_price"],
+        "exit_price": trade["exit_price"],
+        "stop_price": position["initial_stop_price"],
+        "target_price": position["target_price"],
+        "qty": position["qty_total"],
+        "pnl_usd": total_pnl,
+        "close_reason": "exchange_native",
+        "entry_utc": position.get("fill_timestamp"),
+        "exit_utc": trade.get("closed_ms"),
+        "order_id": trade.get("order_id"),
+    }
+    if not dry_run:
+        store.append_trade(record)
+        store.save_position({"status": "flat"})
+    return CycleResult(asset, "flat", f"position closed natively, pnl_usd={total_pnl:.2f}", not dry_run)
+
+
+# ── Full-account cycle ──────────────────────────────────────────────────────
+
+
+def run_full_cycle(
+    assets: Sequence[str],
+    broker: BrokerAdapter,
+    state_root: Path,
+    candles_by_asset: dict[str, Sequence[Candle]],
+    *,
+    dry_run: bool = False,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT_TRADES,
+    daily_limit_pct: float = DEFAULT_DAILY_LOSS_LIMIT_PCT,
+    weekly_limit_pct: float = DEFAULT_WEEKLY_LOSS_LIMIT_PCT,
+    **scan_params,
+) -> list[CycleResult]:
+    """
+    One full scan across all assets. Broker ground truth for `busy_count`
+    (positions + resting orders, across EVERY asset) is fetched once up
+    front so a stale count from one asset's cycle can't leak into
+    another's max_concurrent check within the same pass -- and so two
+    assets each placing a resting order in the same pass can't jointly
+    exceed max_concurrent (resting orders count as busy too; see the
+    live-worker plan's rationale).
+
+    Each asset's cycle is isolated in its own try/except (matching
+    tools/run_ict_scanner.py's own per-asset isolation) so an unexpected
+    failure on one asset -- a transient exchange error, an
+    OrderTooSmallError, anything -- can't take down monitoring/management
+    for the other three assets in the same pass.
+    """
+    busy_count = len(broker.get_positions()) + len(broker.get_open_orders())
+
+    results = []
+    for asset in assets:
+        store = AssetStateStore(Path(state_root) / asset.replace("/", "_"))
+        candles = candles_by_asset.get(asset, [])
+        try:
+            result = run_asset_cycle(
+                asset, broker, candles, store, busy_count, dry_run=dry_run,
+                max_concurrent=max_concurrent, daily_limit_pct=daily_limit_pct,
+                weekly_limit_pct=weekly_limit_pct, **scan_params,
+            )
+        except Exception as e:
+            result = CycleResult(asset, "error", f"{type(e).__name__}: {e}", False)
+        results.append(result)
+    return results
