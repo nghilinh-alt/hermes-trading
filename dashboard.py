@@ -1,7 +1,20 @@
 """
-dashboard.py — local Hermes Trading dashboard
-Pulls live state from VPS via SSH, serves at http://localhost:8888
-Auto-refreshes every 60 seconds.
+dashboard.py -- local Hermes Trading dashboard for the ICT live worker.
+
+Pulls state from the VPS over SSH, serves at http://localhost:8888.
+
+Reads (read-only, never writes to the VPS):
+  state-ict-live/heartbeat.json              account-level liveness + equity
+  state-ict-live/<ASSET>/position.json       flat | resting_order | open_position
+  state-ict-live/<ASSET>/context.json        market snapshot written each cycle
+  state-ict-live/<ASSET>/trades.jsonl        closed trades
+  state-ict-live/<ASSET>/NEEDS_MANUAL_REVIEW.flag
+  live.log                                   worker log tail
+
+The predecessor of this file (for the retired indicator-weight agent) is at
+archive/dashboard-indicator-weight-2026-07-20.py. Nothing here is ported
+from it except the SSH batching, the stale-state fallback and the theme --
+the ICT worker shares no state schema with the old system.
 
 Usage:
   python dashboard.py
@@ -13,78 +26,60 @@ import json
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-
-import yaml
 
 AEST = ZoneInfo("Australia/Sydney")
 
-VPS        = "root@187.127.108.173"
-VPS_BASE   = "/opt/trading/hermes_trading"
-ASSETS     = ["btc_usdt", "eth_usdt", "sol_usdt", "xrp_usdt"]
-ASSET_LABELS = {
-    "btc_usdt": "BTC/USDT",
-    "eth_usdt": "ETH/USDT",
-    "sol_usdt": "SOL/USDT",
-    "xrp_usdt": "XRP/USDT",
-}
-LOCAL_STATE = Path("state")
-PORT        = 8888
-POLL_SECS   = 60
+VPS      = "root@187.127.108.173"
+VPS_BASE = "/opt/trading/hermes-trading"
+STATE    = f"{VPS_BASE}/state-ict-live"
+LOG_PATH = f"{VPS_BASE}/live.log"
+
+# Matches tools/fetch_ict_live_data_bybit.ASSETS exactly. XRP is deliberately
+# absent -- it is not part of the ICT universe (confirmed with Linh, s21).
+ASSETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "TAO/USDT"]
+
+PORT      = 8888
+POLL_SECS = 300  # the worker only cycles every 15 min; polling faster just re-reads identical files
+
+# Palette
+GREEN, RED, AMBER, BLUE, PURPLE = "#1D9E75", "#E24B4A", "#EF9F27", "#4A7DE2", "#8B5CF6"
 
 
-# ── SSH helpers ────────────────────────────────────────────────────────────────
+def _slug(asset: str) -> str:
+    """BTC/USDT -> BTC_USDT, matching AssetStateStore's own directory naming."""
+    return asset.replace("/", "_")
+
+
+# ── SSH ────────────────────────────────────────────────────────────────────────
 
 def _ssh_batch(files: list[str]) -> dict[str, str]:
-    """Fetch multiple remote files in a single SSH connection. Returns {} on any error."""
-    SEP   = "---HERMES_SEP---"
-    parts = [f"echo '{SEP}{path}'; cat {path} 2>/dev/null; echo '{SEP}END'" for path in files]
-    script = "; ".join(parts)
+    """Fetch many remote files in one SSH connection. Returns {} on any failure."""
+    SEP = "---HERMES_SEP---"
+    parts = [f"echo '{SEP}{p}'; cat {p} 2>/dev/null; echo '{SEP}END'" for p in files]
     try:
         result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", VPS, script],
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", VPS, "; ".join(parts)],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
         )
         output = result.stdout if result.returncode == 0 else ""
     except Exception:
         return {}
 
-    parsed: dict[str, str] = {}
-    current_path, current_lines = None, []
+    parsed, cur, lines = {}, None, []
     for line in output.splitlines():
         if line.startswith(SEP) and not line.endswith("END"):
-            current_path  = line[len(SEP):]
-            current_lines = []
-        elif line == f"{SEP}END" and current_path:
-            parsed[current_path] = "\n".join(current_lines).strip()
-            current_path = None
-        elif current_path is not None:
-            current_lines.append(line)
+            cur, lines = line[len(SEP):], []
+        elif line == f"{SEP}END" and cur:
+            parsed[cur] = "\n".join(lines).strip()
+            cur = None
+        elif cur is not None:
+            lines.append(line)
     return parsed
 
 
-def _read_file(remote_path: str, local_fallback: Path | None, cache: dict) -> str:
-    if remote_path in cache:
-        return cache[remote_path]
-    if local_fallback and local_fallback.exists():
-        return local_fallback.read_text()
-    return ""
-
-
-# ── Parsing (real YAML, not homebrew) ─────────────────────────────────────────
-
-def _parse_yaml(text: str) -> dict:
-    if not text:
-        return {}
-    try:
-        return yaml.safe_load(text) or {}
-    except Exception:
-        return {}
-
-
-def _parse_heartbeat(text: str) -> dict:
+def _json(text: str) -> dict:
     if not text:
         return {}
     try:
@@ -93,809 +88,873 @@ def _parse_heartbeat(text: str) -> dict:
         return {}
 
 
-# ── Data fetch ─────────────────────────────────────────────────────────────────
+def _jsonl(text: str) -> list[dict]:
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out
 
-def _fetch_data(last_known: dict | None = None) -> dict:
-    """Pull all state from VPS. Falls back to last_known on SSH failure."""
-    data: dict = {
-        "updated":  datetime.now(AEST).strftime("%H:%M:%S AEST"),
-        "assets":   {},
-        "log_tail": [],
-        "goal":     {},
-        "source":   "vps",
-        "ssh_ok":   True,
+
+# ── Fetch ──────────────────────────────────────────────────────────────────────
+
+def _fetch(last_known: dict | None = None) -> dict:
+    data = {
+        "updated": datetime.now(AEST).strftime("%H:%M:%S AEST"),
+        "assets": {}, "heartbeat": {}, "log_tail": [], "ssh_ok": True,
     }
 
-    all_files = [f"{VPS_BASE}/state/goal.yaml", f"{VPS_BASE}/logs/hermes.log"]
-    for slug in ASSETS:
-        sd = f"{VPS_BASE}/state/{slug}"
-        all_files += [
-            f"{sd}/trades.jsonl",
-            f"{sd}/strategy.yaml",
-            f"{sd}/heartbeat.json",
-            f"{sd}/hypotheses.jsonl",
-        ]
-    cache = _ssh_batch(all_files)
+    files = [f"{STATE}/heartbeat.json", LOG_PATH]
+    for a in ASSETS:
+        d = f"{STATE}/{_slug(a)}"
+        files += [f"{d}/position.json", f"{d}/context.json", f"{d}/trades.jsonl",
+                  f"{d}/NEEDS_MANUAL_REVIEW.flag"]
+    cache = _ssh_batch(files)
 
     if not cache:
         data["ssh_ok"] = False
-        data["source"] = "stale"
         if last_known:
-            data.update({k: last_known[k] for k in ("assets", "goal", "log_tail") if k in last_known})
+            for k in ("assets", "heartbeat", "log_tail"):
+                if k in last_known:
+                    data[k] = last_known[k]
             data["updated"] = last_known.get("updated", "—") + " (stale — VPS unreachable)"
         return data
 
-    # ── Goal ──────────────────────────────────────────────────────────────────
-    goal_raw  = _read_file(f"{VPS_BASE}/state/goal.yaml", LOCAL_STATE / "goal.yaml", cache)
-    goal_yaml = _parse_yaml(goal_raw)
+    data["heartbeat"] = _json(cache.get(f"{STATE}/heartbeat.json", ""))
 
-    # Support both flat and nested goal.yaml layouts
-    obj  = goal_yaml.get("objective", {})
-    risk = goal_yaml.get("risk", {})
-    data["goal"] = {
-        "target":     f"{obj.get('target_value', goal_yaml.get('target_return_30d', 25))}%",
-        "drawdown":   f"{risk.get('stop_loss_pct', goal_yaml.get('max_drawdown_pct', 5))}%",
-        "timeframe":  goal_yaml.get("timeframe", "5m"),
-        "reflection": str(goal_yaml.get("reflection_every", 5)),
-        "mode":       goal_yaml.get("mode", "paper"),
-    }
-
-    # ── Per-asset ─────────────────────────────────────────────────────────────
-    for slug in ASSETS:
-        sd = f"{VPS_BASE}/state/{slug}"
-        ld = LOCAL_STATE / slug
-
-        trades_text   = _read_file(f"{sd}/trades.jsonl",    None, cache)
-        strategy_text = _read_file(f"{sd}/strategy.yaml",   (ld / "strategy.yaml") if ld.exists() else None, cache)
-        hb_text       = _read_file(f"{sd}/heartbeat.json",  None, cache)
-        hyp_text      = _read_file(f"{sd}/hypotheses.jsonl", None, cache)
-
-        all_trades: list[dict] = []
-        for line in trades_text.splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    all_trades.append(json.loads(line))
-                except Exception:
-                    pass
-
-        strategy  = _parse_yaml(strategy_text)
-        heartbeat = _parse_heartbeat(hb_text)
-
-        hypotheses: list[dict] = []
-        for line in hyp_text.splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    hypotheses.append(json.loads(line))
-                except Exception:
-                    pass
-
-        closed   = [t for t in all_trades if t.get("pnl_pct") is not None]
-        win_rate = (
-            sum(1 for t in closed if float(t["pnl_pct"]) > 0) / len(closed)
-            if closed else None
-        )
-        total_pnl = sum(float(t["pnl_pct"]) for t in closed) * 100 if closed else None
-
-        # Direction stats: long/short win rate from closed trades
-        long_closed  = [t for t in closed if t.get("direction") == "long"]
-        short_closed = [t for t in closed if t.get("direction") == "short"]
-        long_win_rate  = (sum(1 for t in long_closed  if float(t["pnl_pct"]) > 0) / len(long_closed))  if long_closed  else None
-        short_win_rate = (sum(1 for t in short_closed if float(t["pnl_pct"]) > 0) / len(short_closed)) if short_closed else None
-
-        indicators = [
-            {
-                "name":     i.get("name", ""),
-                "weight":   float(i.get("weight", 1.0)),
-                "required": bool(i.get("required", False)),
-                "params":   i.get("params", {}),
-            }
-            for i in strategy.get("indicators", [])
-        ]
-
-        # Today's USD PnL for this asset (for portfolio daily loss display)
-        today = datetime.now(AEST).strftime("%Y-%m-%d")
-        today_pnl_usd = sum(
-            float(t.get("closed_pnl_usdt", 0) or 0)
-            for t in all_trades
-            if t.get("ts", "")[:10] >= today and t.get("closed_pnl_usdt") is not None
-        )
-
-        data["assets"][slug] = {
-            "label":           ASSET_LABELS[slug],
-            "trade_count":     len(all_trades),
-            "last_trade":      all_trades[-1] if all_trades else {},
-            "trades":          all_trades,
-            "strategy_ver":    str(strategy.get("version", "—")),
-            "indicators":      indicators,
-            "stop_loss":       strategy.get("stop_loss_pct", "—"),
-            "pos_size":        strategy.get("position_size_r", "—"),
-            "position_pct":    float(strategy.get("position_pct", 0.10)),
-            "risk_per_trade":  float(strategy.get("risk_per_trade", 0.02)),
-            "min_conf":        strategy.get("entry", {}).get("min_confidence", "—"),
-            "hb_status":       heartbeat.get("status", "unknown"),
-            "hb_failures":     int(heartbeat.get("consecutive_failures", 0)),
-            "last_tick":       heartbeat.get("last_tick", "—"),
-            "hypotheses":      hypotheses,
-            "win_rate":        win_rate,
-            "total_pnl":       total_pnl,
-            "long_win_rate":   long_win_rate,
-            "short_win_rate":  short_win_rate,
-            "today_pnl_usd":   today_pnl_usd,
-            # Trend filter config
-            "trend_filter_enabled": bool((strategy.get("trend_filter") or {}).get("enabled", False)),
-            # XRP/paper mode
-            "trading_mode":    strategy.get("trading_mode", "live"),
-            "trading_enabled": strategy.get("trading_enabled", True),
+    for a in ASSETS:
+        d = f"{STATE}/{_slug(a)}"
+        position = _json(cache.get(f"{d}/position.json", "")) or {"status": "flat"}
+        data["assets"][a] = {
+            "position": position,
+            "context": _json(cache.get(f"{d}/context.json", "")),
+            "trades": _jsonl(cache.get(f"{d}/trades.jsonl", "")),
+            "review_flag": (cache.get(f"{d}/NEEDS_MANUAL_REVIEW.flag") or "").strip(),
         }
 
-    # ── Log ───────────────────────────────────────────────────────────────────
-    import re as _re
-    log_text = cache.get(f"{VPS_BASE}/logs/hermes.log", "")
-    lines    = [l for l in log_text.splitlines() if l.strip()]
-    data["log_tail"] = lines[-25:]
-
-    # Extract latest price per asset from log
-    latest_prices: dict[str, float] = {}
-    for line in reversed(lines):
-        for slug, label in ASSET_LABELS.items():
-            if label in line and slug not in latest_prices:
-                m = _re.search(r'price=([\d.]+)', line)
-                if m:
-                    latest_prices[slug] = float(m.group(1))
-                m2 = _re.search(r'@ ([\d.]+)', line)
-                if m2 and slug not in latest_prices:
-                    latest_prices[slug] = float(m2.group(1))
-    for slug in ASSETS:
-        if slug in data["assets"]:
-            data["assets"][slug]["current_price"] = latest_prices.get(slug)
-
+    data["log_tail"] = [l for l in (cache.get(LOG_PATH, "") or "").splitlines() if l.strip()][-40:]
     return data
 
 
-# ── HTML rendering ─────────────────────────────────────────────────────────────
+# ── Formatting helpers ─────────────────────────────────────────────────────────
 
-def _render_html(d: dict) -> str:
-    goal    = d.get("goal", {})
+def _esc(s) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _px(v, dp=2) -> str:
+    """Price formatting -- more decimals for low-priced assets like TAO/SOL."""
+    if v is None:
+        return "—"
+    v = float(v)
+    if v < 1:
+        return f"${v:,.5f}"
+    if v < 100:
+        return f"${v:,.3f}"
+    return f"${v:,.{dp}f}"
+
+
+def _col(v) -> str:
+    return GREEN if (v or 0) >= 0 else RED
+
+
+def _sgn(v, suffix="", dp=2) -> str:
+    if v is None:
+        return "—"
+    return f"{'+' if v >= 0 else ''}{v:.{dp}f}{suffix}"
+
+
+def _ts_aest(ms, fmt="%m-%d %H:%M") -> str:
+    if not ms:
+        return "—"
+    try:
+        return datetime.fromtimestamp(float(ms) / 1000, tz=timezone.utc).astimezone(AEST).strftime(fmt)
+    except Exception:
+        return "—"
+
+
+def _chip(text, colour, bg_alpha="0.14", title="") -> str:
+    t = f" title='{_esc(title)}'" if title else ""
+    return (f"<span{t} style='font-size:9px;padding:1px 6px;border-radius:4px;"
+            f"background:{colour}{'' if colour.startswith('rgba') else ''};"
+            f"background-color:color-mix(in srgb,{colour} {float(bg_alpha)*100:.0f}%,transparent);"
+            f"color:{colour};font-weight:500;letter-spacing:0.02em'>{_esc(text)}</span>")
+
+
+GRADE_LABEL = {"a_plus": ("A+", GREEN), "b": ("B", AMBER), "none": ("—", "#888")}
+
+
+def _grade_chip(grade) -> str:
+    label, colour = GRADE_LABEL.get(grade or "none", ("—", "#888"))
+    return _chip(label, colour, title=f"setup grade: {grade}")
+
+
+# Human-readable explanations of the 7 mandatory gates, so a blocked setup
+# says *why* rather than printing an internal identifier at the operator.
+GATE_TEXT = {
+    "htf_bias": "HTF bias not aligned",
+    "liquidity_event": "no liquidity sweep",
+    "mss": "no market-structure shift",
+    "entry_zone": "no unmitigated FVG/OB/breaker",
+    "rr": "R:R below minimum",
+    "session": "outside kill zone",
+    "risk_filter": "position sizing rejected",
+    "score_below_b": "score below B threshold",
+}
+
+
+def _gate_list(failures) -> str:
+    if not failures:
+        return f"<span style='color:{GREEN};font-size:11px'>all gates passed</span>"
+    return " ".join(
+        f"<span style='font-size:10px;padding:1px 6px;border-radius:4px;"
+        f"background-color:color-mix(in srgb,{RED} 12%,transparent);color:{RED}' "
+        f"title='gate: {_esc(g)}'>{_esc(GATE_TEXT.get(g, g))}</span>"
+        for g in failures
+    )
+
+
+# ── Price ladder ───────────────────────────────────────────────────────────────
+
+LADDER_H = 250  # px
+
+
+def _ladder(price, bands, lines, height=LADDER_H) -> str:
+    """
+    Vertical price ladder: bands are (lo, hi, colour, label, dashed), lines are
+    (price, colour, label, style). Everything is positioned by linear
+    interpolation between the min and max of every level supplied, padded so
+    nothing renders flush against an edge.
+
+    Pure CSS -- no chart library, no candle data. The point is relative
+    position (is the stop above or below that order block?), not a price
+    chart.
+    """
+    levels = [p for (lo, hi, *_ ) in bands for p in (lo, hi) if p is not None]
+    levels += [p for (p, *_) in lines if p is not None]
+    if price is not None:
+        levels.append(price)
+    levels = [float(l) for l in levels if l is not None]
+    if len(levels) < 2:
+        return "<div style='font-size:11px;color:var(--muted);padding:8px 0'>Not enough levels to plot.</div>"
+
+    lo_v, hi_v = min(levels), max(levels)
+    pad = (hi_v - lo_v) * 0.08 or (hi_v * 0.001 or 1.0)
+    lo_v, hi_v = lo_v - pad, hi_v + pad
+    span = hi_v - lo_v
+
+    def y(v):
+        """Price -> px from top. Higher price = nearer the top, as on a chart."""
+        return max(0.0, min(1.0, (hi_v - float(v)) / span)) * height
+
+    out = [f"<div style='position:relative;height:{height}px;margin:10px 0 6px;"
+           f"border-left:1px solid var(--border);border-right:1px solid var(--border)'>"]
+
+    for lo, hi, colour, label, dashed in bands:
+        if lo is None or hi is None:
+            continue
+        top, bot = y(hi), y(lo)
+        h = max(3.0, bot - top)
+        border = f"1px dashed {colour}" if dashed else "none"
+        out.append(
+            f"<div title='{_esc(label)} · {_px(lo)}–{_px(hi)}' style='position:absolute;left:0;right:88px;"
+            f"top:{top:.1f}px;height:{h:.1f}px;background-color:color-mix(in srgb,{colour} 16%,transparent);"
+            f"border:{border};border-radius:2px'></div>"
+            f"<div style='position:absolute;right:0;width:86px;top:{top:.1f}px;font-size:9px;"
+            f"color:{colour};text-align:right;white-space:nowrap;overflow:hidden'>{_esc(label)}</div>"
+        )
+
+    for lvl, colour, label, style in lines:
+        if lvl is None:
+            continue
+        top = y(lvl)
+        out.append(
+            f"<div title='{_esc(label)} · {_px(lvl)}' style='position:absolute;left:0;right:88px;top:{top:.1f}px;"
+            f"border-top:1.5px {style} {colour}'></div>"
+            f"<div style='position:absolute;right:0;width:86px;top:{max(0.0, top - 6):.1f}px;font-size:9px;"
+            f"color:{colour};text-align:right;white-space:nowrap'>{_esc(label)}</div>"
+        )
+
+    if price is not None:
+        top = y(price)
+        out.append(
+            f"<div style='position:absolute;left:0;right:88px;top:{top:.1f}px;border-top:2px solid var(--fg)'></div>"
+            f"<div style='position:absolute;right:0;width:86px;top:{max(0.0, top - 7):.1f}px;font-size:10px;"
+            f"font-weight:600;color:var(--fg);text-align:right'>{_px(price)}</div>"
+        )
+
+    out.append("</div>")
+    return "".join(out)
+
+
+def _zone_bands(ctx: dict, limit_each=3) -> list:
+    """Structure bands for the ladder, drawn from context.json's zones block."""
+    z = (ctx or {}).get("zones") or {}
+    bands = []
+    for f in (z.get("fvg") or [])[:limit_each]:
+        bands.append((f["low"], f["high"], AMBER, f"FVG {f['kind'][:4]}", False))
+    for o in (z.get("order_blocks") or [])[:limit_each]:
+        bands.append((o["low"], o["high"], PURPLE, f"OB {o['kind'][:4]}", False))
+    for b in (z.get("breakers") or [])[:limit_each]:
+        bands.append((b["low"], b["high"], PURPLE, f"BRK {b['kind'][:4]}", True))
+    for s in (z.get("sr") or [])[:limit_each]:
+        bands.append((s["price_low"], s["price_high"], "#888",
+                      f"{'R' if s['kind'] == 'resistance' else 'S'} ×{s['touches']}", False))
+    return bands
+
+
+def _liquidity_lines(ctx: dict, limit=4) -> list:
+    z = (ctx or {}).get("zones") or {}
+    out = []
+    for p in (z.get("liquidity") or [])[:limit]:
+        out.append((p["price"], "#888", p["source"].upper(), "dotted"))
+    return out
+
+
+# ── Asset cards: open_position / resting_order / flat ──────────────────────────
+
+def _row(label, value, colour=None, title="") -> str:
+    c = f";color:{colour}" if colour else ""
+    t = f" title='{_esc(title)}'" if title else ""
+    return (f"<div{t} style='display:contents'>"
+            f"<span style='font-size:11px;color:var(--muted);padding:2px 0'>{_esc(label)}</span>"
+            f"<span style='font-size:12px;text-align:right;font-weight:500;padding:2px 0{c}'>{value}</span>"
+            f"</div>")
+
+
+def _grid(rows_html: str) -> str:
+    return (f"<div style='display:grid;grid-template-columns:auto 1fr;gap:0 12px;"
+            f"align-items:baseline'>{rows_html}</div>")
+
+
+def _card_open(asset, pos, ctx) -> str:
+    """In a live position: entry, mark, SL (initial + current), TP, partial state."""
+    price   = (ctx or {}).get("price")
+    entry   = pos.get("entry_price")
+    init_sl = pos.get("initial_stop_price")
+    cur_sl  = pos.get("current_stop_price")
+    tp      = pos.get("target_price")
+    is_long = pos.get("direction") == "bullish"
+    sign    = 1 if is_long else -1
+
+    risk_unit = abs(entry - init_sl) if (entry and init_sl) else None
+    unreal_pct = (price - entry) / entry * sign * 100 if (price and entry) else None
+    unreal_r   = (price - entry) * sign / risk_unit if (price and entry and risk_unit) else None
+    unreal_usd = (price - entry) * sign * pos.get("qty_remaining", 0) if (price and entry) else None
+    planned_rr = abs(tp - entry) / risk_unit if (tp and entry and risk_unit) else None
+
+    def dist(level):
+        return f" <span style='color:var(--muted);font-weight:400'>{_sgn((level - entry) / entry * 100, '%')}</span>" \
+            if (level and entry) else ""
+
+    # A stop that has moved off its initial level is the visible evidence of
+    # breakeven/trailing management -- previously invisible anywhere.
+    moved = cur_sl is not None and init_sl is not None and abs(cur_sl - init_sl) > 1e-9
+    at_be = moved and entry is not None and abs(cur_sl - entry) <= abs(entry) * 1e-6
+    sl_badge = ""
+    if at_be:
+        sl_badge = " " + _chip("BREAKEVEN", GREEN)
+    elif moved:
+        sl_badge = " " + _chip("TRAILING", GREEN)
+
+    partial = _chip("2R PARTIAL TAKEN", GREEN) if pos.get("partial_taken") else \
+        _chip("partial not yet taken", "#888")
+
+    rows = (
+        _row("entry (filled)", _px(entry))
+        + _row("mark", _px(price), title="close of the most recent 1H bar the worker saw — not a live tick")
+        + _row("unrealised", f"{_sgn(unreal_pct, '%')} &nbsp; <b>{_sgn(unreal_r, 'R')}</b>", _col(unreal_pct))
+        + _row("unrealised $", _sgn(unreal_usd, dp=2) if unreal_usd is not None else "—", _col(unreal_usd))
+        + _row("initial stop", _px(init_sl) + dist(init_sl), RED)
+        + _row("current stop", _px(cur_sl) + dist(cur_sl) + sl_badge, RED)
+        + _row("target", _px(tp) + dist(tp), GREEN)
+        + _row("planned R:R", _sgn(planned_rr, "R") if planned_rr else "—")
+        + _row("qty", f"{pos.get('qty_remaining', 0):.6g} / {pos.get('qty_total', 0):.6g}")
+        + _row("leverage", f"{pos.get('leverage', '—')}x")
+        + _row("opened", _ts_aest(pos.get("fill_timestamp")))
+    )
+
+    lines = [(entry, BLUE, "entry", "solid"), (tp, GREEN, "target", "solid"),
+             (cur_sl, RED, "stop", "solid")]
+    # Only draw the initial stop separately once it has actually moved --
+    # otherwise it sits exactly under "stop" and just renders as clutter.
+    if moved:
+        lines.append((init_sl, RED, "initial SL", "dashed"))
+    lines += _liquidity_lines(ctx, limit=2)
+
+    return (f"<div style='margin-bottom:6px'>{partial}</div>"
+            + _ladder(price, _zone_bands(ctx, limit_each=2), lines)
+            + _grid(rows))
+
+
+def _card_resting(asset, pos, ctx, scan_params) -> str:
+    """Limit order placed, not yet filled -- a state the old dashboard had no concept of."""
+    price = (ctx or {}).get("price")
+    atr   = (ctx or {}).get("atr")
+    entry = pos.get("entry_price")
+    sl, tp = pos.get("stop_price"), pos.get("target_price")
+    risk_unit = abs(entry - sl) if (entry and sl) else None
+    rr = abs(tp - entry) / risk_unit if (tp and entry and risk_unit) else None
+
+    away_pct = (entry - price) / price * 100 if (price and entry) else None
+    away_atr = abs(entry - price) / atr if (price and entry and atr) else None
+
+    ttl = (scan_params or {}).get("state_ttl_bars", 40)
+    rows = (
+        _row("limit price", _px(entry), BLUE)
+        + _row("mark", _px(price))
+        + _row("distance", f"{_sgn(away_pct, '%')} &nbsp; <span style='color:var(--muted)'>{away_atr:.1f}×ATR</span>"
+               if away_atr is not None else _sgn(away_pct, "%"))
+        + _row("stop (on fill)", _px(sl), RED)
+        + _row("target (on fill)", _px(tp), GREEN)
+        + _row("R:R", _sgn(rr, "R") if rr else "—")
+        + _row("qty", f"{pos.get('qty', 0):.6g}")
+        + _row("leverage", f"{pos.get('leverage', '—')}x")
+        + _row("risk if stopped", f"${pos.get('risk_usd', 0):,.2f}")
+        + _row("from MSS", _ts_aest(pos.get("mss_timestamp")))
+    )
+
+    note = (f"<div style='font-size:11px;color:var(--muted);line-height:1.6;margin-top:8px;"
+            f"border-top:0.5px solid var(--border);padding-top:8px'>"
+            f"Cancels automatically if price closes back through the MSS level, "
+            f"or after {ttl} bars without a fill.</div>")
+
+    lines = [(entry, BLUE, "limit", "dashed"), (sl, RED, "stop", "solid"), (tp, GREEN, "target", "solid")]
+    lines += _liquidity_lines(ctx, limit=2)
+    return _ladder(price, _zone_bands(ctx, limit_each=2), lines) + _grid(rows) + note
+
+
+def _candidate_block(c: dict, ttl_bars: int) -> str:
+    """One proposed scenario -- qualified or near-miss."""
+    armed = c.get("qualified") and c.get("status") == "pending"
+    head_col = GREEN if armed else AMBER if c.get("grade") != "none" else "#888"
+    state = "ENTRY ARMED" if armed else ("blocked" if c.get("gate_failures") else c.get("status", "—"))
+    ez = c.get("entry_zone") or {}
+    zone_txt = (f"{ez.get('kind', '—').replace('_', ' ').upper()} &nbsp;"
+                f"{_px(ez.get('low'))} – {_px(ez.get('high'))}") if ez else "—"
+
+    size = c.get("size") or {}
+    risk_txt = f"${size.get('risk_usd', 0):,.2f}" if size else "—"
+
+    rows = (
+        _row("direction", f"<span style='color:{GREEN if c['direction'] == 'bullish' else RED}'>"
+                          f"{'LONG' if c['direction'] == 'bullish' else 'SHORT'}</span>")
+        + _row("entry zone", zone_txt)
+        + _row("entry (mid)", _px(c.get("entry_price")), BLUE)
+        + _row("stop", _px(c.get("stop_price")), RED)
+        + _row("target", _px(c.get("target_price")), GREEN)
+        + _row("R:R", _sgn(c.get("rr"), "R") if c.get("rr") else "—")
+        + _row("would risk", risk_txt + (f" · {size.get('leverage')}x" if size else ""))
+        + _row("swept level", _px(c.get("swept_level")))
+        + _row("MSS level", _px(c.get("mss_level")))
+        + _row("age", f"{c.get('bars_since_mss', '—')} bars · "
+                      f"expires in {c.get('bars_until_expiry', '—')}")
+    )
+
+    return (
+        f"<div style='border:0.5px solid var(--border);border-radius:8px;padding:10px;margin-top:8px'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px'>"
+        f"<div style='display:flex;align-items:center;gap:6px'>"
+        f"<span style='font-size:11px;font-weight:600;color:{head_col}'>{_esc(state.upper())}</span>"
+        f"{_grade_chip(c.get('grade'))}"
+        f"<span style='font-size:10px;color:var(--muted)'>score {c.get('score', '—')}/20</span>"
+        f"</div>"
+        f"<span style='font-size:10px;color:var(--muted)'>{_ts_aest(c.get('mss_ts'))}</span>"
+        f"</div>"
+        f"{_grid(rows)}"
+        f"<div style='margin-top:8px;display:flex;gap:4px;flex-wrap:wrap'>{_gate_list(c.get('gate_failures'))}</div>"
+        f"</div>"
+    )
+
+
+def _card_flat(asset, ctx, scan_params) -> str:
+    """Watching: bias, proposed scenarios (qualified + near-miss), structure near price."""
+    if not ctx:
+        return ("<div style='font-size:11px;color:var(--muted);padding:8px 0'>"
+                "No market context yet — the worker writes it once per cycle. "
+                "If this persists, the worker may be running a build without the context dump.</div>")
+
+    price = ctx.get("price")
+    bias  = ctx.get("bias") or {}
+    dr    = ctx.get("dealing_range") or {}
+    ttl   = (scan_params or {}).get("state_ttl_bars", 40)
+
+    bd = bias.get("direction", "no_trade")
+    bias_col = GREEN if bd == "long" else RED if bd == "short" else "#888"
+    bias_html = (
+        f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px'>"
+        f"<span style='font-size:12px;font-weight:600;color:{bias_col}'>{_esc(bd.replace('_', ' ').upper())}</span>"
+        f"<span style='font-size:10px;color:var(--muted)'>weekly {_esc(bias.get('weekly_trend', '—'))} · "
+        f"daily {_esc(bias.get('daily_trend', '—'))}</span></div>"
+        f"<div style='font-size:10px;color:var(--muted);line-height:1.5'>{_esc(bias.get('reason', ''))}</div>"
+    )
+
+    if dr:
+        ote = " · <span style='color:%s'>in OTE</span>" % GREEN if dr.get("in_ote") else ""
+        bias_html += (
+            f"<div style='font-size:10px;color:var(--muted);margin-top:4px'>"
+            f"range {_px(dr.get('low'))}–{_px(dr.get('high'))} · "
+            f"{(dr.get('retracement_pct') or 0) * 100:.0f}% retracement · {_esc(dr.get('zone', '—'))}{ote}</div>"
+        )
+
+    bands = _zone_bands(ctx)
+    lines = _liquidity_lines(ctx)
+    cands = ctx.get("candidates") or []
+    if cands:
+        top = cands[0]
+        lines += [(top.get("stop_price"), RED, "stop", "dashed"),
+                  (top.get("target_price"), GREEN, "target", "dashed")]
+        ez = top.get("entry_zone") or {}
+        if ez.get("low") is not None:
+            bands.append((ez["low"], ez["high"], BLUE, "entry", False))
+    if dr.get("ote_band"):
+        b = dr["ote_band"]
+        bands.append((b[0], b[1], "#888", "OTE", True))
+
+    ladder = _ladder(price, bands, lines)
+
+    if cands:
+        cand_html = "".join(_candidate_block(c, ttl) for c in cands[:3])
+    else:
+        cand_html = ("<div style='font-size:11px;color:var(--muted);padding:8px 0'>"
+                     "No candidate setup in the last 61 bars — no MSS with a matching sweep to evaluate.</div>")
+
+    # Structure list -- the raw zones behind the ladder, in numbers.
+    z = ctx.get("zones") or {}
+    struct_rows = []
+    for s in (z.get("sr") or [])[:3]:
+        struct_rows.append(_row(f"{s['kind']}", f"{_px(s['price_low'])} – {_px(s['price_high'])} "
+                                                f"<span style='color:var(--muted);font-weight:400'>×{s['touches']}</span>"))
+    for o in (z.get("order_blocks") or [])[:3]:
+        struct_rows.append(_row(f"{o['kind']} OB", f"{_px(o['low'])} – {_px(o['high'])}"))
+    for f in (z.get("fvg") or [])[:3]:
+        d = " <span style='color:%s;font-weight:400'>disp</span>" % AMBER if f.get("displacement") else ""
+        struct_rows.append(_row(f"{f['kind']} FVG", f"{_px(f['low'])} – {_px(f['high'])}{d}"))
+    for b in (z.get("breakers") or [])[:2]:
+        struct_rows.append(_row(f"{b['kind']} breaker", f"{_px(b['low'])} – {_px(b['high'])}"))
+    for p in (z.get("liquidity") or [])[:4]:
+        struct_rows.append(_row(f"{p['source'].upper()} liq", _px(p["price"])))
+
+    struct_html = (
+        f"<div style='margin-top:10px;border-top:0.5px solid var(--border);padding-top:8px'>"
+        f"<div style='font-size:10px;color:var(--muted);margin-bottom:4px'>STRUCTURE NEAR PRICE</div>"
+        f"{_grid(''.join(struct_rows))}</div>"
+    ) if struct_rows else ""
+
+    return bias_html + ladder + cand_html + struct_html
+
+
+# ── Closed trades + R-based performance ────────────────────────────────────────
+
+def _all_trades(assets: dict) -> list[dict]:
+    out = []
+    for a in ASSETS:
+        for t in (assets.get(a) or {}).get("trades", []):
+            out.append({**t, "_asset": t.get("asset", a)})
+    out.sort(key=lambda t: t.get("exit_utc") or 0, reverse=True)
+    return out
+
+
+def _realised_r(t: dict):
+    """
+    Prefer the R the worker recorded at close; fall back to deriving it for
+    trades written before realised_r existed. Returns None when the initial
+    stop distance isn't recoverable.
+    """
+    if t.get("realised_r") is not None:
+        return float(t["realised_r"])
+    entry, stop, qty, pnl = t.get("entry_price"), t.get("stop_price"), t.get("qty"), t.get("pnl_usd")
+    if None in (entry, stop, qty, pnl):
+        return None
+    risk = abs(float(entry) - float(stop)) * float(qty)
+    return (float(pnl) / risk) if risk > 0 else None
+
+
+def _trades_table(trades: list[dict]) -> str:
+    if not trades:
+        return ("<div style='font-size:12px;color:var(--muted);margin-bottom:1.5rem'>"
+                "No closed trades yet.</div>")
+
+    head = "".join(
+        f"<th style='padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left'>{h}</th>"
+        for h in ("closed (AEST)", "asset", "side", "grade", "entry", "exit", "stop",
+                  "planned", "realised", "P&L $", "source")
+    )
+
+    rows = []
+    for t in trades[:50]:
+        r = _realised_r(t)
+        pnl = t.get("pnl_usd")
+        src = t.get("pnl_source", "—")
+        # local_estimate means the exchange records didn't reconcile against
+        # the position's qty -- flag it rather than presenting it as truth.
+        src_html = (f"<span style='color:{AMBER}' title='closed-pnl records did not reconcile; "
+                    f"figure includes a locally-estimated partial'>estimate</span>"
+                    if src == "local_estimate" else
+                    "<span style='color:var(--muted)' title='summed from Bybit closed-pnl records'>exchange</span>")
+        partial = " " + _chip("P", GREEN, title="2R partial was taken on this trade") if t.get("partial_taken") else ""
+        cells = [
+            f"<span style='color:var(--muted)'>{_ts_aest(t.get('exit_utc'))}</span>",
+            _esc(t.get("_asset", "—")),
+            f"<span style='color:{GREEN if t.get('direction') == 'bullish' else RED}'>"
+            f"{'long' if t.get('direction') == 'bullish' else 'short'}</span>",
+            GRADE_LABEL.get(t.get("grade"), ("—", "#888"))[0] + partial,
+            _px(t.get("entry_price")),
+            _px(t.get("exit_price")),
+            _px(t.get("stop_price")),
+            _sgn(t.get("planned_rr"), "R") if t.get("planned_rr") else "—",
+            f"<b style='color:{_col(r)}'>{_sgn(r, 'R')}</b>" if r is not None else "—",
+            f"<span style='color:{_col(pnl)};font-weight:500'>"
+            f"{'+' if (pnl or 0) >= 0 else '-'}${abs(pnl or 0):,.2f}</span>",
+            src_html,
+        ]
+        rows.append("<tr style='border-top:0.5px solid var(--border)'>"
+                    + "".join(f"<td style='padding:5px 8px;font-size:11px'>{c}</td>" for c in cells)
+                    + "</tr>")
+
+    return (f"<div style='background:var(--bg);border:0.5px solid var(--border);border-radius:8px;"
+            f"overflow:auto;margin-bottom:1.5rem'><table style='width:100%;border-collapse:collapse;"
+            f"white-space:nowrap'><thead><tr style='background:var(--surface)'>{head}</tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>")
+
+
+def _stat(label, value, sub="", colour=None) -> str:
+    c = f";color:{colour}" if colour else ""
+    return (f"<div style='background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px'>"
+            f"<div style='font-size:11px;color:var(--muted);margin-bottom:4px'>{_esc(label)}</div>"
+            f"<div style='font-size:20px;font-weight:500{c}'>{value}</div>"
+            f"{f'<div style=font-size:10px;color:var(--muted);margin-top:3px>{sub}</div>' if sub else ''}</div>")
+
+
+def _performance(trades: list[dict]) -> str:
+    """
+    R-based, not percentage-based. Position size is grade-dependent (A+ risks
+    20% of equity, B risks 10%), so summing raw percentage returns across
+    grades would be comparing different-sized bets. R is the only unit that
+    makes them comparable.
+    """
+    closed = [t for t in trades if _realised_r(t) is not None]
+    if not closed:
+        return ("<div style='font-size:12px;color:var(--muted);margin-bottom:1.5rem'>"
+                "No closed trades yet — performance appears here after the first close.</div>")
+
+    rs = [_realised_r(t) for t in closed]
+    total_r = sum(rs)
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r <= 0]
+    win_rate = len(wins) / len(rs) * 100
+    avg_w = sum(wins) / len(wins) if wins else 0.0
+    avg_l = sum(losses) / len(losses) if losses else 0.0
+    expectancy = total_r / len(rs)
+    total_usd = sum(float(t.get("pnl_usd") or 0) for t in closed)
+
+    cards = (
+        _stat("total R", f"<b>{_sgn(total_r, 'R')}</b>", f"{len(rs)} closed trades", _col(total_r))
+        + _stat("expectancy", _sgn(expectancy, "R"), "per trade", _col(expectancy))
+        + _stat("win rate", f"{win_rate:.0f}%", f"{len(wins)}W / {len(losses)}L")
+        + _stat("realised P&L", f"{'+' if total_usd >= 0 else '-'}${abs(total_usd):,.2f}",
+                f"avg win {_sgn(avg_w, 'R')} · avg loss {_sgn(avg_l, 'R')}", _col(total_usd))
+    )
+
+    # By grade -- this is the question that validates or refutes the 20-point
+    # scoring model: does A+ actually outperform B?
+    by_grade = []
+    for g in ("a_plus", "b"):
+        sub = [t for t in closed if t.get("grade") == g]
+        if not sub:
+            continue
+        sub_r = [_realised_r(t) for t in sub]
+        w = sum(1 for r in sub_r if r > 0)
+        label, colour = GRADE_LABEL[g]
+        by_grade.append(
+            f"<div style='display:flex;justify-content:space-between;font-size:11px;padding:4px 0;"
+            f"border-top:0.5px solid var(--border)'>"
+            f"<span style='color:{colour};font-weight:600'>{label}</span>"
+            f"<span style='color:var(--muted)'>{len(sub)} trades · {w / len(sub) * 100:.0f}% win · "
+            f"<b style='color:{_col(sum(sub_r))}'>{_sgn(sum(sub_r), 'R')}</b> total · "
+            f"{_sgn(sum(sub_r) / len(sub_r), 'R')} avg</span></div>"
+        )
+    grade_html = (
+        f"<div style='background:var(--bg);border:0.5px solid var(--border);border-radius:8px;"
+        f"padding:12px;margin-bottom:1.5rem'>"
+        f"<div style='font-size:10px;color:var(--muted);margin-bottom:2px'>BY GRADE "
+        f"<span style='font-weight:400'>· does A+ actually outperform B?</span></div>"
+        f"{''.join(by_grade)}</div>"
+    ) if by_grade else ""
+
+    return (f"<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));"
+            f"gap:10px;margin-bottom:1rem'>{cards}</div>{grade_html}")
+
+
+def _funnel(assets: dict) -> str:
+    """
+    Where setups die, aggregated across assets. At ~0.5-0.9 trades/month/asset
+    this is usually more informative than the P&L table -- it answers "why
+    isn't it trading?" directly from gate_summary.
+    """
+    totals: dict[str, int] = {}
+    candidates = 0
+    qualified = 0
+    for a in ASSETS:
+        ctx = (assets.get(a) or {}).get("context") or {}
+        for gate, n in (ctx.get("gate_summary") or {}).items():
+            totals[gate] = totals.get(gate, 0) + n
+        for c in ctx.get("candidates") or []:
+            candidates += 1
+            if c.get("qualified"):
+                qualified += 1
+
+    if not totals and not candidates:
+        return ("<div style='font-size:12px;color:var(--muted);margin-bottom:1.5rem'>"
+                "No candidate setups in the current window across any asset.</div>")
+
+    worst = max(totals.values()) if totals else 1
+    bars = []
+    for gate, n in sorted(totals.items(), key=lambda kv: -kv[1]):
+        w = max(4, int(n / worst * 180))
+        bars.append(
+            f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:3px' "
+            f"title='{_esc(gate)}'>"
+            f"<span style='font-size:10px;width:170px;color:var(--muted)'>{_esc(GATE_TEXT.get(gate, gate))}</span>"
+            f"<div style='height:6px;width:{w}px;background:{RED};border-radius:3px;opacity:0.6'></div>"
+            f"<span style='font-size:10px;color:var(--muted)'>{n}</span></div>"
+        )
+
+    return (f"<div style='background:var(--bg);border:0.5px solid var(--border);border-radius:8px;"
+            f"padding:12px;margin-bottom:1.5rem'>"
+            f"<div style='font-size:11px;margin-bottom:8px'>"
+            f"<b>{candidates}</b> candidate setup(s) in window · "
+            f"<b style='color:{GREEN}'>{qualified}</b> fully qualified</div>"
+            f"<div style='font-size:10px;color:var(--muted);margin-bottom:6px'>REJECTED BY GATE</div>"
+            f"{''.join(bars)}</div>")
+
+
+def _log_html(lines: list[str]) -> str:
+    keep = ("placed", "filled", "closed", "cancel", "ERROR", "WARN", "Traceback",
+            "needs_review", "circuit breaker", "partial", "trail", "[cycle]", "starting")
+    shown = [l for l in lines if any(k.lower() in l.lower() for k in keep)][-25:]
+    if not shown:
+        shown = lines[-10:]
+    if not shown:
+        return "<div style='font-size:11px;color:var(--muted)'>No log output.</div>"
+    out = []
+    for l in shown:
+        c = ""
+        low = l.lower()
+        if "error" in low or "traceback" in low:
+            c = f"color:{RED}"
+        elif "filled" in low or "closed" in low or "placed" in low:
+            c = f"color:{GREEN}"
+        elif "warn" in low:
+            c = f"color:{AMBER}"
+        elif l.startswith("[cycle]"):
+            c = "color:var(--muted)"
+        out.append(f"<div style='font-size:11px;line-height:1.8;{c}'>{_esc(l)}</div>")
+    return "".join(out)
+
+
+# ── Alerts ─────────────────────────────────────────────────────────────────────
+
+def _alert_keys(assets: dict) -> list[dict]:
+    """
+    Stable identities for events worth notifying about. The browser keeps the
+    set it has already shown in localStorage, so a key only fires once even
+    though the page reloads on a timer.
+    """
+    events = []
+    for a in ASSETS:
+        st = assets.get(a) or {}
+        pos, ctx = st.get("position") or {}, st.get("context") or {}
+        status = pos.get("status")
+
+        if st.get("review_flag"):
+            events.append({"key": f"{a}:review", "title": f"{a} needs manual review",
+                           "body": st["review_flag"][:180]})
+        if status == "resting_order":
+            events.append({"key": f"{a}:resting:{pos.get('mss_timestamp')}",
+                           "title": f"{a} order resting",
+                           "body": f"{'long' if pos.get('direction') == 'bullish' else 'short'} "
+                                   f"limit @ {_px(pos.get('entry_price'))}"})
+        elif status == "open_position":
+            events.append({"key": f"{a}:filled:{pos.get('fill_timestamp')}",
+                           "title": f"{a} position open",
+                           "body": f"{'long' if pos.get('direction') == 'bullish' else 'short'} "
+                                   f"filled @ {_px(pos.get('entry_price'))}"})
+        for c in (ctx.get("candidates") or []):
+            if c.get("qualified") and c.get("status") == "pending":
+                events.append({"key": f"{a}:armed:{c.get('mss_ts')}",
+                               "title": f"{a} setup armed",
+                               "body": f"{c.get('grade', '').upper()} · "
+                                       f"{'long' if c['direction'] == 'bullish' else 'short'} · "
+                                       f"{_sgn(c.get('rr'), 'R')}"})
+        for t in (st.get("trades") or [])[-3:]:
+            r = _realised_r(t)
+            events.append({"key": f"{a}:closed:{t.get('exit_utc')}",
+                           "title": f"{a} trade closed",
+                           "body": f"{_sgn(r, 'R')} · ${float(t.get('pnl_usd') or 0):,.2f}"})
+    return events
+
+
+# ── Page ───────────────────────────────────────────────────────────────────────
+
+def _render(d: dict) -> str:
     assets  = d.get("assets", {})
-    logs    = d.get("log_tail", [])
-    updated = d.get("updated", "—")
-    mode    = goal.get("mode", "paper")
+    hb      = d.get("heartbeat", {})
     ssh_ok  = d.get("ssh_ok", True)
+    updated = d.get("updated", "—")
+    sp      = hb.get("scan_params") or {}
 
-    # helpers
-    def _pnl_col(val: float) -> str:
-        return "#1D9E75" if val >= 0 else "#E24B4A"
-
-    def _pnl_chip(val: float, decimals: int = 2) -> str:
-        sign = "+" if val >= 0 else ""
-        return f"<span style='color:{_pnl_col(val)};font-weight:500'>{sign}{val:.{decimals}f}%</span>"
-
-    def _convert_log_utc(line: str) -> str:
-        import re
-        m = re.match(r'^(\d{2}:\d{2}) UTC (.+)', line)
-        if not m:
-            return line
-        try:
-            now_utc = datetime.now(timezone.utc)
-            t = datetime.strptime(m.group(1), "%H:%M").replace(
-                year=now_utc.year, month=now_utc.month, day=now_utc.day, tzinfo=timezone.utc,
-            )
-            return f"{t.astimezone(AEST).strftime('%H:%M')} AEST {m.group(2)}"
-        except Exception:
-            return line
-
-    def _log_line(line: str) -> str:
-        line = _convert_log_utc(line)
-        col  = ""
-        if "Trade #" in line:
-            col = "color:#1D9E75"
-        elif "error" in line.lower():
-            col = "color:#E24B4A"
-        elif "reflect" in line.lower() or "Reflection" in line:
-            col = "color:#EF9F27"
-        elif "Trend filter" in line or "Session filter" in line or "Portfolio daily" in line:
-            col = "color:#888"
-        safe = line.replace("<", "&lt;").replace(">", "&gt;")
-        return f"<div style='font-size:11px;line-height:1.9;{col}'>{safe}</div>"
-
-    # SSH warning banner
-    ssh_banner = ""
+    banners = ""
     if not ssh_ok:
-        ssh_banner = (
-            "<div style='background:rgba(226,75,74,0.1);border:0.5px solid #E24B4A;"
-            "border-radius:8px;padding:10px 14px;margin-bottom:1rem;font-size:12px;color:#E24B4A'>"
-            "&#9888; VPS unreachable — showing last known state</div>"
-        )
+        banners += (f"<div style='background-color:color-mix(in srgb,{RED} 10%,transparent);"
+                    f"border:0.5px solid {RED};border-radius:8px;padding:10px 14px;margin-bottom:1rem;"
+                    f"font-size:12px;color:{RED}'>&#9888; VPS unreachable — showing last known state</div>")
 
-    # top stats
-    total_trades = sum(assets.get(s, {}).get("trade_count", 0) for s in ASSETS)
-    top_stats = f"""
-<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1.5rem">
-  <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">target / 30d</div>
-    <div style="font-size:20px;font-weight:500">{goal.get("target", "—")}</div>
-  </div>
-  <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">max drawdown</div>
-    <div style="font-size:20px;font-weight:500">{goal.get("drawdown", "—")}</div>
-  </div>
-  <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">total trades</div>
-    <div style="font-size:20px;font-weight:500">{total_trades}</div>
-  </div>
-  <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">reflect every</div>
-    <div style="font-size:20px;font-weight:500">{goal.get("reflection", "5")} trades</div>
-  </div>
-</div>"""
+    for a in ASSETS:
+        flag = (assets.get(a) or {}).get("review_flag")
+        if flag:
+            banners += (f"<div style='background-color:color-mix(in srgb,{RED} 14%,transparent);"
+                        f"border:1px solid {RED};border-radius:8px;padding:12px 14px;margin-bottom:1rem;"
+                        f"font-size:12px;color:{RED}'><b>&#9888; {_esc(a)} NEEDS MANUAL REVIEW</b> — "
+                        f"automated management of this asset is stopped.<br>"
+                        f"<span style='font-size:11px'>{_esc(flag)}</span></div>")
 
-    # P&L summary
-    def _cutoff(days: int) -> str:
-        aest_today = datetime.now(AEST).date()
-        midnight   = datetime(aest_today.year, aest_today.month, aest_today.day, tzinfo=AEST) - timedelta(days=days)
-        return midnight.astimezone(timezone.utc).isoformat()
+    # Worker liveness: heartbeat ts is wall-clock seconds (see run_ict_live).
+    hb_age = None
+    if hb.get("ts"):
+        hb_age = time.time() - float(hb["ts"])
+    if hb_age is not None and hb_age > 30 * 60:
+        banners += (f"<div style='background-color:color-mix(in srgb,{AMBER} 12%,transparent);"
+                    f"border:0.5px solid {AMBER};border-radius:8px;padding:10px 14px;margin-bottom:1rem;"
+                    f"font-size:12px;color:{AMBER}'>&#9888; Last worker cycle was "
+                    f"{hb_age / 60:.0f} min ago — expected every 15 min. The worker may be stopped.</div>")
 
-    all_trades_flat = [t for s in ASSETS for t in assets.get(s, {}).get("trades", [])]
-
-    def _pnl_usd(t: dict):
-        """
-        Resolve a trade's $ P&L. Prefer the authoritative closed_pnl_usdt
-        from Bybit (when present); else compute from pnl_pct * entry * qty.
-        Returns float or None if neither is computable.
-        """
-        cp = t.get("closed_pnl_usdt")
-        if cp is not None:
-            try: return float(cp)
-            except (TypeError, ValueError): pass
-        pnl_pct = t.get("pnl_pct")
-        entry   = t.get("entry_price")
-        qty     = t.get("qty")
-        if pnl_pct is None or entry is None or qty is None:
-            return None
-        try:
-            return float(pnl_pct) * float(entry) * float(qty)
-        except (TypeError, ValueError):
-            return None
-
-    def _period_pnl(since_iso: str) -> float:
-        return sum(
-            float(t["pnl_pct"])
-            for t in all_trades_flat
-            if t.get("pnl_pct") is not None and t.get("ts", "") >= since_iso
-        ) * 100
-
-    def _period_pnl_usd(since_iso: str) -> float:
-        return sum(
-            (v for t in all_trades_flat
-             if t.get("ts", "") >= since_iso and (v := _pnl_usd(t)) is not None),
-            0.0,
-        )
-
-    agg = {
-        "day":   _period_pnl(_cutoff(1)),
-        "week":  _period_pnl(_cutoff(7)),
-        "month": _period_pnl(_cutoff(30)),
-        "all":   _period_pnl(""),
-    }
-    agg_usd = {
-        "day":   _period_pnl_usd(_cutoff(1)),
-        "week":  _period_pnl_usd(_cutoff(7)),
-        "month": _period_pnl_usd(_cutoff(30)),
-        "all":   _period_pnl_usd(""),
-    }
-
-    def _usd_chip(v: float) -> str:
-        col = "#1D9E75" if v >= 0 else "#E24B4A"
-        sign = "+" if v >= 0 else "-"
-        return f"<span style='color:{col};font-size:13px;font-weight:500'>{sign}${abs(v):,.2f}</span>"
-
-    # Portfolio daily loss across all assets
-    portfolio_daily_usd = sum(
-        assets.get(s, {}).get("today_pnl_usd", 0.0) for s in ASSETS
-    )
-    portfolio_daily_col = _pnl_col(portfolio_daily_usd)
-    portfolio_daily_str = f"{'+' if portfolio_daily_usd >= 0 else '-'}${abs(portfolio_daily_usd):,.2f}"
-
-    pnl_summary = f"""
-<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1.5rem">
-  <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">today P&L</div>
-    <div style="font-size:20px;font-weight:500">{_pnl_chip(agg["day"])}</div>
-    <div style="margin-top:2px">{_usd_chip(agg_usd["day"])}</div>
-  </div>
-  <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">7-day P&L</div>
-    <div style="font-size:20px;font-weight:500">{_pnl_chip(agg["week"])}</div>
-    <div style="margin-top:2px">{_usd_chip(agg_usd["week"])}</div>
-  </div>
-  <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">30-day P&L</div>
-    <div style="font-size:20px;font-weight:500">{_pnl_chip(agg["month"])}</div>
-    <div style="margin-top:2px">{_usd_chip(agg_usd["month"])}</div>
-  </div>
-  <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:8px;padding:12px">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">portfolio today</div>
-    <div style="font-size:20px;font-weight:500;color:{portfolio_daily_col}">{portfolio_daily_str}</div>
-    <div style="font-size:10px;color:var(--muted);margin-top:3px">cap: -$40 · all-time {_usd_chip(agg_usd["all"])}</div>
-  </div>
-</div>"""
-
-    # asset cards
-    def _status_dot(status: str, failures: int, trading_enabled: bool = True) -> str:
-        if not trading_enabled:
-            return "<span style='color:#888' title='trading disabled'>&#9679;</span>"
-        if failures >= 3:
-            return "<span style='color:#E24B4A' title='circuit breaker tripped'>&#9679;</span>"
-        cols = {"ok": "#1D9E75", "error": "#E24B4A", "disabled": "#888"}
-        col = cols.get(status, "#888")
-        return f"<span style='color:{col}'>&#9679;</span>"
-
-    def _position_badge(last_trade: dict, cur_price) -> str:
-        if not last_trade or last_trade.get("pnl_pct") is not None:
-            return ""
-        entry = last_trade.get("entry_price")
-        col   = "#1D9E75" if (entry and cur_price and float(cur_price) >= float(entry)) else "#E24B4A"
-        return f"<span style='font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(0,0,0,0.06);color:{col}'>IN TRADE</span>"
-
-    def _indicator_bars(indicators: list[dict]) -> str:
-        if not indicators:
-            return ""
-        rows = []
-        for ind in indicators:
-            name   = ind.get("name", "")
-            w      = float(ind.get("weight", 0))
-            req    = ind.get("required", False)
-            params = ind.get("params", {})
-            col    = "#EF9F27" if req else ("#1D9E75" if w > 0 else "#555")
-            tag    = "★" if req else ""
-            bw     = max(3, int(w * 42))
-            req_label = " · required gate" if req else ""
-            params_str = ", ".join(f"{k}={v}" for k, v in params.items()) if params else ""
-            tooltip = f"weight {w}{req_label}" + (f" · {params_str}" if params_str else "")
-            rows.append(
-                f"<div style='display:flex;align-items:center;gap:5px;margin-bottom:2px' title='{tooltip}'>"
-                f"<span style='font-size:9px;width:70px;color:var(--muted);overflow:hidden;white-space:nowrap'>{tag}{name}</span>"
-                f"<div style='height:4px;width:{bw}px;background:{col};border-radius:2px;flex-shrink:0'></div>"
-                f"<span style='font-size:9px;color:var(--muted)'>{w}</span>"
-                f"</div>"
-            )
-        legend = (
-            "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:5px'>"
-            "<span style='font-size:9px;color:var(--muted)'>indicators · bar = weight</span>"
-            "<span style='font-size:9px;color:var(--muted)' title='★ = required gate (must fire); bar width = relative weight; hover for details'>★ = required &nbsp; <span style='color:#1D9E75'>■</span> active</span>"
-            "</div>"
-        )
-        return "<div style='margin-top:10px;border-top:0.5px solid var(--border);padding-top:8px'>" + legend + "".join(rows) + "</div>"
-
-    asset_cards = ""
-    for slug in ASSETS:
-        a      = assets.get(slug, {})
-        t      = a.get("last_trade", {})
-        ver    = a.get("strategy_ver", "—")
-        count  = a.get("trade_count", 0)
-        status = a.get("hb_status", "unknown")
-        fails  = a.get("hb_failures", 0)
-        win_r  = a.get("win_rate")
-        tot    = a.get("total_pnl")
-        cur    = a.get("current_price")
-        lwr    = a.get("long_win_rate")
-        swr    = a.get("short_win_rate")
-        tf_on  = a.get("trend_filter_enabled", False)
-        t_mode = a.get("trading_mode", "live")
-        t_en   = a.get("trading_enabled", True)
-        pos_pct = a.get("position_pct", 0.10)
-        risk_pt = a.get("risk_per_trade", 0.02)
-
-        cur_str  = f"${float(cur):,.2f}" if cur else "—"
-        win_str  = f"{win_r * 100:.0f}%" if win_r is not None else "—"
-        tot_col  = _pnl_col(tot) if tot is not None else "inherit"
-        tot_str  = (f"{'+' if tot >= 0 else ''}{tot:.2f}%") if tot is not None else "—"
-        lwr_str  = f"{lwr*100:.0f}%" if lwr is not None else "—"
-        swr_str  = f"{swr*100:.0f}%" if swr is not None else "—"
-
-        last_pnl = t.get("pnl_pct")
-        if last_pnl is not None:
-            lp_col = _pnl_col(float(last_pnl))
-            lp_str = f"{'+' if float(last_pnl) >= 0 else ''}{float(last_pnl)*100:.3f}%"
-        else:
-            lp_col, lp_str = "var(--muted)", ("open" if t else "—")
-
-        ep      = t.get("entry_price")
-        ep_str  = f"${float(ep):,.2f}" if ep else "—"
-
-        lt_raw  = a.get("last_tick", "—")
-        try:
-            lt_str = datetime.fromisoformat(lt_raw).astimezone(AEST).strftime("%H:%M")
-        except Exception:
-            lt_str = "—"
-
-        ind_bars = _indicator_bars(a.get("indicators", []))
-
-        # Mode / status badges
-        badges = ""
-        if not t_en:
-            badges += "<span style='font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(136,136,136,0.15);color:#888;margin-left:4px'>PAUSED</span>"
-        elif t_mode == "paper":
-            badges += "<span style='font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(239,159,39,0.15);color:#EF9F27;margin-left:4px'>PAPER</span>"
-        if tf_on:
-            badges += "<span style='font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(29,158,117,0.12);color:#1D9E75;margin-left:4px' title='Daily + 4h trend filter active'>TF ✓</span>"
-
-        asset_cards += f"""
-        <div style="background:var(--bg);border:0.5px solid var(--border);border-radius:12px;padding:1rem">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
-              {_status_dot(status, fails, t_en)}
-              <span style="font-size:13px;font-weight:500">{a.get("label", slug)}</span>
-              {_position_badge(t, cur)}
-              {badges}
-            </div>
-            <span style="font-size:11px;color:var(--muted)">v{ver}</span>
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px 0">
-            <span style="font-size:11px;color:var(--muted)">price</span>
-            <span style="font-size:12px;font-weight:500;text-align:right">{cur_str}</span>
-            <span style="font-size:11px;color:var(--muted)">trades</span>
-            <span style="font-size:12px;font-weight:500;text-align:right">{count}</span>
-            <span style="font-size:11px;color:var(--muted)">win rate</span>
-            <span style="font-size:12px;font-weight:500;text-align:right">{win_str}</span>
-            <span style="font-size:11px;color:var(--muted)">long / short</span>
-            <span style="font-size:12px;font-weight:500;text-align:right">{lwr_str} / {swr_str}</span>
-            <span style="font-size:11px;color:var(--muted)">total P&L</span>
-            <span style="font-size:12px;font-weight:500;text-align:right;color:{tot_col}">{tot_str}</span>
-            <span style="font-size:11px;color:var(--muted)">sizing</span>
-            <span style="font-size:12px;font-weight:500;text-align:right">{int(pos_pct*100)}% bal · {int(risk_pt*100)}% risk</span>
-            <span style="font-size:11px;color:var(--muted)">last entry</span>
-            <span style="font-size:12px;text-align:right">{ep_str}</span>
-            <span style="font-size:11px;color:var(--muted)">last P&L</span>
-            <span style="font-size:12px;text-align:right;color:{lp_col}">{lp_str}</span>
-          </div>
-          {ind_bars}
-        </div>"""
-
-    # ── Live positions ────────────────────────────────────────────────────────
-    open_trades = [
-        {**t, "_slug": s}
-        for s in ASSETS
-        for t in assets.get(s, {}).get("trades", [])
-        if t.get("pnl_pct") is None and not t.get("abandoned")
-    ]
-    open_trades.sort(key=lambda t: t.get("ts", ""), reverse=True)
-
-    def _unrealised(t: dict) -> str:
-        slug      = t.get("_slug", "")
-        cur_price = assets.get(slug, {}).get("current_price")
-        entry     = t.get("entry_price")
-        if not cur_price or not entry:
-            return "—"
-        direction = t.get("direction", "long")
-        move = (float(cur_price) - float(entry)) / float(entry)
-        pct  = move if direction == "long" else -move
-        col  = _pnl_col(pct * 100)
-        sign = "+" if pct >= 0 else ""
-        return f"<span style='color:{col};font-weight:500'>{sign}{pct*100:.2f}%</span>"
-
-    def _open_trade_row(t: dict) -> str:
-        ts_raw  = t.get("ts", "")
-        try:
-            ts_s = datetime.fromisoformat(ts_raw).astimezone(AEST).strftime("%m-%d %H:%M")
-        except Exception:
-            ts_s = ts_raw[:16].replace("T", " ")
-        asset_s = t.get("asset", "—")
-        dirn    = t.get("direction", "long")
-        dc      = "#1D9E75" if dirn == "long" else "#E24B4A"
-        entry   = t.get("entry_price", 0)
-        slug    = t.get("_slug", "")
-        cur     = assets.get(slug, {}).get("current_price")
-        cur_s   = f"${float(cur):,.2f}" if cur else "—"
-        sl      = t.get("sl_price")
-        tp      = t.get("tp_price")
-        sl_s    = f"${float(sl):,.2f}" if sl else "—"
-        tp_s    = f"${float(tp):,.2f}" if tp else "—"
-        unr     = _unrealised(t)
-        # R:R ratio — prefer stored value; recompute from prices if missing
-        rr = t.get("rr_ratio")
-        if rr is None and sl and tp and entry:
-            sl_dist = abs(float(entry) - float(sl))
-            tp_dist = abs(float(tp) - float(entry))
-            rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else None
-        rr_col  = "#1D9E75" if rr and float(rr) >= 1.5 else "#E8A838" if rr else "var(--muted)"
-        rr_s    = f"<span style='color:{rr_col};font-weight:500'>{rr:.1f}R</span>" if rr else "—"
-        return (
-            f"<tr style='border-top:0.5px solid var(--border)'>"
-            f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{ts_s}</td>"
-            f"<td style='padding:5px 8px;font-size:12px;font-weight:500'>{asset_s}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;color:{dc};font-weight:500'>{dirn}</td>"
-            f"<td style='padding:5px 8px;font-size:11px'>${float(entry):,.2f}</td>"
-            f"<td style='padding:5px 8px;font-size:11px'>{cur_s}</td>"
-            f"<td style='padding:5px 8px;font-size:12px'>{unr}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;color:#E24B4A'>{sl_s}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;color:#1D9E75'>{tp_s}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;text-align:center'>{rr_s}</td>"
-            f"</tr>"
-        )
-
-    if open_trades:
-        positions_html = f"""
-<div style="background:var(--bg);border:0.5px solid var(--border);border-radius:8px;overflow:auto;margin-bottom:1.5rem">
-  <table style="width:100%;border-collapse:collapse;white-space:nowrap">
-    <thead>
-      <tr style="background:var(--surface)">
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">opened (AEST)</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">asset</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">side</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">entry</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">mark</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">unreal P&L</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:#E24B4A;text-align:left">stop loss</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:#1D9E75;text-align:left">take profit</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:center">R:R</th>
-      </tr>
-    </thead>
-    <tbody>{"".join(_open_trade_row(t) for t in open_trades)}</tbody>
-  </table>
-</div>"""
-    else:
-        positions_html = "<div style='font-size:12px;color:var(--muted);margin-bottom:1.5rem'>No open positions.</div>"
-
-    # ── Trade history table ───────────────────────────────────────────────────
-    recent_trades = sorted(
-        [t for t in all_trades_flat if not t.get("abandoned")],
-        key=lambda t: t.get("ts", ""), reverse=True
-    )[:50]
-
-    # Short display names for indicators — keeps chips compact
-    _IND_SHORT = {
-        "rsi": "RSI", "ema_trend": "EMA", "macd": "MACD", "vwap": "VWAP",
-        "volume_spike": "VOL", "bb_squeeze": "BB", "fvg": "FVG",
-        "order_block": "OB", "sr_zone": "SR",
-    }
-
-    # Snapshot keys to show in the tooltip, with short labels
-    _SNAP_LABELS = [
-        ("rsi_14",        "RSI"),
-        ("macd_line",     "MACD"),
-        ("macd_hist",     "Hist"),
-        ("vwap",          "VWAP"),
-        ("volume_ratio",  "VolR"),
-        ("ema_50",        "EMA50"),
-        ("ema20_daily",   "EMA20d"),
-        ("ema50_4h",      "EMA50_4h"),
-        ("bb_upper",      "BB↑"),
-        ("bb_lower",      "BB↓"),
-        ("atr_14",        "ATR"),
-        ("support_1h4h",  "Sup"),
-        ("resistance_1h4h","Res"),
-    ]
-
-    def _signals_cell(t: dict) -> str:
-        fired    = t.get("indicators_fired") or {}
-        snapshot = t.get("indicators_snapshot") or {}
-
-        if not fired:
-            return "<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>—</td>"
-
-        # Build hover tooltip from snapshot values
-        tip_parts = []
-        for key, label in _SNAP_LABELS:
-            val = snapshot.get(key)
-            if val is not None:
-                try:
-                    tip_parts.append(f"{label}:{float(val):.2f}")
-                except Exception:
-                    pass
-        tooltip = "  |  ".join(tip_parts) if tip_parts else ""
-
-        # Build chips — green for fired, dim for not fired, skip None (no data)
-        chips = []
-        for name, result in sorted(fired.items()):
-            if result is None:
-                continue
-            short = _IND_SHORT.get(name, name[:3].upper())
-            if result:
-                chips.append(
-                    f"<span style='display:inline-block;padding:1px 5px;margin:1px;border-radius:3px;"
-                    f"background:rgba(29,158,117,0.15);color:#1D9E75;font-size:10px'>{short}</span>"
-                )
-            else:
-                chips.append(
-                    f"<span style='display:inline-block;padding:1px 5px;margin:1px;border-radius:3px;"
-                    f"background:rgba(0,0,0,0.04);color:var(--muted);font-size:10px'>{short}</span>"
-                )
-
-        chips_html = "".join(chips) if chips else "<span style='color:var(--muted);font-size:11px'>—</span>"
-        title_attr = f" title='{tooltip}'" if tooltip else ""
-        return f"<td style='padding:5px 8px'{title_attr}>{chips_html}</td>"
-
-    def _trade_row(t: dict) -> str:
-        ts_raw = t.get("ts", "")
-        try:
-            ts = datetime.fromisoformat(ts_raw).astimezone(AEST).strftime("%m-%d %H:%M")
-        except Exception:
-            ts = ts_raw[:16].replace("T", " ")
-        asset_l   = t.get("asset", "—")
-        dirn      = t.get("direction", "—")
-        dc        = "#1D9E75" if dirn == "long" else "#E24B4A"
-        entry     = t.get("entry_price", 0)
-        exitp     = t.get("exit_price")
-        abandoned = t.get("abandoned", False)
-        pnl_r     = t.get("pnl_pct")
-        if abandoned:
-            exit_s = "<span style='color:var(--muted);font-style:italic'>abandoned</span>"
-            ps, pc = "—", "var(--muted)"
-        elif pnl_r is not None:
-            pv     = float(pnl_r) * 100
-            ps     = f"{'+' if pv >= 0 else ''}{pv:.3f}%"
-            pc     = _pnl_col(pv)
-            exit_s = f"${float(exitp):,.2f}" if exitp is not None else "—"
-        else:
-            exit_s = "<span style='color:#EF9F27;font-weight:500'>open</span>"
-            ps, pc = "open", "#EF9F27"
-        conf = t.get("confidence_at_entry")
-        cs   = f"{float(conf)*100:.0f}%" if conf is not None else "—"
-        ver  = t.get("strategy_version", "—")
-        # $ P&L cell — matches the % cell's coloring/state
-        pnl_usd_val = _pnl_usd(t)
-        if abandoned:
-            usd_s, usd_c = "—", "var(--muted)"
-        elif pnl_usd_val is not None:
-            usd_s = f"{'+' if pnl_usd_val >= 0 else '-'}${abs(pnl_usd_val):,.2f}"
-            usd_c = _pnl_col(pnl_usd_val)
-        elif pnl_r is None:
-            usd_s, usd_c = "—", "#EF9F27"
-        else:
-            usd_s, usd_c = "—", "var(--muted)"
-
-        return (
-            f"<tr style='border-top:0.5px solid var(--border)'>"
-            f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{ts}</td>"
-            f"<td style='padding:5px 8px;font-size:11px'>{asset_l}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;color:{dc}'>{dirn}</td>"
-            f"<td style='padding:5px 8px;font-size:11px'>${float(entry):,.2f}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{exit_s}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>{cs}</td>"
-            + _signals_cell(t) +
-            f"<td style='padding:5px 8px;font-size:12px;font-weight:500;color:{pc}'>{ps}</td>"
-            f"<td style='padding:5px 8px;font-size:12px;font-weight:500;color:{usd_c}'>{usd_s}</td>"
-            f"<td style='padding:5px 8px;font-size:11px;color:var(--muted)'>v{ver}</td>"
-            f"</tr>"
-        )
-
-    if recent_trades:
-        trade_table = f"""
-<div style="background:var(--bg);border:0.5px solid var(--border);border-radius:8px;overflow:auto;margin-bottom:1.5rem">
-  <table style="width:100%;border-collapse:collapse;white-space:nowrap">
-    <thead>
-      <tr style="background:var(--surface)">
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">time (AEST)</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">asset</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">side</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">entry</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">exit</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">conf</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">signals fired</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">P&L %</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">P&L $</th>
-        <th style="padding:7px 8px;font-size:11px;font-weight:500;color:var(--muted);text-align:left">strat</th>
-      </tr>
-    </thead>
-    <tbody>{"".join(_trade_row(t) for t in recent_trades)}</tbody>
-  </table>
-</div>"""
-    else:
-        trade_table = "<div style='font-size:12px;color:var(--muted);margin-bottom:1.5rem'>No trades yet.</div>"
-
-    # reflection cards
-    all_reflections = []
-    for slug in ASSETS:
-        for h in assets.get(slug, {}).get("hypotheses", []):
-            all_reflections.append({**h, "_asset": ASSET_LABELS.get(slug, slug)})
-    all_reflections.sort(key=lambda x: x.get("ts", ""), reverse=True)
-
-    def _refl_card(h: dict) -> str:
-        asset  = h.get("_asset", "")
-        ts_raw = h.get("ts", "")
-        try:
-            tsd = datetime.fromisoformat(ts_raw).astimezone(AEST).strftime("%Y-%m-%d %H:%M") if ts_raw else "—"
-        except Exception:
-            tsd = ts_raw[:16].replace("T", " ") if ts_raw else "—"
-        v_from = h.get("version_from", "?")
-        v_to   = h.get("version_to", "?")
-        var    = h.get("changed_variable", "—")
-        old_v  = h.get("old_value", "—")
-        new_v  = h.get("new_value", "—")
-        reason = h.get("reasoning", "")
-        nt     = h.get("trades_evaluated", "—")
-        ret    = h.get("realised_return")
-        win_r  = h.get("win_rate")
-        ret_s  = f"{float(ret)*100:+.2f}%" if ret is not None else "—"
-        ret_c  = _pnl_col(float(ret)) if ret is not None else "var(--muted)"
-        win_s  = f" · {float(win_r)*100:.0f}% win" if win_r is not None else ""
-        conf   = h.get("confidence")
-        conf_s = f" · {float(conf)*100:.0f}% conf" if conf is not None else ""
-        mbadge = h.get("mode", "fallback")
-
-        meta = ""
-        if nt != "—":
-            meta = f"<span style='font-size:11px;color:var(--muted)'>· {nt} trades · return <span style='color:{ret_c}'>{ret_s}</span>{win_s}{conf_s}</span>"
-
-        return (
-            f"<div style='background:var(--bg);border:0.5px solid var(--border);border-radius:10px;padding:1rem;margin-bottom:10px'>"
-            f"<div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px'>"
-            f"<div style='display:flex;align-items:center;gap:8px'>"
-            f"<span style='font-size:12px;font-weight:500'>{asset}</span>"
-            f"<span style='font-size:11px;color:var(--muted)'>v{v_from}→v{v_to}</span>"
-            f"<span style='font-size:10px;padding:1px 6px;border-radius:4px;background:var(--surface);color:var(--muted)'>{mbadge}</span>"
-            f"</div>"
-            f"<span style='font-size:11px;color:var(--muted)'>{tsd}</span>"
-            f"</div>"
-            f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap'>"
-            f"<code style='font-size:11px;background:var(--surface);padding:2px 8px;border-radius:4px;border:0.5px solid var(--border)'>{var}</code>"
-            f"<span style='font-size:12px;color:var(--muted)'>{old_v} → <strong>{new_v}</strong></span>"
-            f"{meta}"
-            f"</div>"
-            f"<div style='font-size:12px;color:var(--muted);line-height:1.6'>{reason}</div>"
-            f"</div>"
-        )
-
-    reflection_html = (
-        "".join(_refl_card(h) for h in all_reflections)
-        if all_reflections
-        else "<div style='font-size:12px;color:var(--muted)'>No reflections yet — fires after every N closed trades.</div>"
+    equity = hb.get("equity_usd")
+    cb = hb.get("circuit_breaker") or {}
+    cb_active = cb.get("active")
+    cb_col = RED if cb_active else GREEN
+    account = (
+        _stat("equity", f"${equity:,.2f}" if equity else "—",
+              f"cycle {hb.get('cycle_seconds', '—')}s")
+        + _stat("positions", f"{hb.get('busy_count', 0)} / {hb.get('max_concurrent', 1)}",
+                "open + resting")
+        + _stat("circuit breaker", "TRIPPED" if cb_active else "ok",
+                f"day {(cb.get('daily_pnl_pct') or 0) * 100:+.1f}% / "
+                f"{(cb.get('daily_limit_pct') or 0) * 100:.0f}% · "
+                f"week {(cb.get('weekly_pnl_pct') or 0) * 100:+.1f}%", cb_col)
+        + _stat("last cycle", _ts_aest((hb.get("ts") or 0) * 1000, "%H:%M") if hb.get("ts") else "—",
+                f"{hb_age / 60:.0f} min ago" if hb_age is not None else "")
     )
 
-    # Filter log to only meaningful events — skip constant "No entry" noise
-    _KEEP_PATTERNS = ("Trade #", "reflect", "Reflection", "error", "Error",
-                      "circuit breaker", "Reconcil", "Abandoned", "Booting",
-                      "ParserError", "Traceback", "Exception", "CRITICAL",
-                      "Portfolio daily loss", "Trend filter", "Session filter")
-    _SKIP_PATTERNS = ("No entry", "Trend filter: ambiguous", "Session filter: 0")
+    # Asset cards
+    cards = ""
+    for a in ASSETS:
+        st = assets.get(a) or {}
+        pos = st.get("position") or {"status": "flat"}
+        ctx = st.get("context") or {}
+        status = pos.get("status", "flat")
 
-    def _is_meaningful(line: str) -> bool:
-        if any(p in line for p in _SKIP_PATTERNS):
-            return False
-        return any(p in line for p in _KEEP_PATTERNS)
+        if status == "open_position":
+            label, colour, body = "IN TRADE", GREEN, _card_open(a, pos, ctx)
+        elif status == "resting_order":
+            label, colour, body = "ORDER RESTING", BLUE, _card_resting(a, pos, ctx, sp)
+        else:
+            label, colour, body = "WATCHING", "#888", _card_flat(a, ctx, sp)
 
-    activity_lines = [l for l in logs if _is_meaningful(l)]
+        side = ""
+        if status in ("open_position", "resting_order"):
+            long_ = pos.get("direction") == "bullish"
+            side = _chip("LONG" if long_ else "SHORT", GREEN if long_ else RED)
+        grade = _grade_chip(pos.get("grade")) if pos.get("grade") else ""
 
-    log_lines = (
-        "\n".join(_log_line(l) for l in activity_lines)
-        if activity_lines
-        else "<div style='font-size:11px;color:var(--muted)'>No significant activity — agent is running quietly (no trades, reflections, or errors since last check).</div>"
-    )
+        stale = ""
+        if ctx.get("last_bar_ts"):
+            stale = (f"<span style='font-size:10px;color:var(--muted)'>"
+                     f"bar {_ts_aest(ctx['last_bar_ts'], '%H:%M')}</span>")
 
-    mode_bg  = "rgba(226,75,74,0.15)" if mode == "live" else "rgba(29,158,117,0.15)"
-    mode_col = "#E24B4A" if mode == "live" else "#1D9E75"
+        cards += (
+            f"<div style='background:var(--bg);border:0.5px solid var(--border);border-radius:12px;padding:1rem'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"
+            f"gap:6px;flex-wrap:wrap'>"
+            f"<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'>"
+            f"<span style='color:{colour}'>&#9679;</span>"
+            f"<span style='font-size:14px;font-weight:600'>{_esc(a)}</span>"
+            f"{_chip(label, colour)}{side}{grade}</div>{stale}</div>"
+            f"{body}</div>"
+        )
+
+    trades = _all_trades(assets)
+    alerts_json = json.dumps(_alert_keys(assets))
+
+    kz = sp.get("kill_zones")
+    params_line = " · ".join(f"{k} {v}" for k, v in sp.items() if k != "kill_zones") if sp else "—"
 
     return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hermes Trading</title>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hermes ICT</title>
 <meta http-equiv="refresh" content="{POLL_SECS}">
 <style>
-  :root{{--bg:#fff;--border:rgba(0,0,0,0.12);--muted:#888;--surface:#f6f6f4}}
-  @media(prefers-color-scheme:dark){{:root{{--bg:#1a1a18;--border:rgba(255,255,255,0.12);--muted:#888;--surface:#232320}}}}
+  :root{{--bg:#fff;--fg:#111;--border:rgba(0,0,0,0.12);--muted:#888;--surface:#f6f6f4}}
+  @media(prefers-color-scheme:dark){{:root{{--bg:#1a1a18;--fg:#eee;--border:rgba(255,255,255,0.12);--muted:#888;--surface:#232320}}}}
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--surface);padding:1.5rem;max-width:860px;margin:0 auto}}
-  h2{{font-size:12px;font-weight:500;color:var(--muted);margin:1.5rem 0 8px}}
-</style>
-</head>
-<body>
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--surface);
+        color:var(--fg);padding:1.5rem;max-width:1100px;margin:0 auto}}
+  h2{{font-size:12px;font-weight:500;color:var(--muted);margin:1.5rem 0 8px;letter-spacing:0.04em}}
+  table{{color:var(--fg)}}
+</style></head><body>
 
-<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:1.5rem">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:1.5rem;gap:10px;flex-wrap:wrap">
   <div>
-    <div style="font-size:18px;font-weight:500">Hermes Trading</div>
+    <div style="font-size:18px;font-weight:600">Hermes Trading &middot; ICT</div>
     <div style="font-size:12px;color:var(--muted);margin-top:3px">
-      synced {updated} &nbsp;·&nbsp; <span id="clk"></span> &nbsp;·&nbsp; refreshes every {POLL_SECS}s
+      synced {updated} &nbsp;·&nbsp; <span id="clk"></span> &nbsp;·&nbsp; refreshes every {POLL_SECS // 60} min
     </div>
   </div>
   <div style="display:flex;align-items:center;gap:8px">
-    <a href="/?refresh=1" style="font-size:11px;padding:3px 10px;border-radius:6px;background:var(--surface);border:0.5px solid var(--border);color:var(--muted);text-decoration:none">↻ sync now</a>
-    <span style="font-size:11px;padding:3px 10px;border-radius:6px;background:{mode_bg};color:{mode_col}">{mode} mode</span>
+    <button id="notify" style="font-size:11px;padding:4px 10px;border-radius:6px;background:var(--surface);
+      border:0.5px solid var(--border);color:var(--muted);cursor:pointer">&#128276; alerts</button>
+    <a href="/?refresh=1" style="font-size:11px;padding:4px 10px;border-radius:6px;background:var(--surface);
+      border:0.5px solid var(--border);color:var(--muted);text-decoration:none">&#8635; sync now</a>
+    <span style="font-size:11px;padding:4px 10px;border-radius:6px;
+      background-color:color-mix(in srgb,{RED} 15%,transparent);color:{RED}">
+      {'DRY RUN' if hb.get('dry_run') else 'LIVE'}</span>
   </div>
+</div>
+
+{banners}
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:1.5rem">
+{account}
+</div>
+
+<h2>ASSETS</h2>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px;margin-bottom:1.5rem">
+{cards}
+</div>
+
+<h2>WHY SETUPS ARE BEING REJECTED</h2>
+{_funnel(assets)}
+
+<h2>PERFORMANCE <span style="font-weight:400">· measured in R, since A+ and B risk different amounts</span></h2>
+{_performance(trades)}
+
+<h2>CLOSED TRADES <span style="font-weight:400">(last 50, newest first)</span></h2>
+{_trades_table(trades)}
+
+<h2>WORKER LOG</h2>
+<div style="background:var(--bg);border:0.5px solid var(--border);border-radius:8px;padding:12px;
+     font-family:ui-monospace,monospace;overflow-x:auto;margin-bottom:1rem">
+{_log_html(d.get('log_tail', []))}
+</div>
+
+<div style="font-size:10px;color:var(--muted);text-align:center;padding-bottom:1.5rem;line-height:1.7">
+  {_esc(VPS)} &nbsp;·&nbsp; kill zones {_esc(kz)} &nbsp;·&nbsp; {_esc(params_line)}<br>
+  Params read live from the worker heartbeat — never a local copy.
 </div>
 
 <script>
@@ -904,43 +963,42 @@ def _render_html(d: dict) -> str:
   if(el) el.textContent=new Date().toLocaleTimeString('en-AU',{{timeZone:'Australia/Sydney',hour12:false}})+' AEST';
   setTimeout(tick,1000);
 }})();
+
+// Alerts. Keys are stable per event, and the shown-set lives in localStorage,
+// so a reload every {POLL_SECS // 60} min doesn't re-notify for the same thing.
+var EVENTS = {alerts_json};
+var SEEN_KEY = 'hermes_seen_alerts';
+
+function seen(){{ try {{ return JSON.parse(localStorage.getItem(SEEN_KEY)) || []; }} catch(e) {{ return []; }} }}
+function markSeen(keys){{ try {{ localStorage.setItem(SEEN_KEY, JSON.stringify(keys.slice(-300))); }} catch(e) {{}} }}
+
+function fire(){{
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  var s = seen(), fresh = EVENTS.filter(function(e){{ return s.indexOf(e.key) === -1; }});
+  // First run after enabling: adopt the current state silently rather than
+  // firing a burst of notifications for things that already happened.
+  if (s.length === 0) {{ markSeen(EVENTS.map(function(e){{ return e.key; }})); return; }}
+  fresh.forEach(function(e){{ new Notification(e.title, {{ body: e.body }}); }});
+  markSeen(s.concat(fresh.map(function(e){{ return e.key; }})));
+}}
+
+var btn = document.getElementById('notify');
+function paint(){{
+  if (!('Notification' in window)) {{ btn.textContent = 'alerts unsupported'; btn.disabled = true; return; }}
+  btn.textContent = Notification.permission === 'granted' ? '\\uD83D\\uDD14 alerts on' : '\\uD83D\\uDD14 enable alerts';
+}}
+btn.addEventListener('click', function(){{
+  if (Notification.permission === 'granted') return;
+  Notification.requestPermission().then(function(){{ paint(); fire(); }});
+}});
+paint(); fire();
 </script>
-
-{ssh_banner}
-{top_stats}
-
-<h2>Assets</h2>
-<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-bottom:1.5rem">
-  {asset_cards}
-</div>
-
-<h2>Live Positions <span style="font-weight:400">({len(open_trades)} open)</span></h2>
-{positions_html}
-
-<h2>Running P&L <span style="font-weight:400;font-size:11px;color:var(--muted)">· portfolio daily cap: -$40</span></h2>
-{pnl_summary}
-
-<h2>Trade history <span style="font-weight:400">(last 50 · newest first · abandoned excluded)</span></h2>
-{trade_table}
-
-<h2>Strategy reflections</h2>
-{reflection_html}
-
-<h2>Agent Activity <span style="font-weight:400">(trades · reflections · errors)</span></h2>
-<div style="background:var(--bg);border:0.5px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;overflow-x:auto;margin-bottom:1.5rem">
-  {log_lines}
-</div>
-
-<div style="font-size:11px;color:var(--muted);text-align:center;padding-bottom:1.5rem">
-  Hermes Trading &nbsp;·&nbsp; {VPS} &nbsp;·&nbsp; <a href="/?refresh=1" style="color:var(--muted)">force refresh</a>
-</div>
-
 </body></html>"""
 
 
-# ── Polling server ─────────────────────────────────────────────────────────────
+# ── Server ─────────────────────────────────────────────────────────────────────
 
-_cache: dict = {"data": {}, "lock": threading.Lock()}
+_cache = {"data": {}, "lock": threading.Lock()}
 
 
 def _poll_loop() -> None:
@@ -948,7 +1006,7 @@ def _poll_loop() -> None:
         try:
             with _cache["lock"]:
                 last = dict(_cache["data"])
-            fresh = _fetch_data(last_known=last or None)
+            fresh = _fetch(last_known=last or None)
             with _cache["lock"]:
                 _cache["data"] = fresh
         except Exception as e:
@@ -958,24 +1016,21 @@ def _poll_loop() -> None:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
+        from urllib.parse import parse_qs, urlparse
+        params = parse_qs(urlparse(self.path).query)
 
         if "refresh" in params:
-            # Force an immediate SSH re-fetch, bypassing the poll cache
             with _cache["lock"]:
                 last = dict(_cache["data"])
-            fresh = _fetch_data(last_known=last or None)
+            fresh = _fetch(last_known=last or None)
             with _cache["lock"]:
                 _cache["data"] = fresh
 
         with _cache["lock"]:
             data = _cache["data"]
-        if not data:
-            body = b"<html><body style='font-family:sans-serif;padding:2rem'>Loading&hellip; refresh in a few seconds.</body></html>"
-        else:
-            body = _render_html(data).encode()
+
+        body = (_render(data).encode() if data else
+                b"<html><body style='font-family:sans-serif;padding:2rem'>Loading&hellip;</body></html>")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -987,19 +1042,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    print("Hermes Trading Dashboard")
-    print(f"Connecting to {VPS}...")
-
-    t = threading.Thread(target=_poll_loop, daemon=True)
-    t.start()
+    print("Hermes Trading Dashboard — ICT")
+    print(f"Connecting to {VPS} ...")
+    threading.Thread(target=_poll_loop, daemon=True).start()
     time.sleep(3)
-
-    print(f"Dashboard at http://localhost:{PORT}")
-    print("Press Ctrl+C to stop.\n")
-
+    print(f"Dashboard at http://localhost:{PORT}\nPress Ctrl+C to stop.\n")
     import webbrowser
     webbrowser.open(f"http://localhost:{PORT}")
-
     with http.server.HTTPServer(("", PORT), Handler) as httpd:
         try:
             httpd.serve_forever()

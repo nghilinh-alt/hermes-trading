@@ -38,7 +38,14 @@ import ccxt
 from dotenv import load_dotenv
 
 from hermes_trading.brokers.bybit import BybitBroker
-from hermes_trading.ict.live import run_full_cycle
+from hermes_trading.ict.context import build_market_context, context_kwargs
+from hermes_trading.ict.live import AssetStateStore, run_full_cycle
+from hermes_trading.ict.risk import (
+    DEFAULT_DAILY_LOSS_LIMIT_PCT,
+    DEFAULT_MAX_CONCURRENT_TRADES,
+    DEFAULT_WEEKLY_LOSS_LIMIT_PCT,
+    circuit_breaker_status,
+)
 from tools.fetch_ict_live_data_bybit import ASSETS, fetch_or_update_cache
 
 SCAN_INTERVAL_SECS = 15 * 60
@@ -73,19 +80,93 @@ def _check_safety_gate() -> None:
         sys.exit(1)
 
 
-def _write_heartbeat(cycle_results) -> None:
-    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """
+    Write via a temp file + os.replace so a dashboard polling this path can
+    never read a half-written file. os.replace is atomic on the same
+    filesystem, which .tmp-alongside-the-target guarantees.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=1))
+    os.replace(tmp, path)
+
+
+def _circuit_breaker_snapshot(equity: float) -> dict:
+    """
+    Read (never write) the per-asset circuit-breaker buckets the trading
+    path maintains, and report the account-level worst case. Read-only by
+    design: the authoritative bucket update belongs to _look_for_new_setup,
+    and duplicating it here could desync the two.
+    """
+    daily, weekly = 0.0, 0.0
+    for asset in ASSETS:
+        try:
+            cb = AssetStateStore(STATE_ROOT / asset.replace("/", "_")).load_circuit_breaker()
+        except Exception:
+            continue
+        if cb.get("equity_at_day_start"):
+            daily = min(daily, (equity - cb["equity_at_day_start"]) / cb["equity_at_day_start"])
+        if cb.get("equity_at_week_start"):
+            weekly = min(weekly, (equity - cb["equity_at_week_start"]) / cb["equity_at_week_start"])
+    return {
+        "daily_pnl_pct": daily,
+        "weekly_pnl_pct": weekly,
+        "daily_limit_pct": DEFAULT_DAILY_LOSS_LIMIT_PCT,
+        "weekly_limit_pct": DEFAULT_WEEKLY_LOSS_LIMIT_PCT,
+        "active": circuit_breaker_status(daily, weekly),
+    }
+
+
+def _write_heartbeat(cycle_results, *, equity, busy_count, cycle_seconds, dry_run) -> None:
+    """
+    Account-level liveness + the facts the dashboard can't derive on its
+    own. `scan_params` is emitted from the RUNNING process deliberately:
+    the same values are duplicated by hand in run_ict_backtest.py and
+    run_ict_scanner.py, so a dashboard that reads them from here can never
+    show a stale copy.
+    """
     payload = {
         "ts": time.time(),
+        "equity_usd": equity,
+        "busy_count": busy_count,
+        "max_concurrent": DEFAULT_MAX_CONCURRENT_TRADES,
+        "circuit_breaker": _circuit_breaker_snapshot(equity) if equity else None,
+        "scan_params": {k: (list(v) if isinstance(v, tuple) else v) for k, v in SCAN_PARAMS.items()},
+        "cycle_seconds": round(cycle_seconds, 1),
+        "dry_run": dry_run,
+        "assets": ASSETS,
         "results": [
             {"asset": r.asset, "status": r.status, "action": r.action, "mutated": r.mutated}
             for r in cycle_results
         ],
     }
-    (STATE_ROOT / "heartbeat.json").write_text(json.dumps(payload, indent=2))
+    _atomic_write_json(STATE_ROOT / "heartbeat.json", payload)
+
+
+def _dump_market_context(candles_by_asset: dict, equity: float) -> None:
+    """
+    Persist the per-asset market snapshot the dashboard renders.
+
+    Deliberately runs AFTER run_full_cycle has completed, reads only
+    already-fetched candles, and isolates every asset in its own
+    try/except: this is an observability feature and it must never be able
+    to interfere with trading. A failure here logs and moves on.
+    """
+    for asset in ASSETS:
+        try:
+            candles = candles_by_asset.get(asset) or []
+            if not candles:
+                continue
+            ctx = build_market_context(candles, asset, equity, **context_kwargs(SCAN_PARAMS))
+            _atomic_write_json(STATE_ROOT / asset.replace("/", "_") / "context.json", ctx)
+        except Exception:
+            print(f"[WARN] market-context dump failed for {asset} (trading unaffected):", flush=True)
+            traceback.print_exc(file=sys.stdout)
 
 
 def run_once(broker: BybitBroker, public_exchange: ccxt.Exchange, *, dry_run: bool) -> None:
+    cycle_start = time.time()
     candles_by_asset = {}
     for asset in ASSETS:
         try:
@@ -98,7 +179,21 @@ def run_once(broker: BybitBroker, public_exchange: ccxt.Exchange, *, dry_run: bo
     results = run_full_cycle(ASSETS, broker, STATE_ROOT, candles_by_asset, dry_run=dry_run, **SCAN_PARAMS)
     for r in results:
         print(f"[{r.asset}] status={r.status} mutated={r.mutated} -- {r.action}", flush=True)
-    _write_heartbeat(results)
+
+    # Account-level facts for the dashboard. Both calls are wrapped: a
+    # broker hiccup fetching balance for a *display* field must not surface
+    # as a cycle error, since the trading decisions are already made.
+    equity, busy_count = 0.0, 0
+    try:
+        equity = broker.get_balance()
+        busy_count = len(broker.get_positions()) + len(broker.get_open_orders())
+    except Exception:
+        print("[WARN] could not fetch account summary for heartbeat (trading unaffected):", flush=True)
+        traceback.print_exc(file=sys.stdout)
+
+    _dump_market_context(candles_by_asset, equity)
+    _write_heartbeat(results, equity=equity, busy_count=busy_count,
+                     cycle_seconds=time.time() - cycle_start, dry_run=dry_run)
 
 
 def main() -> None:

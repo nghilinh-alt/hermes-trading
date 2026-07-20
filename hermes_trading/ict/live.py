@@ -478,9 +478,30 @@ def _manage_open_position(asset, broker, candles_15m, store, position, *, dry_ru
         if action.kind == "partial_take":
             partial_qty = position["qty_remaining"] * DEFAULT_PARTIAL_FRACTION
             close_side = "sell" if direction == Direction.BULLISH else "buy"
+            # `action.price` is the 2R trigger level, NOT a fill price -- the
+            # reduce goes out as a market order, so the real fill can differ.
+            # Prefer the broker's reported average fill; fall back to the
+            # trigger level only when the adapter can't supply one.
+            partial_exit_price = action.price
             if not dry_run:
                 result = broker.reduce_position(asset, close_side, partial_qty)
                 partial_qty = result.qty
+                if result.price:
+                    partial_exit_price = float(result.price)
+            # Record the partial's realised PnL. Previously this was never
+            # accumulated -- `partial_realized_pnl_usd` was initialised to 0.0
+            # at fill and read back as 0.0 at close, silently dropping the
+            # entire 2R leg from every partialled trade's recorded pnl_usd.
+            # This local figure is gross of fees and is only a FALLBACK: at
+            # close, _handle_position_closed prefers the sum of Bybit's own
+            # closed-pnl records (fee-inclusive) whenever they reconcile.
+            sign = 1.0 if direction == Direction.BULLISH else -1.0
+            position["partial_realized_pnl_usd"] = (
+                position.get("partial_realized_pnl_usd", 0.0)
+                + sign * (partial_exit_price - position["entry_price"]) * partial_qty
+            )
+            position["partial_qty"] = position.get("partial_qty", 0.0) + partial_qty
+            position["partial_exit_price"] = partial_exit_price
             position["qty_remaining"] -= partial_qty
             position["partial_taken"] = True
         elif action.kind == "trail_stop":
@@ -502,6 +523,9 @@ def _manage_open_position(asset, broker, candles_15m, store, position, *, dry_ru
     return CycleResult(asset, "open_position", summary, mutated)
 
 
+_QTY_RECONCILE_TOLERANCE = 0.01  # 1% -- absorbs exchange qty-precision rounding on a partial
+
+
 def _handle_position_closed(asset, broker, store, position, *, dry_run) -> CycleResult:
     closed_trades = broker.fetch_recent_closed_trades(asset, limit=5)
     matching = [t for t in closed_trades if t.get("created_ms", 0) >= position.get("fill_timestamp", 0)]
@@ -510,28 +534,80 @@ def _handle_position_closed(asset, broker, store, position, *, dry_run) -> Cycle
         # open_position and recheck next cycle rather than guessing at PnL.
         return CycleResult(asset, "open_position", "position closed at exchange but no matching closed-pnl record yet -- rechecking next cycle", False)
 
-    trade = matching[0]
-    total_pnl = trade["closed_pnl_usd"] + position.get("partial_realized_pnl_usd", 0.0)
+    # A partialled trade produces MORE THAN ONE closed-pnl record (one per
+    # reduce, one for the final close). Taking only matching[0] -- as this
+    # did before -- silently dropped whichever leg wasn't first. Sum every
+    # record belonging to this position instead: that's Bybit's own
+    # fee-inclusive ground truth for the whole trade.
+    qty_total = position["qty_total"]
+    summed_qty = sum(float(t.get("qty", 0) or 0) for t in matching)
+    summed_pnl = sum(float(t["closed_pnl_usd"]) for t in matching)
+
+    if qty_total > 0 and abs(summed_qty - qty_total) <= _QTY_RECONCILE_TOLERANCE * qty_total:
+        # The records account for the full position -- trust them entirely,
+        # and do NOT add the local partial estimate (it's already included).
+        total_pnl = summed_pnl
+        pnl_source = "exchange_sum"
+    else:
+        # Feed lag or an unexpected record set: fall back to the newest
+        # record plus our own locally-tracked partial estimate, and mark the
+        # trade so the dashboard can flag it rather than presenting an
+        # unreconciled figure as if it were exchange truth.
+        total_pnl = float(matching[0]["closed_pnl_usd"]) + position.get("partial_realized_pnl_usd", 0.0)
+        pnl_source = "local_estimate"
+
+    # Qty-weighted average exit across every leg, so a partialled trade's
+    # recorded exit_price reflects both the 2R partial and the final close.
+    exit_price = (
+        sum(float(t["exit_price"]) * float(t.get("qty", 0) or 0) for t in matching) / summed_qty
+        if summed_qty > 0 else float(matching[0]["exit_price"])
+    )
+
+    entry_price = position["entry_price"]
+    initial_stop = position["initial_stop_price"]
+    target_price = position.get("target_price")
+    is_long = position["direction"] == Direction.BULLISH.value
+
+    # R is the unit this strategy is actually built in -- risk_per_unit is
+    # the initial (never the trailed) stop distance, so realised R stays
+    # comparable across trades regardless of how the stop was later managed.
+    risk_per_unit = abs(entry_price - initial_stop)
+    total_risk_usd = risk_per_unit * qty_total
+    realised_r = (total_pnl / total_risk_usd) if total_risk_usd > 0 else None
+    planned_rr = (abs(target_price - entry_price) / risk_per_unit
+                  if target_price is not None and risk_per_unit > 0 else None)
+    pnl_pct = ((exit_price - entry_price) / entry_price * (1 if is_long else -1)
+               if entry_price else None)
 
     record = {
         "asset": asset,
         "direction": position["direction"],
         "grade": position["grade"],
-        "entry_price": position["entry_price"],
-        "exit_price": trade["exit_price"],
-        "stop_price": position["initial_stop_price"],
-        "target_price": position["target_price"],
-        "qty": position["qty_total"],
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "stop_price": initial_stop,
+        "final_stop_price": position.get("current_stop_price"),
+        "target_price": target_price,
+        "qty": qty_total,
         "pnl_usd": total_pnl,
+        "pnl_pct": pnl_pct,
+        "realised_r": realised_r,
+        "planned_rr": planned_rr,
+        "risk_usd": total_risk_usd,
+        "partial_taken": position.get("partial_taken", False),
+        "partial_realized_pnl_usd": position.get("partial_realized_pnl_usd", 0.0),
+        "pnl_source": pnl_source,
+        "legs": len(matching),
         "close_reason": "exchange_native",
         "entry_utc": position.get("fill_timestamp"),
-        "exit_utc": trade.get("closed_ms"),
-        "order_id": trade.get("order_id"),
+        "exit_utc": matching[0].get("closed_ms"),
+        "order_id": matching[0].get("order_id"),
     }
     if not dry_run:
         store.append_trade(record)
         store.save_position({"status": "flat"})
-    return CycleResult(asset, "flat", f"position closed natively, pnl_usd={total_pnl:.2f}", not dry_run)
+    r_str = f"{realised_r:+.2f}R" if realised_r is not None else "R n/a"
+    return CycleResult(asset, "flat", f"position closed natively, pnl_usd={total_pnl:.2f} ({r_str}, {pnl_source})", not dry_run)
 
 
 # ── Full-account cycle ──────────────────────────────────────────────────────

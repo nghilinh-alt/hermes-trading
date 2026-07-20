@@ -1,0 +1,298 @@
+{
+ "schema_version": 1,
+ "asset": "BTC/USDT",
+ "exec_tf": "1h",
+ "last_bar_ts": 1766761200000,
+ "price": 87137.81,
+ "atr": 655.8614285714294,
+ "equity": 808.03,
+ "bias": {
+  "direction": "short",
+  "weekly_trend": "downtrend",
+  "daily_trend": "downtrend",
+  "reason": "weekly and daily both downtrend"
+ },
+ "dealing_range": {
+  "low": 84450.01,
+  "high": 90588.23,
+  "retracement_pct": 0.437879385228943,
+  "zone": "discount",
+  "in_ote": false,
+  "ote_band": [
+   88255.7064,
+   89299.20379999999
+  ],
+  "ote_for": "short"
+ },
+ "zones": {
+  "fvg": [
+   {
+    "low": 87381.0,
+    "high": 88618.14,
+    "kind": "bearish",
+    "bar_ts": 1766761200000,
+    "displacement": true,
+    "mitigated": false
+   }
+  ],
+  "order_blocks": [
+   {
+    "low": 88618.14,
+    "high": 89050.0,
+    "kind": "bearish",
+    "bar_ts": 1766754000000,
+    "break_bar_ts": 1766757600000,
+    "mitigated": false
+   }
+  ],
+  "breakers": [],
+  "sr": [
+   {
+    "price_low": 87162.39,
+    "price_high": 87297.69,
+    "kind": "support",
+    "touches": 4,
+    "strength": 2.595763752378198
+   },
+   {
+    "price_low": 87051.52,
+    "price_high": 87061.23,
+    "kind": "support",
+    "touches": 2,
+    "strength": 0.8111428175332337
+   },
+   {
+    "price_low": 87288.48,
+    "price_high": 87350.0,
+    "kind": "resistance",
+    "touches": 2,
+    "strength": 0.0
+   },
+   {
+    "price_low": 86860.0,
+    "price_high": 86938.01,
+    "kind": "resistance",
+    "touches": 4,
+    "strength": 0.0
+   },
+   {
+    "price_low": 86565.48,
+    "price_high": 86909.99,
+    "kind": "support",
+    "touches": 8,
+    "strength": 4.067028535200714
+   },
+   {
+    "price_low": 87398.78,
+    "price_high": 87950.0,
+    "kind": "support",
+    "touches": 13,
+    "strength": 5.55120107084861
+   },
+   {
+    "price_low": 87453.63,
+    "price_high": 87670.0,
+    "kind": "resistance",
+    "touches": 6,
+    "strength": 2.75418682671546
+   },
+   {
+    "price_low": 86431.14,
+    "price_high": 86674.0,
+    "kind": "resistance",
+    "touches": 7,
+    "strength": 0.0
+   }
+  ],
+  "liquidity": [
+   {
+    "price": 87162.39,
+    "kind": "sellside",
+    "source": "swing",
+    "bar_ts": 1766512800000
+   },
+   {
+    "price": 87169.37,
+    "kind": "buyside",
+    "source": "swing",
+    "bar_ts": 1765954800000
+   },
+   {
+    "price": 87171.195,
+    "kind": "sellside",
+    "source": "equal_lows",
+    "bar_ts": 1766530800000
+   },
+   {
+    "price": 87180.0,
+    "kind": "sellside",
+    "source": "swing",
+    "bar_ts": 1766530800000
+   },
+   {
+    "price": 87061.23,
+    "kind": "sellside",
+    "source": "swing",
+    "bar_ts": 1765908000000
+   },
+   {
+    "price": 87056.375,
+    "kind": "sellside",
+    "source": "equal_lows",
+    "bar_ts": 1766469600000
+   },
+   {
+    "price": 87051.52,
+    "kind": "sellside",
+    "source": "swing",
+    "bar_ts": 1766469600000
+   },
+   {
+    "price": 87251.6,
+    "kind": "sellside",
+    "source": "swing",
+    "bar_ts": 1766656800000
+   }
+  ]
+ },
+ "recent_events": {
+  "sweeps": [
+   {
+    "bar_ts": 1766761200000,
+    "pool_price": 87061.23,
+    "pool_kind": "sellside",
+    "source": "swing",
+    "penetration": 406.1499999999942,
+    "direction": "bullish",
+    "pools_swept": 6
+   },
+   {
+    "bar_ts": 1766761200000,
+    "pool_price": 87169.37,
+    "pool_kind": "buyside",
+    "source": "swing",
+    "penetration": 211.63000000000466,
+    "direction": "bearish",
+    "pools_swept": 1
+   },
+   {
+    "bar_ts": 1766757600000,
+    "pool_price": 87453.63,
+    "pool_kind": "buyside",
+    "source": "swing",
+    "penetration": 1596.25,
+    "direction": "bearish",
+    "pools_swept": 25
+   },
+   {
+    "bar_ts": 1766754000000,
+    "pool_price": 88908.01,
+    "pool_kind": "sellside",
+    "source": "swing",
+    "penetration": 289.86999999999534,
+    "direction": "bullish",
+    "pools_swept": 2
+   },
+   {
+    "bar_ts": 1766750400000,
+    "pool_price": 88608.0,
+    "pool_kind": "sellside",
+    "source": "swing",
+    "penetration": 74.58000000000175,
+    "direction": "bullish",
+    "pools_swept": 1
+   },
+   {
+    "bar_ts": 1766746800000,
+    "pool_price": 88573.07,
+    "pool_kind": "buyside",
+    "source": "swing",
+    "penetration": 181.61999999999534,
+    "direction": "bearish",
+    "pools_swept": 4
+   },
+   {
+    "bar_ts": 1766736000000,
+    "pool_price": 88687.27,
+    "pool_kind": "sellside",
+    "source": "swing",
+    "penetration": 272.4600000000064,
+    "direction": "bullish",
+    "pools_swept": 2
+   },
+   {
+    "bar_ts": 1766732400000,
+    "pool_price": 88519.99,
+    "pool_kind": "buyside",
+    "source": "swing",
+    "penetration": 1047.7599999999948,
+    "direction": "bearish",
+    "pools_swept": 11
+   },
+   {
+    "bar_ts": 1766728800000,
+    "pool_price": 89077.6,
+    "pool_kind": "sellside",
+    "source": "swing",
+    "penetration": 81.02000000000407,
+    "direction": "bullish",
+    "pools_swept": 2
+   },
+   {
+    "bar_ts": 1766725200000,
+    "pool_price": 88995.33,
+    "pool_kind": "sellside",
+    "source": "swing",
+    "penetration": 167.27000000000407,
+    "direction": "bullish",
+    "pools_swept": 1
+   }
+  ],
+  "mss": [
+   {
+    "bar_ts": 1766757600000,
+    "direction": "bearish",
+    "broken_swing_price": 88347.45,
+    "close": 87380.43
+   }
+  ]
+ },
+ "candidates": [
+  {
+   "mss_ts": 1766757600000,
+   "direction": "bearish",
+   "status": "pending",
+   "qualified": false,
+   "score": 18,
+   "grade": "a_plus",
+   "gate_failures": [
+    "rr"
+   ],
+   "entry_zone": {
+    "kind": "fvg",
+    "low": 87381.0,
+    "high": 88618.14
+   },
+   "entry_price": 87999.57,
+   "stop_price": 89207.66839285714,
+   "target_price": 87051.52,
+   "rr": 0.7847456842963569,
+   "swept_level": 88250.0,
+   "mss_level": 88347.45,
+   "displacement": true,
+   "bars_since_mss": 1,
+   "bars_until_expiry": 39,
+   "size": {
+    "qty": 0.09182203958496614,
+    "leverage": 10,
+    "notional": 8080.299999999999,
+    "risk_usd": 110.93005845146199,
+    "stop_pct": 0.013728457910159524
+   }
+  }
+ ],
+ "gate_summary": {
+  "rr": 1,
+  "htf_bias": 1
+ }
+}

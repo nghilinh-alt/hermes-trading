@@ -752,3 +752,188 @@ def test_restart_recovery_resumes_open_position_without_double_opening(tmp_path,
 
     assert result.status == "open_position"
     assert broker.place_order_calls == []  # never treated as a fresh flat/new-entry cycle
+
+
+# ── Partial-take P&L accounting (session 21 fix) ───────────────────────────
+#
+# Regression cover for a real bug: the partial_take branch reduced
+# qty_remaining and set partial_taken=True but NEVER accumulated
+# partial_realized_pnl_usd, so _handle_position_closed's
+# "closed_pnl + partial_realized" always added zero and every partialled
+# trade under-reported its P&L by the whole 2R leg.
+
+
+def _open_position(**overrides):
+    base = {
+        "status": "open_position", "order_id": "order1", "direction": "bullish",
+        "entry_price": 100.0, "initial_stop_price": 96.0, "current_stop_price": 96.0,
+        "target_price": 120.0, "grade": "a_plus", "qty_total": 10.0, "qty_remaining": 10.0,
+        "leverage": 5, "partial_taken": False, "partial_realized_pnl_usd": 0.0,
+        "mss_timestamp": 1_000_000_000_000, "fill_timestamp": 1_000_000_000_000,
+        "last_processed_bar_ts": 1_000_000_000_000,
+    }
+    base.update(overrides)
+    return base
+
+
+QUARTER_HOUR_MS = 900_000
+
+
+def _two_exec_bars():
+    """
+    Sixteen 15m candles -> wall-clock-aligned 1H exec bars starting at
+    timestamp 0, so fill_timestamp/last_processed_bar_ts can be pinned
+    deterministically. Note `resample` drops the still-forming final bucket,
+    so this deliberately supplies more 15m bars than the exec bars needed.
+    """
+    return make_candles([(100, 101, 99, 100)] * 16, step_ms=QUARTER_HOUR_MS)
+
+
+def _drive_partial(broker, store, position, candles):
+    """
+    Run _manage_open_position with the management replay stubbed to a single
+    2R partial-take at the level replay_management_bars would itself have
+    produced for entry=100/stop=96.
+
+    replay_management_bars has its own thorough tests above; stubbing it here
+    isolates the P&L ACCOUNTING branch -- the part that was broken -- instead
+    of re-testing threshold detection through a fixture that would have to be
+    reverse-engineered to make the real detector fire.
+    """
+    from hermes_trading.ict.live import _manage_open_position
+
+    with patch("hermes_trading.ict.live.replay_management_bars",
+               return_value=[ManagementAction("partial_take", 1, 108.0)]):
+        return _manage_open_position("BTC/USDT", broker, candles, store, position, dry_run=False)
+
+
+def test_partial_take_records_realised_pnl(tmp_path):
+    """The 2R partial's P&L must actually be recorded, not silently dropped."""
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    position = _open_position(fill_timestamp=0, last_processed_bar_ts=0)
+    broker.positions["BTC/USDT"] = Position(symbol="BTC/USDT", side="long", contracts=10.0,
+                                            entry_price=100.0, unrealized_pnl=0.0)
+
+    _drive_partial(broker, store, position, _two_exec_bars())
+
+    saved = store.load_position()
+    assert saved["partial_taken"] is True
+    # FakeBroker.reduce_position reports price=None, so the 2R trigger level
+    # (108) is used as the fill: (108 - 100) * 5 units = 40.0
+    assert saved["partial_realized_pnl_usd"] == pytest.approx(40.0)
+    assert saved["partial_qty"] == pytest.approx(5.0)
+    assert saved["qty_remaining"] == pytest.approx(5.0)
+
+
+def test_partial_uses_actual_fill_price_when_broker_reports_one(tmp_path):
+    """A market reduce can slip; the reported average fill wins over the trigger level."""
+    broker = FakeBroker()
+
+    def slipped(symbol, side, qty):
+        broker.reduce_position_calls.append({"symbol": symbol, "side": side, "qty": qty})
+        return OrderResult(order_id="r1", symbol=symbol, side=side, qty=qty,
+                           price=107.0, status="closed")  # filled 1.0 worse than the 108 trigger
+
+    broker.reduce_position = slipped
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    position = _open_position(fill_timestamp=0, last_processed_bar_ts=0)
+    broker.positions["BTC/USDT"] = Position(symbol="BTC/USDT", side="long", contracts=10.0,
+                                            entry_price=100.0, unrealized_pnl=0.0)
+
+    _drive_partial(broker, store, position, _two_exec_bars())
+
+    # (107 - 100) * 5 = 35.0, not the 40.0 the trigger level alone would imply.
+    assert store.load_position()["partial_realized_pnl_usd"] == pytest.approx(35.0)
+
+
+def test_close_sums_all_exchange_legs_of_a_partialled_trade(tmp_path):
+    """
+    A partialled trade produces MORE THAN ONE closed-pnl record. Taking only
+    matching[0] dropped a leg; the sum is the exchange's own fee-inclusive
+    truth and must be preferred over the local estimate.
+    """
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    store.save_position(_open_position(
+        qty_remaining=5.0, partial_taken=True, partial_realized_pnl_usd=40.0,
+        current_stop_price=100.0, last_processed_bar_ts=1_000_003_600_000,
+    ))
+    broker.closed_trades["BTC/USDT"] = [
+        {"order_id": "close2", "exit_price": 120.0, "qty": 5.0, "closed_pnl_usd": 99.0,
+         "created_ms": 1_000_007_200_000, "closed_ms": 1_000_007_200_000},
+        {"order_id": "close1", "exit_price": 108.0, "qty": 5.0, "closed_pnl_usd": 39.5,
+         "created_ms": 1_000_003_600_000, "closed_ms": 1_000_003_600_000},
+    ]
+
+    result = run_asset_cycle("BTC/USDT", broker, [], store, busy_count=1)
+    assert result.status == "flat"
+
+    logged = json.loads((tmp_path / "BTC_USDT" / "trades.jsonl").read_text().strip())
+    # 99.0 + 39.5 = 138.5 from the exchange -- NOT 99.0 + the 40.0 local estimate.
+    assert logged["pnl_usd"] == pytest.approx(138.5)
+    assert logged["pnl_source"] == "exchange_sum"
+    assert logged["legs"] == 2
+    # Qty-weighted average exit across both legs: (120*5 + 108*5) / 10 = 114
+    assert logged["exit_price"] == pytest.approx(114.0)
+
+
+def test_close_falls_back_to_local_estimate_when_legs_dont_reconcile(tmp_path):
+    """Feed lag: only one leg present. Flag it rather than under-reporting silently."""
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    store.save_position(_open_position(
+        qty_remaining=5.0, partial_taken=True, partial_realized_pnl_usd=40.0,
+        current_stop_price=100.0, last_processed_bar_ts=1_000_003_600_000,
+    ))
+    broker.closed_trades["BTC/USDT"] = [
+        {"order_id": "close2", "exit_price": 120.0, "qty": 5.0, "closed_pnl_usd": 99.0,
+         "created_ms": 1_000_007_200_000, "closed_ms": 1_000_007_200_000},
+    ]
+
+    run_asset_cycle("BTC/USDT", broker, [], store, busy_count=1)
+
+    logged = json.loads((tmp_path / "BTC_USDT" / "trades.jsonl").read_text().strip())
+    assert logged["pnl_usd"] == pytest.approx(139.0)  # 99 exchange + 40 local partial
+    assert logged["pnl_source"] == "local_estimate"
+
+
+def test_closed_trade_records_r_multiple(tmp_path):
+    """R is the unit this strategy is built in -- it must be recorded at close."""
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    store.save_position(_open_position(last_processed_bar_ts=1_000_003_600_000))
+    broker.closed_trades["BTC/USDT"] = [
+        {"order_id": "c1", "exit_price": 120.0, "qty": 10.0, "closed_pnl_usd": 200.0,
+         "created_ms": 1_000_003_600_000, "closed_ms": 1_000_007_200_000},
+    ]
+
+    run_asset_cycle("BTC/USDT", broker, [], store, busy_count=1)
+
+    logged = json.loads((tmp_path / "BTC_USDT" / "trades.jsonl").read_text().strip())
+    # risk/unit = |100 - 96| = 4, total risk = 4 * 10 = 40; 200 / 40 = 5R
+    assert logged["realised_r"] == pytest.approx(5.0)
+    assert logged["risk_usd"] == pytest.approx(40.0)
+    # planned R:R from the initial stop and target: |120-100| / 4 = 5
+    assert logged["planned_rr"] == pytest.approx(5.0)
+    assert logged["pnl_pct"] == pytest.approx(0.20)
+
+
+def test_short_trade_pnl_pct_is_direction_aware(tmp_path):
+    """A short that exits BELOW entry is a win -- the old system's sign-flip bug."""
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    store.save_position(_open_position(
+        direction="bearish", entry_price=100.0, initial_stop_price=104.0,
+        current_stop_price=104.0, target_price=80.0, last_processed_bar_ts=1_000_003_600_000,
+    ))
+    broker.closed_trades["BTC/USDT"] = [
+        {"order_id": "c1", "exit_price": 90.0, "qty": 10.0, "closed_pnl_usd": 100.0,
+         "created_ms": 1_000_003_600_000, "closed_ms": 1_000_007_200_000},
+    ]
+
+    run_asset_cycle("BTC/USDT", broker, [], store, busy_count=1)
+
+    logged = json.loads((tmp_path / "BTC_USDT" / "trades.jsonl").read_text().strip())
+    assert logged["pnl_pct"] == pytest.approx(0.10)   # positive: price fell, short won
+    assert logged["realised_r"] == pytest.approx(2.5)  # 100 / (4 * 10)
