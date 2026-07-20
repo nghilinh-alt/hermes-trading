@@ -35,6 +35,7 @@ import traceback
 from pathlib import Path
 
 import ccxt
+from dotenv import load_dotenv
 
 from hermes_trading.brokers.bybit import BybitBroker
 from hermes_trading.ict.live import run_full_cycle
@@ -106,6 +107,7 @@ def main() -> None:
                          help="Log intended actions without placing real orders or persisting state")
     args = parser.parse_args()
 
+    load_dotenv()  # populates BYBIT_API_KEY/BYBIT_API_SECRET/HERMES_TRADING_* from .env, matching hermes_trading.run's pattern
     _check_safety_gate()
 
     broker = BybitBroker()
