@@ -96,13 +96,26 @@ def broker(fake):
     return BybitBroker(exchange=fake)
 
 
-def test_get_balance_parses_free_usdt(broker):
-    assert broker.get_balance() == 1000.0
+def test_get_balance_returns_total_equity_not_free_margin(broker):
+    """
+    Fixture is {"free": 1000.0, "total": 1200.0} -- must return 1200.
+
+    Regression cover for a live incident (2026-07-21): returning `free`
+    meant locked margin was indistinguishable from a loss, and the circuit
+    breaker tripped at -49.99% on an account that had lost nothing.
+    """
+    assert broker.get_balance() == 1200.0
 
 
-def test_get_balance_falls_back_to_total_when_free_absent(fake, broker):
-    fake.balance_response = {"USDT": {"total": 500.0}}
+def test_get_balance_falls_back_to_free_when_total_absent(fake, broker):
+    fake.balance_response = {"USDT": {"free": 500.0}}
     assert broker.get_balance() == 500.0
+
+
+def test_get_balance_locked_margin_does_not_reduce_reported_equity(fake, broker):
+    """The exact live shape: half the account committed as margin, nothing lost."""
+    fake.balance_response = {"USDT": {"free": 404.04, "used": 403.99, "total": 808.03}}
+    assert broker.get_balance() == 808.03
 
 
 def test_get_positions_maps_and_filters_zero_contracts(fake, broker):

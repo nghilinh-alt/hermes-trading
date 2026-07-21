@@ -72,9 +72,47 @@ class BybitBroker(BrokerAdapter):
         return self._exchange.fetch_ohlcv(_to_perp_symbol(symbol), timeframe=timeframe, limit=limit)
 
     def get_balance(self) -> float:
+        """
+        Account equity in USDT -- `total` (wallet balance, INCLUDING margin
+        currently locked in open positions), NOT `free`.
+
+        This preferred `free` until session 21c, which was a real bug with
+        real consequences. Callers use this value for two things -- position
+        sizing and the circuit breaker -- and both want equity, not
+        available margin:
+
+          * The circuit breaker computes
+            (equity - equity_at_day_start) / equity_at_day_start. With
+            `free`, merely OPENING a position looks identical to losing the
+            margin it locked. Observed live on 2026-07-21: a manual order
+            locked $403.99 of a $808.03 account, `free` read $404.04, and
+            the breaker tripped at -49.99% against its -20% limit having
+            lost nothing at all. Worse, this is self-inflicted at scale --
+            position_size can take notional up to equity x lev_max, so the
+            worker opening ONE of its own A+ trades can collapse `free` and
+            stand the whole account down for the rest of the UTC day.
+          * Sizing should likewise be a function of account equity, not of
+            whatever margin happens to be unencumbered this second.
+
+        Note `total` is wallet balance and may exclude unrealised PnL on
+        open positions, so the breaker measures REALISED drawdown. That
+        suits this strategy (exchange-native stops mean a loss realises when
+        it stops out, and the spec frames the limits as "-20% daily = 1
+        loss") but it does mean an open, deeply-underwater position won't
+        trip it before the stop does.
+        """
         balance = self._exchange.fetch_balance({"type": "contract"})
         usdt = balance.get("USDT", {})
-        return float(usdt.get("free", usdt.get("total", 0)) or 0)
+        # Explicit None check rather than `usdt.get("total", usdt.get("free"))`:
+        # a present-but-null `total` would satisfy .get() and then collapse to
+        # 0.0 through `or 0`, reporting zero equity. That isn't merely wrong,
+        # it's silently disabling -- zero equity reads as a -100% day and
+        # stands the whole account down.
+        for key in ("total", "free"):
+            value = usdt.get(key)
+            if value is not None:
+                return float(value)
+        return 0.0
 
     def get_positions(self, symbol: str | None = None) -> list[Position]:
         symbols = [_to_perp_symbol(symbol)] if symbol else None
