@@ -3,7 +3,12 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_trading.ict.risk import circuit_breaker_status, max_concurrent_ok, position_size
+from hermes_trading.ict.risk import (
+    DEFAULT_MAX_CONCURRENT_TRADES,
+    circuit_breaker_status,
+    max_concurrent_ok,
+    position_size,
+)
 from hermes_trading.ict.types import Grade
 
 EQUITY = 1000.0
@@ -79,9 +84,17 @@ def test_circuit_breaker_clear_when_within_limits():
 # ── max_concurrent_ok ──────────────────────────────────────────────────────────
 
 
-def test_max_concurrent_ok_default_one():
+def test_max_concurrent_ok_default_is_four():
+    """
+    Default raised 1 -> 4 in session 21c (one slot per traded asset).
+    Pinned explicitly rather than left implicit: this default alone decides
+    how much of the account can be at risk simultaneously, since per-trade
+    risk is grade-based and independent of it.
+    """
+    assert DEFAULT_MAX_CONCURRENT_TRADES == 4
     assert max_concurrent_ok(0) is True
-    assert max_concurrent_ok(1) is False
+    assert max_concurrent_ok(3) is True
+    assert max_concurrent_ok(4) is False
 
 
 def test_max_concurrent_ok_custom_limit():

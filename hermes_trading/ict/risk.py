@@ -15,7 +15,17 @@ DEFAULT_RISK_PCT_A_PLUS = 0.20
 DEFAULT_RISK_PCT_B = 0.10
 DEFAULT_DAILY_LOSS_LIMIT_PCT = -0.20
 DEFAULT_WEEKLY_LOSS_LIMIT_PCT = -0.40
-DEFAULT_MAX_CONCURRENT_TRADES = 1
+# Raised 1 -> 4 by Linh, session 21c (2026-07-21), one slot per traded asset.
+#
+# UNRESOLVED RISK, deliberately accepted for now and flagged here so it isn't
+# forgotten: per-trade risk is still grade-based at 20% (A+) / 10% (B) of
+# equity, which was chosen back when this was 1. Four concurrent A+ setups
+# therefore put ~80% of equity at risk simultaneously, and the circuit
+# breakers below CANNOT prevent that -- they're evaluated at entry time
+# (see _look_for_new_setup), so all four can open before any loss registers.
+# Linh's call was to change this one variable and measure before touching
+# sizing. Revisit once there's a real sample of multi-position days.
+DEFAULT_MAX_CONCURRENT_TRADES = 4
 
 
 def position_size(

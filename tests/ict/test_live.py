@@ -380,8 +380,9 @@ def test_max_concurrent_blocks_on_another_assets_resting_order(tmp_path):
 def test_run_full_cycle_busy_count_includes_resting_orders_across_assets(tmp_path):
     """BTC has a resting order (no filled position anywhere) -- ETH's own
     cycle must still see busy_count=1 and refuse to look for a new entry,
-    proving run_full_cycle sums positions+open_orders account-wide before
-    any per-asset cycle runs, not just per-asset in isolation."""
+    proving run_full_cycle sums positions+open_orders across the traded
+    asset set before any per-asset cycle runs, not just per-asset in
+    isolation."""
     broker = FakeBroker()
     broker.open_orders["BTC/USDT"] = {"id": "order1"}
     candles = {"ETH/USDT": make_candles([(100, 101, 99, 100)], start_ts=1_000_000_000_000)}
@@ -392,6 +393,26 @@ def test_run_full_cycle_busy_count_includes_resting_orders_across_assets(tmp_pat
     assert eth_result.status == "flat"
     assert "max_concurrent" in eth_result.action
     assert broker.place_order_calls == []
+
+
+def test_busy_count_ignores_positions_outside_the_traded_asset_set(tmp_path):
+    """
+    A manual position/order on a symbol this worker doesn't trade must NOT
+    consume a slot. Session 21c: busy_count was account-wide, so a manual
+    limit order Linh placed silently saturated max_concurrent and stopped
+    the worker trading entirely, surfacing only as a generic
+    "max_concurrent reached" line.
+    """
+    broker = FakeBroker()
+    broker.open_orders["XRP/USDT"] = {"id": "manual1"}          # not in the traded set
+    broker.positions["DOGE/USDT"] = Position(symbol="DOGE/USDT", side="long", contracts=5.0,
+                                             entry_price=0.4, unrealized_pnl=0.0)
+    candles = {"ETH/USDT": make_candles([(100, 101, 99, 100)], start_ts=1_000_000_000_000)}
+
+    results = run_full_cycle(["BTC/USDT", "ETH/USDT"], broker, tmp_path, candles, max_concurrent=1)
+
+    eth_result = next(r for r in results if r.asset == "ETH/USDT")
+    assert "max_concurrent" not in eth_result.action
 
 
 def test_run_full_cycle_isolates_one_assets_exception(tmp_path):

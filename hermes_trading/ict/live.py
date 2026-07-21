@@ -627,12 +627,22 @@ def run_full_cycle(
 ) -> list[CycleResult]:
     """
     One full scan across all assets. Broker ground truth for `busy_count`
-    (positions + resting orders, across EVERY asset) is fetched once up
-    front so a stale count from one asset's cycle can't leak into
-    another's max_concurrent check within the same pass -- and so two
-    assets each placing a resting order in the same pass can't jointly
-    exceed max_concurrent (resting orders count as busy too; see the
-    live-worker plan's rationale).
+    (positions + resting orders) is fetched once up front so a stale count
+    from one asset's cycle can't leak into another's max_concurrent check
+    within the same pass -- and so two assets each placing a resting order
+    in the same pass can't jointly exceed max_concurrent (resting orders
+    count as busy too; see the live-worker plan's rationale).
+
+    `busy_count` is scoped to `assets` -- the symbols this worker actually
+    trades -- NOT the whole account. It was account-wide until session 21c,
+    which meant any manual order Linh placed on any symbol silently consumed
+    a slot and (at the then-current max_concurrent=1) stopped the worker
+    trading entirely; that's exactly what happened on 2026-07-21 and it is
+    invisible in the logs beyond a generic "max_concurrent reached" line.
+    The tradeoff accepted here: total account exposure is now this worker's
+    slots PLUS whatever is held manually, and nothing reconciles the
+    combined margin -- the worker can no longer see, let alone account for,
+    positions outside its own universe.
 
     Each asset's cycle is isolated in its own try/except (matching
     tools/run_ict_scanner.py's own per-asset isolation) so an unexpected
@@ -640,7 +650,14 @@ def run_full_cycle(
     OrderTooSmallError, anything -- can't take down monitoring/management
     for the other three assets in the same pass.
     """
-    busy_count = len(broker.get_positions()) + len(broker.get_open_orders())
+    # Per-asset rather than one unfiltered call: the BrokerAdapter interface
+    # already supports symbol filtering on both, and matching venue-specific
+    # symbol formats (ccxt returns "BTC/USDT:USDT" for "BTC/USDT") in this
+    # layer would put exchange-format knowledge on the wrong side of the seam.
+    busy_count = sum(
+        len(broker.get_positions(asset)) + len(broker.get_open_orders(asset))
+        for asset in assets
+    )
 
     results = []
     for asset in assets:
