@@ -47,7 +47,12 @@ from hermes_trading.ict.risk import (
     max_concurrent_ok,
     position_size,
 )
-from hermes_trading.ict.scanner import build_detection_context, locate_pending_setup, scan_asset
+from hermes_trading.ict.scanner import (
+    DetectionContext,
+    build_detection_context,
+    locate_pending_setup,
+    scan_asset,
+)
 from hermes_trading.ict.types import Direction, SwingKind
 from hermes_trading.ict.util import Candle
 
@@ -264,8 +269,18 @@ def run_asset_cycle(
     max_concurrent: int = DEFAULT_MAX_CONCURRENT_TRADES,
     daily_limit_pct: float = DEFAULT_DAILY_LOSS_LIMIT_PCT,
     weekly_limit_pct: float = DEFAULT_WEEKLY_LOSS_LIMIT_PCT,
+    detection_context: DetectionContext | None = None,
     **scan_params,
 ) -> CycleResult:
+    """
+    `detection_context`, when supplied, is reused by every branch below
+    instead of each rebuilding its own. All three consumers
+    (_look_for_new_setup -> scan_asset, _check_resting_order_status,
+    _manage_open_position) already derive theirs from the identical
+    _DETECTION_CONTEXT_KEYS subset of scan_params, so one context is valid
+    for all of them. Caller must build it from the same candles and the
+    same detection params; pass None to have each branch build its own.
+    """
     if store.is_needs_review():
         return CycleResult(asset, "needs_review", "flagged for manual review -- no automated action taken", False)
 
@@ -280,30 +295,35 @@ def run_asset_cycle(
             return CycleResult(asset, "needs_review", "unrecoverable drift: broker has a position, no local record", False)
         return _look_for_new_setup(asset, broker, candles_15m, store, busy_count, dry_run=dry_run,
                                     max_concurrent=max_concurrent, daily_limit_pct=daily_limit_pct,
-                                    weekly_limit_pct=weekly_limit_pct, **scan_params)
+                                    weekly_limit_pct=weekly_limit_pct,
+                                    detection_context=detection_context, **scan_params)
 
     if status == "resting_order":
         open_orders = broker.get_open_orders(asset)
         still_resting = any(str(o.get("id")) == str(position.get("order_id")) for o in open_orders)
         if not still_resting:
             if broker.has_open_position(asset):
-                return _handle_resting_order_filled(asset, broker, candles_15m, store, position, dry_run=dry_run)
+                return _handle_resting_order_filled(asset, broker, candles_15m, store, position, dry_run=dry_run,
+                                                     detection_context=detection_context)
             if not dry_run:
                 store.save_position({"status": "flat"})
             return CycleResult(asset, "flat", "resting order gone at the exchange with no fill -- reset to flat", not dry_run)
-        return _check_resting_order_status(asset, broker, candles_15m, store, position, dry_run=dry_run, **scan_params)
+        return _check_resting_order_status(asset, broker, candles_15m, store, position, dry_run=dry_run,
+                                            detection_context=detection_context, **scan_params)
 
     if status == "open_position":
         if not broker.has_open_position(asset):
             return _handle_position_closed(asset, broker, store, position, dry_run=dry_run)
-        return _manage_open_position(asset, broker, candles_15m, store, position, dry_run=dry_run, **scan_params)
+        return _manage_open_position(asset, broker, candles_15m, store, position, dry_run=dry_run,
+                                      detection_context=detection_context, **scan_params)
 
     raise ValueError(f"unknown local position status {status!r} for {asset}")
 
 
 def _look_for_new_setup(
     asset, broker, candles_15m, store, busy_count, *, dry_run,
-    max_concurrent, daily_limit_pct, weekly_limit_pct, **scan_params,
+    max_concurrent, daily_limit_pct, weekly_limit_pct,
+    detection_context=None, **scan_params,
 ) -> CycleResult:
     if not max_concurrent_ok(busy_count, max_concurrent=max_concurrent):
         return CycleResult(asset, "flat", f"max_concurrent reached ({busy_count}/{max_concurrent}) -- skipping new-entry check", False)
@@ -322,7 +342,8 @@ def _look_for_new_setup(
         return CycleResult(asset, "flat", "circuit breaker active -- standing down", False)
 
     attempted = store.load_attempted()
-    alerts = scan_asset(candles_15m, asset, equity, already_alerted=attempted, **scan_params)
+    alerts = scan_asset(candles_15m, asset, equity, already_alerted=attempted,
+                        detection_context=detection_context, **scan_params)
     if not alerts:
         return CycleResult(asset, "flat", "no qualified pending setup", False)
 
@@ -371,8 +392,10 @@ def _look_for_new_setup(
     return CycleResult(asset, "resting_order", f"placed {side} limit @ {entry_price} qty={size.qty} lev={size.leverage}x", not dry_run)
 
 
-def _check_resting_order_status(asset, broker, candles_15m, store, position, *, dry_run, **scan_params) -> CycleResult:
-    ctx = build_detection_context(candles_15m, **_detection_kwargs(scan_params))
+def _check_resting_order_status(asset, broker, candles_15m, store, position, *, dry_run,
+                                 detection_context=None, **scan_params) -> CycleResult:
+    ctx = detection_context if detection_context is not None else build_detection_context(
+        candles_15m, **_detection_kwargs(scan_params))
     if not ctx.exec_full:
         return CycleResult(asset, "resting_order", "no candle history yet -- leaving order resting", False)
 
@@ -406,7 +429,8 @@ def _check_resting_order_status(asset, broker, candles_15m, store, position, *, 
     return CycleResult(asset, "flat", f"resting order cancelled ({status})", not dry_run)
 
 
-def _handle_resting_order_filled(asset, broker, candles_15m, store, position, *, dry_run) -> CycleResult:
+def _handle_resting_order_filled(asset, broker, candles_15m, store, position, *, dry_run,
+                                  detection_context=None) -> CycleResult:
     broker_positions = broker.get_positions(asset)
     if not broker_positions:
         return CycleResult(asset, "resting_order", "order gone but no position found yet -- rechecking next cycle", False)
@@ -422,7 +446,17 @@ def _handle_resting_order_filled(asset, broker, candles_15m, store, position, *,
     if not dry_run:
         broker.set_position_protection(asset, stop_loss=position["stop_price"], take_profit=position["target_price"])
 
-    ctx = build_detection_context(candles_15m)
+    # NOTE (session 21c): this call passes NO detection params, so on its own
+    # it builds with library defaults (disp_atr_mult=1.5) rather than the
+    # worker's calibrated 0.75 -- unlike every other build_detection_context
+    # call in this module, which routes through _detection_kwargs. Detection
+    # is param-sensitive, so a mismatched context can fail to re-locate the
+    # MSS and silently fall back to fill_index=0, which in turn feeds
+    # replay_management_bars' swing-eligibility filter. Passing the shared
+    # context (as the live worker now does) resolves that inconsistency;
+    # the no-context fallback is left as-is to avoid changing behaviour for
+    # callers that don't supply one.
+    ctx = detection_context if detection_context is not None else build_detection_context(candles_15m)
     found = locate_pending_setup(ctx, position["mss_timestamp"])
     fill_index = found[1].index if found is not None else 0
     fill_timestamp = ctx.exec_full[fill_index].timestamp if ctx.exec_full else position.get("placed_at_ms", 0)
@@ -451,8 +485,10 @@ def _handle_resting_order_filled(asset, broker, candles_15m, store, position, *,
     return CycleResult(asset, "open_position", f"resting order filled at {fill_price}, SL/TP re-verified", not dry_run)
 
 
-def _manage_open_position(asset, broker, candles_15m, store, position, *, dry_run, **scan_params) -> CycleResult:
-    ctx = build_detection_context(candles_15m, **_detection_kwargs(scan_params))
+def _manage_open_position(asset, broker, candles_15m, store, position, *, dry_run,
+                           detection_context=None, **scan_params) -> CycleResult:
+    ctx = detection_context if detection_context is not None else build_detection_context(
+        candles_15m, **_detection_kwargs(scan_params))
     if not ctx.exec_full:
         return CycleResult(asset, "open_position", "no candle history yet", False)
 
@@ -623,6 +659,7 @@ def run_full_cycle(
     max_concurrent: int = DEFAULT_MAX_CONCURRENT_TRADES,
     daily_limit_pct: float = DEFAULT_DAILY_LOSS_LIMIT_PCT,
     weekly_limit_pct: float = DEFAULT_WEEKLY_LOSS_LIMIT_PCT,
+    detection_contexts: dict[str, DetectionContext] | None = None,
     **scan_params,
 ) -> list[CycleResult]:
     """
@@ -667,7 +704,8 @@ def run_full_cycle(
             result = run_asset_cycle(
                 asset, broker, candles, store, busy_count, dry_run=dry_run,
                 max_concurrent=max_concurrent, daily_limit_pct=daily_limit_pct,
-                weekly_limit_pct=weekly_limit_pct, **scan_params,
+                weekly_limit_pct=weekly_limit_pct,
+                detection_context=(detection_contexts or {}).get(asset), **scan_params,
             )
         except Exception as e:
             result = CycleResult(asset, "error", f"{type(e).__name__}: {e}", False)

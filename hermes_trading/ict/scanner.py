@@ -163,6 +163,7 @@ def scan_asset(
     mss_retrace_buffer_mult: float = DEFAULT_MSS_RETRACE_BUFFER_MULT,
     as_of_index: int | None = None,
     already_alerted: set[int] | None = None,
+    detection_context: DetectionContext | None = None,
 ) -> list[Alert]:
     """
     Detect currently-pending (ENTRY_ARMED, not yet filled/invalidated/
@@ -179,9 +180,19 @@ def scan_asset(
     backtest engine would have called a qualified, still-open setup at
     that point (spec S:12's "also used live" reusability, verified in
     tests/ict/test_scanner.py).
+
+    `detection_context` optionally supplies an already-computed
+    DetectionContext instead of rebuilding it here. Purely a performance
+    seam -- detection is deterministic, so a context built from the SAME
+    candles and the same exec_tf/swing_n_exec/atr_period/disp_atr_mult
+    yields byte-identical results (asserted in
+    tests/ict/test_context.py::test_prebuilt_detection_context_matches_internal_build).
+    The caller owns that "same inputs" contract; pass None to be safe.
     """
-    ctx = build_detection_context(candles_15m, exec_tf=exec_tf, swing_n_exec=swing_n_exec,
-                                   atr_period=atr_period, disp_atr_mult=disp_atr_mult)
+    ctx = detection_context if detection_context is not None else build_detection_context(
+        candles_15m, exec_tf=exec_tf, swing_n_exec=swing_n_exec,
+        atr_period=atr_period, disp_atr_mult=disp_atr_mult,
+    )
     exec_full = ctx.exec_full
     if not exec_full:
         return []

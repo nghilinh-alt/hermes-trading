@@ -185,3 +185,61 @@ def test_context_kwargs_filters_unknown_params():
     out = context_kwargs({"min_rr": 0.8, "totally_unknown": 1, "kill_zones": ((0, 24),)})
     assert out == {"min_rr": 0.8, "kill_zones": ((0, 24),)}
     build_market_context([], "BTC/USDT", 1000.0, **out)  # must not raise
+
+
+# ── Shared-detection-context optimisation (session 21c) ───────────────────
+
+
+def test_prebuilt_detection_context_matches_internal_build(candles_with_candidates):
+    """
+    THE contract for the shared-context optimisation: passing a prebuilt
+    DetectionContext must produce output identical to letting the function
+    build its own. Detection is deterministic, so any divergence here means
+    the two paths disagree about market structure -- and since the same
+    context is now shared with the TRADING scan, that would be a real-money
+    correctness bug, not merely a display one.
+    """
+    sliced, built_internally = candles_with_candidates
+
+    shared = build_detection_context(sliced, exec_tf="1h",
+                                     disp_atr_mult=SCAN_PARAMS["disp_atr_mult"])
+    with_prebuilt = build_market_context(sliced, "BTC/USDT", 808.03,
+                                         detection_context=shared,
+                                         **context_kwargs(SCAN_PARAMS))
+
+    assert json.dumps(with_prebuilt, sort_keys=True) == json.dumps(built_internally, sort_keys=True)
+
+
+def test_scan_asset_with_prebuilt_context_matches_internal_build(candles_with_candidates):
+    """Same contract on the trading side -- alerts must be identical."""
+    sliced, _ = candles_with_candidates
+
+    shared = build_detection_context(sliced, exec_tf="1h",
+                                     disp_atr_mult=SCAN_PARAMS["disp_atr_mult"])
+    a_internal = scan_asset(sliced, "BTC/USDT", 808.03, **SCAN_PARAMS)
+    a_shared = scan_asset(sliced, "BTC/USDT", 808.03, detection_context=shared, **SCAN_PARAMS)
+
+    assert a_internal == a_shared
+
+
+def test_prebuilt_context_is_not_mutated_by_either_consumer(candles_with_candidates):
+    """
+    The context is now shared across the trading scan and the display
+    snapshot within a cycle. Neither may mutate it, or the second consumer
+    would silently see different market structure than the first.
+    """
+    sliced, _ = candles_with_candidates
+    shared = build_detection_context(sliced, exec_tf="1h",
+                                     disp_atr_mult=SCAN_PARAMS["disp_atr_mult"])
+    before = (len(shared.exec_full), len(shared.exec_swings), len(shared.sweeps),
+              len(shared.mss_events), len(shared.fvgs), len(shared.order_blocks),
+              len(shared.breakers), len(shared.atr_series))
+
+    scan_asset(sliced, "BTC/USDT", 808.03, detection_context=shared, **SCAN_PARAMS)
+    build_market_context(sliced, "BTC/USDT", 808.03, detection_context=shared,
+                         **context_kwargs(SCAN_PARAMS))
+
+    after = (len(shared.exec_full), len(shared.exec_swings), len(shared.sweeps),
+             len(shared.mss_events), len(shared.fvgs), len(shared.order_blocks),
+             len(shared.breakers), len(shared.atr_series))
+    assert before == after

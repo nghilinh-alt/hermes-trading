@@ -39,7 +39,8 @@ from dotenv import load_dotenv
 
 from hermes_trading.brokers.bybit import BybitBroker
 from hermes_trading.ict.context import build_market_context, context_kwargs
-from hermes_trading.ict.live import AssetStateStore, run_full_cycle
+from hermes_trading.ict.live import AssetStateStore, _detection_kwargs, run_full_cycle
+from hermes_trading.ict.scanner import build_detection_context
 from hermes_trading.ict.risk import (
     DEFAULT_DAILY_LOSS_LIMIT_PCT,
     DEFAULT_MAX_CONCURRENT_TRADES,
@@ -144,7 +145,35 @@ def _write_heartbeat(cycle_results, *, equity, busy_count, cycle_seconds, dry_ru
     _atomic_write_json(STATE_ROOT / "heartbeat.json", payload)
 
 
-def _dump_market_context(candles_by_asset: dict, equity: float) -> None:
+def _build_detection_contexts(candles_by_asset: dict) -> dict:
+    """
+    Build each asset's DetectionContext ONCE per cycle, to be shared by the
+    trading scan and the display snapshot.
+
+    This is the expensive step in the whole cycle -- resample + swings +
+    sweeps + BOS/MSS + FVG/OB/breaker over the full (ever-growing, 70k+ bar)
+    15m cache. It used to run twice per asset: once inside scan_asset and
+    again inside build_market_context, which measured at ~90-100s of pure
+    duplication per cycle on 2026-07-21.
+
+    Failure is isolated per asset and non-fatal: a None context just means
+    that asset's cycle builds its own, exactly as before this optimisation.
+    """
+    contexts = {}
+    for asset in ASSETS:
+        candles = candles_by_asset.get(asset) or []
+        if not candles:
+            continue
+        try:
+            contexts[asset] = build_detection_context(candles, **_detection_kwargs(SCAN_PARAMS))
+        except Exception:
+            print(f"[WARN] detection-context build failed for {asset}; "
+                  f"its cycle will build its own:", flush=True)
+            traceback.print_exc(file=sys.stdout)
+    return contexts
+
+
+def _dump_market_context(candles_by_asset: dict, equity: float, detection_contexts: dict) -> None:
     """
     Persist the per-asset market snapshot the dashboard renders.
 
@@ -158,7 +187,9 @@ def _dump_market_context(candles_by_asset: dict, equity: float) -> None:
             candles = candles_by_asset.get(asset) or []
             if not candles:
                 continue
-            ctx = build_market_context(candles, asset, equity, **context_kwargs(SCAN_PARAMS))
+            ctx = build_market_context(candles, asset, equity,
+                                        detection_context=detection_contexts.get(asset),
+                                        **context_kwargs(SCAN_PARAMS))
             _atomic_write_json(STATE_ROOT / asset.replace("/", "_") / "context.json", ctx)
         except Exception:
             print(f"[WARN] market-context dump failed for {asset} (trading unaffected):", flush=True)
@@ -176,7 +207,12 @@ def run_once(broker: BybitBroker, public_exchange: ccxt.Exchange, *, dry_run: bo
             traceback.print_exc(file=sys.stdout)
             candles_by_asset[asset] = []
 
-    results = run_full_cycle(ASSETS, broker, STATE_ROOT, candles_by_asset, dry_run=dry_run, **SCAN_PARAMS)
+    # One detection context per asset, shared by the trading cycle below and
+    # the display snapshot further down -- see _build_detection_contexts.
+    detection_contexts = _build_detection_contexts(candles_by_asset)
+
+    results = run_full_cycle(ASSETS, broker, STATE_ROOT, candles_by_asset, dry_run=dry_run,
+                             detection_contexts=detection_contexts, **SCAN_PARAMS)
     for r in results:
         print(f"[{r.asset}] status={r.status} mutated={r.mutated} -- {r.action}", flush=True)
 
@@ -191,7 +227,7 @@ def run_once(broker: BybitBroker, public_exchange: ccxt.Exchange, *, dry_run: bo
         print("[WARN] could not fetch account summary for heartbeat (trading unaffected):", flush=True)
         traceback.print_exc(file=sys.stdout)
 
-    _dump_market_context(candles_by_asset, equity)
+    _dump_market_context(candles_by_asset, equity, detection_contexts)
     _write_heartbeat(results, equity=equity, busy_count=busy_count,
                      cycle_seconds=time.time() - cycle_start, dry_run=dry_run)
 

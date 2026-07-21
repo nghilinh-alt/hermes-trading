@@ -107,6 +107,7 @@ def build_market_context(
     mss_retrace_buffer_mult: float = DEFAULT_MSS_RETRACE_BUFFER_MULT,
     ote_low: float = DEFAULT_OTE_LOW,
     ote_high: float = DEFAULT_OTE_HIGH,
+    detection_context=None,
 ) -> dict:
     """
     Build a JSON-serialisable market-context snapshot for one asset.
@@ -120,9 +121,18 @@ def build_market_context(
 
     Returns a dict with an "error" key (and nothing else meaningful) only
     if there isn't enough history to say anything.
+
+    `detection_context` optionally supplies an already-computed
+    DetectionContext rather than rebuilding it. This is the expensive part
+    of the whole function -- on the live 70k-candle cache it dominates, and
+    sharing one context between the trading scan and this display snapshot
+    is what keeps the worker's cycle time down. Must be built from the same
+    candles and the same exec_tf/swing_n_exec/atr_period/disp_atr_mult.
     """
-    ctx = build_detection_context(candles_15m, exec_tf=exec_tf, swing_n_exec=swing_n_exec,
-                                  atr_period=atr_period, disp_atr_mult=disp_atr_mult)
+    ctx = detection_context if detection_context is not None else build_detection_context(
+        candles_15m, exec_tf=exec_tf, swing_n_exec=swing_n_exec,
+        atr_period=atr_period, disp_atr_mult=disp_atr_mult,
+    )
     exec_full = ctx.exec_full
     if not exec_full:
         return {"schema_version": _CONTEXT_VERSION, "asset": asset, "error": "no candle history"}
