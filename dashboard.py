@@ -57,7 +57,17 @@ def _slug(asset: str) -> str:
 def _ssh_batch(files: list[str]) -> dict[str, str]:
     """Fetch many remote files in one SSH connection. Returns {} on any failure."""
     SEP = "---HERMES_SEP---"
-    parts = [f"echo '{SEP}{p}'; cat {p} 2>/dev/null; echo '{SEP}END'" for p in files]
+    # The bare `echo` between the file and the END marker is load-bearing:
+    # the worker writes heartbeat.json / context.json / position.json via
+    # json.dumps and the review flag via write_text, none of which end in a
+    # newline. Without the extra echo, `cat`'s final line (e.g. a closing
+    # `}`) glues directly onto `{SEP}END`, the marker never matches on its
+    # own line, and that file's content is silently dropped -- which is
+    # exactly what happened on first live render (2026-07-21): live.log and
+    # trades.jsonl parsed (shell-written, newline-terminated) while every
+    # JSON panel came back empty. The forced newline makes END always land
+    # alone; the resulting blank line is removed by .strip() below.
+    parts = [f"echo '{SEP}{p}'; cat {p} 2>/dev/null; echo; echo '{SEP}END'" for p in files]
     try:
         result = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", VPS, "; ".join(parts)],
