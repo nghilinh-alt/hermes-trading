@@ -264,6 +264,13 @@ def _ladder(price, bands, lines, height=LADDER_H) -> str:
     out = [f"<div style='position:relative;height:{height}px;margin:10px 0 6px;"
            f"border-left:1px solid var(--border);border-right:1px solid var(--border)'>"]
 
+    # Geometry (bands + lines) is drawn at EXACT price positions -- that's the
+    # whole point of the ladder. Labels are collected separately and pushed
+    # apart afterwards, so a cluster of nearby levels stays spatially honest
+    # while its text stays legible. `ideal` is the label's true y; `size` and
+    # `weight` let the price label sit a touch larger.
+    labels: list[dict] = []
+
     for lo, hi, colour, label, dashed in bands:
         if lo is None or hi is None:
             continue
@@ -271,30 +278,54 @@ def _ladder(price, bands, lines, height=LADDER_H) -> str:
         h = max(3.0, bot - top)
         border = f"1px dashed {colour}" if dashed else "none"
         out.append(
-            f"<div title='{_esc(label)} · {_px(lo)}–{_px(hi)}' style='position:absolute;left:0;right:88px;"
+            f"<div title='{_esc(label)} · {_px(lo)}–{_px(hi)}' style='position:absolute;left:0;right:90px;"
             f"top:{top:.1f}px;height:{h:.1f}px;background-color:color-mix(in srgb,{colour} 16%,transparent);"
             f"border:{border};border-radius:2px'></div>"
-            f"<div style='position:absolute;right:0;width:86px;top:{top:.1f}px;font-size:9px;"
-            f"color:{colour};text-align:right;white-space:nowrap;overflow:hidden'>{_esc(label)}</div>"
         )
+        labels.append({"ideal": top, "colour": colour, "text": label, "size": 9, "weight": 400})
 
     for lvl, colour, label, style in lines:
         if lvl is None:
             continue
         top = y(lvl)
         out.append(
-            f"<div title='{_esc(label)} · {_px(lvl)}' style='position:absolute;left:0;right:88px;top:{top:.1f}px;"
+            f"<div title='{_esc(label)} · {_px(lvl)}' style='position:absolute;left:0;right:90px;top:{top:.1f}px;"
             f"border-top:1.5px {style} {colour}'></div>"
-            f"<div style='position:absolute;right:0;width:86px;top:{max(0.0, top - 6):.1f}px;font-size:9px;"
-            f"color:{colour};text-align:right;white-space:nowrap'>{_esc(label)}</div>"
         )
+        labels.append({"ideal": top, "colour": colour, "text": label, "size": 9, "weight": 400})
 
     if price is not None:
         top = y(price)
         out.append(
-            f"<div style='position:absolute;left:0;right:88px;top:{top:.1f}px;border-top:2px solid var(--fg)'></div>"
-            f"<div style='position:absolute;right:0;width:86px;top:{max(0.0, top - 7):.1f}px;font-size:10px;"
-            f"font-weight:600;color:var(--fg);text-align:right'>{_px(price)}</div>"
+            f"<div style='position:absolute;left:0;right:90px;top:{top:.1f}px;border-top:2px solid var(--fg)'></div>"
+        )
+        labels.append({"ideal": top, "colour": "var(--fg)", "text": _px(price), "size": 10, "weight": 600})
+
+    # De-collision, two passes over labels sorted by true position:
+    #   (1) top-down -- push each label to at least prev + ROW, so none
+    #       overlaps the one above it;
+    #   (2) bottom-up -- if that pushed the last past the bottom edge, pull
+    #       each up to at most next - ROW.
+    # Both passes only ever enforce the ROW gap, so together they settle to a
+    # non-overlapping stack that stays within [0, height]. Labels remain in
+    # price order; the title tooltip on each geometry element carries the
+    # exact value, so a nudged label never misleads.
+    ROW = 11.0
+    labels.sort(key=lambda d: d["ideal"])
+    prev = -ROW
+    for d in labels:
+        d["y"] = max(d["ideal"], prev + ROW)
+        prev = d["y"]
+    nxt = height
+    for d in reversed(labels):
+        d["y"] = min(d["y"], nxt - ROW)
+        nxt = d["y"]
+    for d in labels:
+        yy = max(0.0, d["y"])
+        out.append(
+            f"<div style='position:absolute;right:0;width:88px;top:{yy:.1f}px;font-size:{d['size']}px;"
+            f"font-weight:{d['weight']};color:{d['colour']};text-align:right;white-space:nowrap;"
+            f"overflow:hidden;line-height:{ROW:.0f}px'>{_esc(d['text'])}</div>"
         )
 
     out.append("</div>")
