@@ -348,11 +348,47 @@ def _zone_bands(ctx: dict, limit_each=3) -> list:
     return bands
 
 
+def _collapse_pools(pools: list, tol_pct: float = 0.001) -> list:
+    """
+    Merge liquidity pools whose prices sit within `tol_pct` of each other into
+    one representative level. Every confirmed swing is its own pool, so a raw
+    list shows many near-identical rows (four swings within $20 on BTC, say);
+    this collapses them into a single 'SWING liq ×4' at their mean price.
+    Returns dicts {price, count, source} sorted low → high.
+    """
+    items = sorted((p for p in (pools or []) if p.get("price") is not None),
+                   key=lambda p: float(p["price"]))
+    clusters: list[dict] = []
+    for p in items:
+        price = float(p["price"])
+        src = (p.get("source") or "LIQ").upper()
+        if clusters and abs(price - clusters[-1]["ref"]) <= tol_pct * clusters[-1]["ref"]:
+            c = clusters[-1]
+            c["prices"].append(price)
+            c["sources"][src] = c["sources"].get(src, 0) + 1
+            c["ref"] = sum(c["prices"]) / len(c["prices"])
+        else:
+            clusters.append({"prices": [price], "sources": {src: 1}, "ref": price})
+    return [
+        {"price": sum(c["prices"]) / len(c["prices"]),
+         "count": sum(c["sources"].values()),
+         "source": max(c["sources"], key=c["sources"].get)}
+        for c in clusters
+    ]
+
+
 def _liquidity_lines(ctx: dict, limit=4) -> list:
+    """Ladder gutter liquidity levels, collapsed so near-identical swings don't stack."""
     z = (ctx or {}).get("zones") or {}
+    collapsed = _collapse_pools(z.get("liquidity"))
+    price = (ctx or {}).get("price")
+    # Keep the ones nearest current price -- that's what the ladder is centred on.
+    if price is not None:
+        collapsed.sort(key=lambda p: abs(p["price"] - float(price)))
     out = []
-    for p in (z.get("liquidity") or [])[:limit]:
-        out.append((p["price"], "#888", p["source"].upper(), "dotted"))
+    for p in collapsed[:limit]:
+        label = p["source"] + (f" ×{p['count']}" if p["count"] > 1 else "")
+        out.append((p["price"], "#888", label, "dotted"))
     return out
 
 
@@ -564,29 +600,69 @@ def _card_flat(asset, ctx, scan_params) -> str:
         cand_html = ("<div style='font-size:11px;color:var(--muted);padding:8px 0'>"
                      "No candidate setup in the last 61 bars — no MSS with a matching sweep to evaluate.</div>")
 
-    # Structure list -- the raw zones behind the ladder, in numbers.
-    z = ctx.get("zones") or {}
-    struct_rows = []
-    for s in (z.get("sr") or [])[:3]:
-        struct_rows.append(_row(f"{s['kind']}", f"{_px(s['price_low'])} – {_px(s['price_high'])} "
-                                                f"<span style='color:var(--muted);font-weight:400'>×{s['touches']}</span>"))
-    for o in (z.get("order_blocks") or [])[:3]:
-        struct_rows.append(_row(f"{o['kind']} OB", f"{_px(o['low'])} – {_px(o['high'])}"))
-    for f in (z.get("fvg") or [])[:3]:
-        d = " <span style='color:%s;font-weight:400'>disp</span>" % AMBER if f.get("displacement") else ""
-        struct_rows.append(_row(f"{f['kind']} FVG", f"{_px(f['low'])} – {_px(f['high'])}{d}"))
-    for b in (z.get("breakers") or [])[:2]:
-        struct_rows.append(_row(f"{b['kind']} breaker", f"{_px(b['low'])} – {_px(b['high'])}"))
-    for p in (z.get("liquidity") or [])[:4]:
-        struct_rows.append(_row(f"{p['source'].upper()} liq", _px(p["price"])))
-
-    struct_html = (
-        f"<div style='margin-top:10px;border-top:0.5px solid var(--border);padding-top:8px'>"
-        f"<div style='font-size:10px;color:var(--muted);margin-bottom:4px'>STRUCTURE NEAR PRICE</div>"
-        f"{_grid(''.join(struct_rows))}</div>"
-    ) if struct_rows else ""
-
+    struct_html = _structure_table(ctx, price)
     return bias_html + ladder + cand_html + struct_html
+
+
+def _structure_table(ctx: dict, price) -> str:
+    """
+    Structure near price, split into ABOVE and BELOW the current mark and
+    tagged with each level's distance from it. Every row carries a signed
+    distance so it's obvious how far a level sits; liquidity pools are
+    collapsed (see _collapse_pools) so near-identical swings show as one
+    'SWING liq ×N' instead of a stack of look-alikes.
+    """
+    z = (ctx or {}).get("zones") or {}
+    if price is None:
+        return ""
+    price = float(price)
+
+    # Each element: (ref_price_for_side, label, colour, value_html).
+    elems: list[tuple] = []
+
+    def _dist(ref) -> str:
+        pct = (ref - price) / price * 100
+        return f"<span style='color:var(--muted);font-weight:400'>{pct:+.1f}%</span>"
+
+    def _band(lo, hi, label, colour, meta=""):
+        mid = (lo + hi) / 2
+        val = f"{_px(lo)}–{_px(hi)} {meta}{_dist(mid)}".strip()
+        elems.append((mid, label, colour, val))
+
+    for s in (z.get("sr") or [])[:4]:
+        meta = f"<span style='color:var(--muted);font-weight:400'>×{s['touches']}</span> "
+        _band(s["price_low"], s["price_high"], s["kind"], "#888", meta)
+    for o in (z.get("order_blocks") or [])[:3]:
+        _band(o["low"], o["high"], f"{o['kind']} OB", PURPLE)
+    for f in (z.get("fvg") or [])[:3]:
+        meta = "<span style='color:%s;font-weight:400'>disp</span> " % AMBER if f.get("displacement") else ""
+        _band(f["low"], f["high"], f"{f['kind']} FVG", AMBER, meta)
+    for b in (z.get("breakers") or [])[:2]:
+        _band(b["low"], b["high"], f"{b['kind']} breaker", PURPLE)
+    for p in _collapse_pools(z.get("liquidity")):
+        cnt = f"<span style='color:var(--muted);font-weight:400'>×{p['count']}</span> " if p["count"] > 1 else ""
+        elems.append((p["price"], f"{p['source']} liq", "#888",
+                      f"{_px(p['price'])} {cnt}{_dist(p['price'])}".strip()))
+
+    above = sorted((e for e in elems if e[0] >= price), key=lambda e: e[0] - price)[:6]
+    below = sorted((e for e in elems if e[0] < price), key=lambda e: price - e[0])[:6]
+    if not above and not below:
+        return ""
+
+    def _section(title, rows):
+        if not rows:
+            return ""
+        body = "".join(_row(f"<span style='color:{c}'>{_esc(lbl)}</span>", val)
+                       for _, lbl, c, val in rows)
+        return (f"<div style='font-size:9px;color:var(--muted);margin:6px 0 2px'>{title}</div>"
+                f"{_grid(body)}")
+
+    return (
+        f"<div style='margin-top:10px;border-top:0.5px solid var(--border);padding-top:8px'>"
+        f"<div style='font-size:10px;color:var(--muted);margin-bottom:2px'>STRUCTURE NEAR PRICE "
+        f"<span style='font-weight:400'>· nearest first</span></div>"
+        f"{_section('ABOVE ▲', above)}{_section('BELOW ▼', below)}</div>"
+    )
 
 
 # ── Closed trades + R-based performance ────────────────────────────────────────
