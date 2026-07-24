@@ -18,6 +18,7 @@ Two data sources are used deliberately:
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -259,6 +260,7 @@ class FakeBroker(BrokerAdapter):
         self.positions: dict[str, Position] = {}
         self.open_orders: dict[str, dict] = {}
         self.closed_trades: dict[str, list[dict]] = {}
+        self.order_registry: dict[str, dict] = {}  # link_id -> {order_id, status} for find_order_by_link_id
         self.place_order_calls = []
         self.reduce_position_calls = []
         self.update_trailing_stop_calls = []
@@ -279,15 +281,26 @@ class FakeBroker(BrokerAdapter):
         return list(self.positions.values())
 
     def place_order(self, symbol, side, qty, *, order_type="limit", price=None,
-                     stop_loss=None, take_profit=None, leverage=None) -> OrderResult:
+                     stop_loss=None, take_profit=None, leverage=None, order_link_id=None) -> OrderResult:
         order_id = f"order{self._next_order_id}"
         self._next_order_id += 1
         self.place_order_calls.append({
             "symbol": symbol, "side": side, "qty": qty, "order_type": order_type,
             "price": price, "stop_loss": stop_loss, "take_profit": take_profit, "leverage": leverage,
+            "order_link_id": order_link_id,
         })
-        self.open_orders[symbol] = {"id": order_id, "symbol": symbol, "side": side, "qty": qty, "price": price}
+        self.open_orders[symbol] = {"id": order_id, "symbol": symbol, "side": side, "qty": qty,
+                                    "price": price, "clientOrderId": order_link_id,
+                                    "info": {"orderLinkId": order_link_id}}
+        if order_link_id is not None:
+            self.order_registry[order_link_id] = {"order_id": order_id, "status": "new"}
         return OrderResult(order_id=order_id, symbol=symbol, side=side, qty=qty, price=price, status="open")
+
+    def find_order_by_link_id(self, symbol: str, link_id: str) -> dict | None:
+        entry = self.order_registry.get(link_id)
+        if entry is None:
+            return None
+        return {"order_id": entry["order_id"], "status": entry["status"], "link_id": link_id}
 
     # Extras beyond the ABC that hermes_trading.ict.live calls:
 
@@ -958,3 +971,146 @@ def test_short_trade_pnl_pct_is_direction_aware(tmp_path):
     logged = json.loads((tmp_path / "BTC_USDT" / "trades.jsonl").read_text().strip())
     assert logged["pnl_pct"] == pytest.approx(0.10)   # positive: price fell, short won
     assert logged["realised_r"] == pytest.approx(2.5)  # 100 / (4 * 10)
+
+
+# ── Write-ahead intent + pending_placement recovery ─────────────────────────
+#
+# The order goes to the exchange, THEN the local record is written. A crash in
+# that gap used to orphan a live order. The fix persists a `pending_placement`
+# intent BEFORE placing, tagged with a deterministic order_link_id, and adds a
+# recovery branch that reconciles that intent against the exchange on restart.
+
+
+def _pending(link_id, **overrides):
+    base = {
+        "status": "pending_placement", "order_id": None, "order_link_id": link_id,
+        "direction": "bullish", "entry_price": 100.0, "stop_price": 96.0, "target_price": 112.0,
+        "grade": "A_PLUS", "qty": 1.0, "leverage": 5, "notional": 500.0, "risk_usd": 40.0,
+        "mss_timestamp": int(link_id.rsplit("-", 1)[1]), "placed_at_ms": int(link_id.rsplit("-", 1)[1]),
+    }
+    base.update(overrides)
+    return base
+
+
+def test_write_ahead_persists_intent_before_order_is_placed(tmp_path):
+    """The core guarantee: at the instant place_order is called, the local
+    record is ALREADY a pending_placement carrying the same order_link_id
+    that's passed to the exchange -- so a crash mid-placement can't orphan
+    the order."""
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    candles = make_candles([(100, 101, 99, 100)], start_ts=1_000_000_000_000)
+    alert = SimpleNamespace(direction=Direction.BULLISH, entry_zone=(99.0, 100.0),
+                            stop=96.0, target=112.0, grade=Grade.A_PLUS, timestamp=1_000_000_000_000)
+
+    seen = {}
+    real_place = broker.place_order
+
+    def spy(*a, **k):
+        pos = store.load_position()
+        seen["status_at_place"] = pos.get("status")
+        seen["link_at_place"] = pos.get("order_link_id")
+        seen["link_arg"] = k.get("order_link_id")
+        return real_place(*a, **k)
+
+    broker.place_order = spy
+    with patch("hermes_trading.ict.live.scan_asset", return_value=[alert]):
+        result = run_asset_cycle("BTC/USDT", broker, candles, store, busy_count=0)
+
+    assert result.status == "resting_order"
+    assert seen["status_at_place"] == "pending_placement"
+    assert seen["link_at_place"] == "ict-BTCUSDT-1000000000000"
+    assert seen["link_arg"] == "ict-BTCUSDT-1000000000000"
+    final = store.load_position()
+    assert final["status"] == "resting_order"
+    assert final["order_id"] == "order1"
+    assert final["order_link_id"] == "ict-BTCUSDT-1000000000000"
+
+
+def test_recover_pending_placement_adopts_resting_order(tmp_path):
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    link = "ict-BTCUSDT-123"
+    store.save_position(_pending(link))
+    broker.open_orders["BTC/USDT"] = {"id": "orderX", "clientOrderId": link, "info": {"orderLinkId": link}}
+
+    result = run_asset_cycle("BTC/USDT", broker, [], store, busy_count=0)
+
+    assert result.status == "resting_order"
+    pos = store.load_position()
+    assert pos["status"] == "resting_order"
+    assert pos["order_id"] == "orderX"
+    assert broker.place_order_calls == []  # never re-placed
+
+
+def test_recover_pending_placement_adopts_filled_position(tmp_path):
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    link = "ict-BTCUSDT-777"
+    store.save_position(_pending(link))
+    broker.order_registry[link] = {"order_id": "orderX", "status": "filled"}
+    broker.positions["BTC/USDT"] = Position(symbol="BTC/USDT", side="long", contracts=1.0,
+                                            entry_price=100.0, unrealized_pnl=0.0)
+    candles = make_candles([(100, 101, 99, 100), (100, 101, 99, 100)], start_ts=1_000_000_000_000)
+
+    result = run_asset_cycle("BTC/USDT", broker, candles, store, busy_count=0)
+
+    assert result.status == "open_position"
+    pos = store.load_position()
+    assert pos["status"] == "open_position"
+    assert pos["entry_price"] == 100.0
+    assert broker.set_position_protection_calls  # SL/TP re-verified on adopt
+
+
+def test_recover_pending_placement_resets_flat_when_never_placed(tmp_path):
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    store.save_position(_pending("ict-BTCUSDT-1"))  # nothing at the exchange, no registry entry
+
+    result = run_asset_cycle("BTC/USDT", broker, [], store, busy_count=0)
+
+    assert result.status == "flat"
+    assert "never reached" in result.action
+    assert store.load_position() == {"status": "flat"}
+
+
+def test_recover_pending_placement_resets_flat_when_cancelled(tmp_path):
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    link = "ict-BTCUSDT-2"
+    store.save_position(_pending(link))
+    broker.order_registry[link] = {"order_id": "orderX", "status": "cancelled"}
+
+    result = run_asset_cycle("BTC/USDT", broker, [], store, busy_count=0)
+
+    assert result.status == "flat"
+    assert store.load_position() == {"status": "flat"}
+
+
+def test_recover_pending_placement_flags_filled_and_closed_during_downtime(tmp_path):
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    link = "ict-BTCUSDT-3"
+    store.save_position(_pending(link))
+    broker.order_registry[link] = {"order_id": "orderX", "status": "filled"}  # filled, but no open position
+
+    result = run_asset_cycle("BTC/USDT", broker, [], store, busy_count=0)
+
+    assert result.status == "needs_review"
+    assert store.is_needs_review()
+
+
+def test_recover_pending_placement_flags_unmatched_open_position(tmp_path):
+    broker = FakeBroker()
+    store = AssetStateStore(tmp_path / "BTC_USDT")
+    link = "ict-BTCUSDT-4"
+    store.save_position(_pending(link))
+    # no matching open order, link not in registry, yet a position exists -> can't
+    # confidently call it ours -> flag rather than reset flat over a live position.
+    broker.positions["BTC/USDT"] = Position(symbol="BTC/USDT", side="long", contracts=1.0,
+                                            entry_price=100.0, unrealized_pnl=0.0)
+
+    result = run_asset_cycle("BTC/USDT", broker, [], store, busy_count=0)
+
+    assert result.status == "needs_review"
+    assert store.is_needs_review()

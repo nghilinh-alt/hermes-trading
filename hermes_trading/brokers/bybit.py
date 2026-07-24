@@ -142,6 +142,7 @@ class BybitBroker(BrokerAdapter):
         stop_loss: float | None = None,
         take_profit: float | None = None,
         leverage: float | None = None,
+        order_link_id: str | None = None,
     ) -> OrderResult:
         perp_symbol = _to_perp_symbol(symbol)
 
@@ -161,6 +162,8 @@ class BybitBroker(BrokerAdapter):
             params["stopLoss"] = str(stop_loss)
         if take_profit is not None:
             params["takeProfit"] = str(take_profit)
+        if order_link_id is not None:
+            params["orderLinkId"] = order_link_id
 
         order = self._exchange.create_order(perp_symbol, order_type, side, qty, price, params=params)
         return OrderResult(
@@ -201,6 +204,32 @@ class BybitBroker(BrokerAdapter):
     def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         perp_symbol = _to_perp_symbol(symbol) if symbol else None
         return self._exchange.fetch_open_orders(perp_symbol)
+
+    def find_order_by_link_id(self, symbol: str, link_id: str) -> dict | None:
+        """Look up an order by its client `orderLinkId` across live and
+        historical orders. Returns a normalized {order_id, status, link_id}
+        (status lower-cased: new/untriggered/filled/partiallyfilled/
+        cancelled/rejected/...) or None if no order with that link id exists.
+        Used to reconcile a `pending_placement` after a worker restart --
+        the deterministic link id ties a possibly-orphaned live order back to
+        the local intent record."""
+        perp_symbol = _to_perp_symbol(symbol)
+        market_id = self._exchange.market(perp_symbol)["id"]
+        params = {"category": "linear", "symbol": market_id, "orderLinkId": link_id}
+        for endpoint in (self._exchange.private_get_v5_order_realtime,
+                         self._exchange.private_get_v5_order_history):
+            try:
+                resp = endpoint(params)
+            except ccxt.BaseError:
+                continue
+            for row in resp.get("result", {}).get("list", []) or []:
+                if row.get("orderLinkId") == link_id:
+                    return {
+                        "order_id": str(row.get("orderId")),
+                        "status": str(row.get("orderStatus", "")).lower(),
+                        "link_id": link_id,
+                    }
+        return None
 
     def cancel_order(self, order_id: str, symbol: str) -> bool:
         perp_symbol = _to_perp_symbol(symbol)

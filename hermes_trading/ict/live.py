@@ -59,6 +59,23 @@ from hermes_trading.ict.util import Candle
 _DETECTION_CONTEXT_KEYS = {"exec_tf", "swing_n_exec", "atr_period", "disp_atr_mult"}
 
 
+def _order_link_id(asset: str, mss_timestamp: int) -> str:
+    """Deterministic client order id for a setup. Being derived from the
+    setup (not random) means a crash-and-retry of the SAME setup reuses the
+    same id, so the exchange dedupes it (no double-placement), and a
+    `pending_placement` record can be tied back to a possibly-orphaned live
+    order after a restart. Bybit's orderLinkId limit is 36 chars, [A-Za-z0-9-_];
+    `ict-<SYMBOL>-<ms>` stays well under that for every symbol we trade."""
+    return f"ict-{asset.replace('/', '')}-{mss_timestamp}"
+
+
+def _order_matches_link(order: dict, link_id: str | None) -> bool:
+    if not link_id:
+        return False
+    info = order.get("info") or {}
+    return order.get("clientOrderId") == link_id or info.get("orderLinkId") == link_id
+
+
 def _detection_kwargs(scan_params: dict) -> dict:
     return {k: v for k, v in scan_params.items() if k in _DETECTION_CONTEXT_KEYS}
 
@@ -287,6 +304,10 @@ def run_asset_cycle(
     position = store.load_position()
     status = position.get("status", "flat")
 
+    if status == "pending_placement":
+        return _recover_pending_placement(asset, broker, candles_15m, store, position,
+                                          dry_run=dry_run, detection_context=detection_context)
+
     if status == "flat":
         if broker.has_open_position(asset):
             store.flag_needs_review(
@@ -318,6 +339,66 @@ def run_asset_cycle(
                                       detection_context=detection_context, **scan_params)
 
     raise ValueError(f"unknown local position status {status!r} for {asset}")
+
+
+def _recover_pending_placement(asset, broker, candles_15m, store, position, *, dry_run,
+                               detection_context=None) -> CycleResult:
+    """Reconcile a crash between order placement and its confirmation write.
+    The intent record was persisted BEFORE the order went to the exchange, so
+    the setup's `order_link_id` ties it back to whatever (if anything) is
+    live. Each case resolves deterministically:
+      - order still resting at the exchange   -> adopt as resting_order
+      - order filled into an open position     -> adopt as open_position
+      - order never reached the exchange / cancelled / rejected -> reset flat
+      - order filled AND already closed while down, or an open position that
+        can't be tied to our link id           -> flag for manual review
+    Never resets to flat while a position is open -- that would hand an
+    unmanaged live position back to the new-setup path."""
+    link_id = position.get("order_link_id")
+
+    # Fast path: the resting limit order is still visible in open orders.
+    for o in broker.get_open_orders(asset):
+        if _order_matches_link(o, link_id):
+            if not dry_run:
+                store.save_position({**position, "status": "resting_order", "order_id": str(o.get("id"))})
+            return CycleResult(asset, "resting_order",
+                               "recovered pending_placement: order still resting -- adopted", not dry_run)
+
+    # Authoritative client-id lookup for every other case.
+    order = broker.find_order_by_link_id(asset, link_id) if link_id else None
+    st = (order or {}).get("status", "")
+
+    if st in ("filled", "partiallyfilled"):
+        if broker.has_open_position(asset):
+            recovered = {**position, "status": "resting_order", "order_id": order["order_id"]}
+            return _handle_resting_order_filled(asset, broker, candles_15m, store, recovered,
+                                                dry_run=dry_run, detection_context=detection_context)
+        store.flag_needs_review(
+            f"pending_placement order {link_id} shows {st} at the exchange but no open position remains "
+            f"-- it likely filled and closed during downtime; reconcile P&L manually")
+        return CycleResult(asset, "needs_review",
+                           "recovered pending_placement: filled and closed during downtime -- flagged", False)
+
+    if st in ("new", "untriggered"):
+        # Live at the exchange but not surfaced by get_open_orders this instant.
+        if not dry_run:
+            store.save_position({**position, "status": "resting_order", "order_id": order["order_id"]})
+        return CycleResult(asset, "resting_order",
+                           "recovered pending_placement: order live at exchange -- adopted", not dry_run)
+
+    # Nothing of ours is resting or filled. Guard against ever resetting to
+    # flat while a position is open (can't confidently call it ours).
+    if broker.has_open_position(asset):
+        store.flag_needs_review(
+            f"pending_placement for {asset}: an open position exists but could not be tied to order_link_id "
+            f"{link_id} -- reconcile manually before the worker manages it")
+        return CycleResult(asset, "needs_review",
+                           "recovered pending_placement: unmatched open position -- flagged", False)
+
+    if not dry_run:
+        store.save_position({"status": "flat"})
+    reason = f"order {st} at exchange" if order else "order never reached the exchange"
+    return CycleResult(asset, "flat", f"recovered pending_placement: {reason} -- reset to flat", not dry_run)
 
 
 def _look_for_new_setup(
@@ -363,18 +444,12 @@ def _look_for_new_setup(
         return CycleResult(asset, "flat", "position_size returned None for this grade -- skipping", False)
 
     side = "buy" if alert.direction == Direction.BULLISH else "sell"
-    if not dry_run:
-        result = broker.place_order(
-            asset, side, size.qty, order_type="limit", price=entry_price,
-            stop_loss=alert.stop, take_profit=alert.target, leverage=size.leverage,
-        )
-        order_id = result.order_id
-    else:
-        order_id = "DRY_RUN"
+    link_id = _order_link_id(asset, alert.timestamp)
 
-    new_position = {
-        "status": "resting_order",
-        "order_id": order_id,
+    # Fields common to the pre-placement intent and the confirmed resting
+    # order. `order_id` and `status` are the only things that differ between
+    # the two writes below.
+    base = {
         "direction": alert.direction.value,
         "entry_price": entry_price,
         "stop_price": alert.stop,
@@ -386,10 +461,26 @@ def _look_for_new_setup(
         "risk_usd": size.risk_usd,
         "mss_timestamp": alert.timestamp,
         "placed_at_ms": now_ms,
+        "order_link_id": link_id,
     }
-    if not dry_run:
-        store.save_position(new_position)
-    return CycleResult(asset, "resting_order", f"placed {side} limit @ {entry_price} qty={size.qty} lev={size.leverage}x", not dry_run)
+
+    if dry_run:
+        return CycleResult(asset, "resting_order",
+                           f"[dry-run] would place {side} limit @ {entry_price} qty={size.qty} lev={size.leverage}x", False)
+
+    # Write-ahead: persist the intent BEFORE the order reaches the exchange.
+    # If the worker dies between here and the confirmation write below, the
+    # order can't be orphaned -- the next cycle's pending_placement branch
+    # reconciles this record against the exchange by order_link_id. The
+    # deterministic link_id also makes placement idempotent at the exchange.
+    store.save_position({**base, "status": "pending_placement", "order_id": None})
+    result = broker.place_order(
+        asset, side, size.qty, order_type="limit", price=entry_price,
+        stop_loss=alert.stop, take_profit=alert.target, leverage=size.leverage,
+        order_link_id=link_id,
+    )
+    store.save_position({**base, "status": "resting_order", "order_id": result.order_id})
+    return CycleResult(asset, "resting_order", f"placed {side} limit @ {entry_price} qty={size.qty} lev={size.leverage}x", True)
 
 
 def _check_resting_order_status(asset, broker, candles_15m, store, position, *, dry_run,

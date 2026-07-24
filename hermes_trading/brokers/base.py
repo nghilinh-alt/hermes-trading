@@ -63,6 +63,9 @@ class BrokerAdapter(ABC):
         stop_loss: float | None = None,
         take_profit: float | None = None,
         leverage: float | None = None,
+        order_link_id: str | None = None,
     ) -> OrderResult:
-        """Place an order. Not implemented by any adapter this phase."""
+        """Place an order. `order_link_id` is an optional client-supplied id
+        the venue echoes back, so a crash between placement and local
+        persistence can be reconciled against the exchange by that id."""
         raise NotImplementedError

@@ -24,6 +24,10 @@ class FakeExchange:
         self.ohlcv_response: list[list[float]] = []
         self.closed_pnl_response = {"result": {"list": []}}
         self.create_order_response = {"id": "order123", "status": "open"}
+        self.realtime_response = {"result": {"list": []}}
+        self.history_response = {"result": {"list": []}}
+        self.realtime_calls: list[dict] = []
+        self.history_calls: list[dict] = []
 
         self.leverage_error: Exception | None = None
         self.margin_mode_error: Exception | None = None
@@ -85,6 +89,17 @@ class FakeExchange:
         self.closed_pnl_calls.append(params)
         return self.closed_pnl_response
 
+    def market(self, symbol):
+        return {"id": symbol.split("/")[0] + "USDT"}
+
+    def private_get_v5_order_realtime(self, params):
+        self.realtime_calls.append(params)
+        return self.realtime_response
+
+    def private_get_v5_order_history(self, params):
+        self.history_calls.append(params)
+        return self.history_response
+
 
 @pytest.fixture
 def fake():
@@ -143,6 +158,37 @@ def test_place_order_limit_attaches_sl_tp_params(fake, broker):
     assert call["side"] == "buy"
     assert call["params"] == {"stopLoss": "95.0", "takeProfit": "110.0"}
     assert fake.leverage_calls == [(5, "BTC/USDT:USDT")]
+
+
+def test_place_order_forwards_order_link_id(fake, broker):
+    broker.place_order("BTC/USDT", "buy", 0.01, order_type="limit", price=100.0,
+                       order_link_id="ict-BTCUSDT-9")
+    assert fake.create_order_calls[0]["params"]["orderLinkId"] == "ict-BTCUSDT-9"
+
+
+def test_place_order_omits_order_link_id_when_none(fake, broker):
+    broker.place_order("BTC/USDT", "buy", 0.01, order_type="limit", price=100.0)
+    assert "orderLinkId" not in fake.create_order_calls[0]["params"]
+
+
+def test_find_order_by_link_id_from_realtime(fake, broker):
+    fake.realtime_response = {"result": {"list": [
+        {"orderId": "abc", "orderLinkId": "ict-BTCUSDT-9", "orderStatus": "New"},
+    ]}}
+    assert broker.find_order_by_link_id("BTC/USDT", "ict-BTCUSDT-9") == {
+        "order_id": "abc", "status": "new", "link_id": "ict-BTCUSDT-9"}
+
+
+def test_find_order_by_link_id_falls_back_to_history(fake, broker):
+    fake.history_response = {"result": {"list": [
+        {"orderId": "h1", "orderLinkId": "ict-BTCUSDT-9", "orderStatus": "Filled"},
+    ]}}
+    assert broker.find_order_by_link_id("BTC/USDT", "ict-BTCUSDT-9") == {
+        "order_id": "h1", "status": "filled", "link_id": "ict-BTCUSDT-9"}
+
+
+def test_find_order_by_link_id_returns_none_when_absent(fake, broker):
+    assert broker.find_order_by_link_id("BTC/USDT", "ict-BTCUSDT-nope") is None
 
 
 def test_place_order_below_minimum_qty_raises(broker):
