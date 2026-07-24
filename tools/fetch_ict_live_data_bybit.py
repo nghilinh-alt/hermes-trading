@@ -35,7 +35,8 @@ import ccxt
 
 from hermes_trading.ict.util import Candle
 
-ASSETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "TAO/USDT"]
+ASSETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "TAO/USDT",
+          "BNB/USDT", "LINK/USDT", "SUI/USDT", "NEAR/USDT"]
 TIMEFRAME = "15m"
 SEED_DAYS = 730  # 2 years -- fast to seed, extend later if needed
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "ict-live-bybit"
